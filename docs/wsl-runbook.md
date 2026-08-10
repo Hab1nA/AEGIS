@@ -34,4 +34,22 @@ research transport awakens the distribution and retries briefly while `aegis-sea
 separate keepalive process is not required. Do not put relay credentials or API keys in the distribution or
 the search settings file.
 
+## Image scanner (environment builder)
+
+The environment builder scans every built image with Trivy inside the dedicated
+distribution. Two prerequisites are provisioned once:
+
+1. A vulnerability database under `~/.cache/trivy/db/` (`trivy.db` +
+   `metadata.json`). The agent always invokes Trivy with `--skip-db-update`,
+   so the first run must download the DB; if the distribution cannot reach the
+   registry, download the `aquasecurity/trivy-db:2` layer on the Windows host
+   through the proxy and unpack it into WSL.
+2. The rootless Podman API socket (`/run/user/<uid>/podman/podman.sock`).
+   The agent starts `podman.socket` automatically before each scan when the
+   socket is missing.
+
+Environment candidates build FROM a digest-pinned parent; the recipe is
+validated offline-first and the scan gate (`require_scanner_passed`) rejects
+any image with fixable vulnerabilities, so use a patched base image.
+
 Do not manually create the quota marker. Delete a failed staging root and render again; `apply_plan` intentionally refuses to overwrite existing files.

@@ -29,6 +29,13 @@ Set secrets only in the host process; they are never copied into WSL:
 $env:AEGIS_OPENAI_API_KEY = "..."
 $env:AEGIS_OPENAI_BASE_URL = "https://relay.example/v1"
 $env:AEGIS_OPENAI_PROTOCOL = "auto"
+# Prefer response_format {"type":"json_object"} for structured role requests
+# (DeepSeek JSON Output mode; see docs/autonomous-evolution.md).
+$env:AEGIS_OPENAI_STRUCTURED_FORMAT = "json_object"
+# Hidden-reasoning relays can be slow; give each model call a generous deadline.
+$env:AEGIS_OPENAI_TIMEOUT_SECONDS = "3600"
+# Optional model-gateway proxy; empty means direct (system proxy is bypassed).
+$env:AEGIS_OPENAI_HTTPS_PROXY = ""
 $env:AEGIS_SEARCH_BASE_URL = "http://127.0.0.1:8888"
 $env:AEGIS_ALLOW_INSECURE_SEARCH_LOOPBACK = "true"
 $env:AEGIS_HTTPS_PROXY = "http://127.0.0.1:7897"
@@ -80,6 +87,29 @@ execution is always offline.
   `data_dir/attribution_arms.jsonl` and emits a content-addressed
   `qualify_attribution` report; without same-cohort paired data the report is
   honestly `invalid-design` or `confounded`.
+- Evolution surfaces: four explicit evolvable surfaces — `workflow`,
+  `subject`, `plugin`, `environment` — with strict JSON schemas and grant
+  rules in `src/aegis/evolution/surfaces.py`. Only the Warrior may propose;
+  workflow/subject/plugin/environment proposals must target the Warrior (a
+  workflow proposal may also target the proposer itself).
+- Candidate consumption: `src/aegis/evolution/consumer.py` materializes every
+  proposal into the content-addressed store and feeds
+  `EvolutionRegistry` (`collect -> validated -> qualified -> active`,
+  per-surface champions with lineage and rollback). Each cycle runs one
+  same-cohort paired shadow arm, attributes the difference (single-coordinate
+  `plugin_ids` or `runtime_variant`, advisory workflow/subject via the role
+  generation identity), and activates a qualified candidate automatically.
+- Active role set binding: every role resolves a `CompositeRoleManifest`
+  (`schema_version=2`: model profile, workflow, subject, plugins, runtime
+  image, budget policy) at cycle start; the activated champion workflow,
+  subject, plugin, and environment image are injected into the real runtime
+  envelope and sandbox prepare for the next generation. Legacy genesis
+  manifests fall back to defaults.
+- Environment builder: `src/aegis/evolution/env_builder.py` wires a real
+  builder (quarantined downloads, two independent offline Podman builds, Trivy
+  scan, CAS publication) into the cycle. An `environment` candidate is built,
+  its receipt is materialized on the candidate, the shadow arm runs on the
+  built image, and activation pins `runtime_image` for later generations.
 - Repair: failed cycles record `cycle_failed_recovery_started`; the Prosecutor
   patch is published, validated, and activated, or the cycle rolls back.
   Interrupted/failed cycles retry the same generation via the `retry`
