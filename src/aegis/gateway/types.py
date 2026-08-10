@@ -25,6 +25,17 @@ class GatewayHTTPError(GatewayError):
         self.retryable = retryable
 
 
+class GatewayTruncationError(GatewayError):
+    """The relay returned a successful HTTP response but the model output was cut off
+    before a complete action could be produced (for example, a hidden-reasoning model
+    consumed the whole output budget and left the content field empty).
+    """
+
+    def __init__(self, message: str, *, usage: TokenUsage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
 @dataclass(slots=True)
 class CancelToken:
     _event: Event = field(default_factory=Event)

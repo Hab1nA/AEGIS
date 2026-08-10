@@ -19,7 +19,11 @@
     "runtime_network": "none",
     "external_writes_via_connectors": true,
     "role_activation_automatic": true,
-    "immutable_safety_constitution": true
+    "immutable_safety_constitution": true,
+    "evolution_surfaces": ["workflow", "subject", "plugin", "environment"],
+    "environment_output_repository": "localhost/aegis-evolution",
+    "scanner_binary": "trivy",
+    "candidate_max_extra_steps": 12
   },
   "sandbox_backend": "wsl",
   "test_mode": false,
@@ -31,20 +35,20 @@
     "warrior": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.55,
-      "max_output_tokens": 8192,
-      "reasoning_effort": "medium"
+      "max_output_tokens": 16384,
+      "reasoning_effort": "high"
     },
     "judge": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
-      "max_output_tokens": 8192,
-      "reasoning_effort": "medium"
+      "max_output_tokens": 16384,
+      "reasoning_effort": "high"
     },
     "prosecutor": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
-      "max_output_tokens": 8192,
-      "reasoning_effort": "medium"
+      "max_output_tokens": 16384,
+      "reasoning_effort": "high"
     }
   }
 }

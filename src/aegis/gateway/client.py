@@ -24,6 +24,7 @@ from .types import (
     GatewayHTTPError,
     GatewayRequest,
     GatewayResponse,
+    GatewayTruncationError,
     TokenUsage,
 )
 
@@ -35,6 +36,7 @@ class GatewayConfig:
     timeout_seconds: float = 900.0
     allow_insecure_loopback: bool = False
     protocol: Literal["auto", "responses", "chat"] = "auto"
+    structured_format: Literal["auto", "json_schema", "json_object"] = "auto"
 
     def __post_init__(self) -> None:
         parsed = urllib.parse.urlsplit(self.base_url)
@@ -59,13 +61,16 @@ class GatewayConfig:
             raise ValueError("timeout_seconds must be positive")
         if self.protocol not in {"auto", "responses", "chat"}:
             raise ValueError("protocol must be 'auto', 'responses', or 'chat'")
+        if self.structured_format not in {"auto", "json_schema", "json_object"}:
+            raise ValueError("structured_format must be 'auto', 'json_schema', or 'json_object'")
 
     def __repr__(self) -> str:
         return (
             f"GatewayConfig(base_url={self.base_url!r}, api_key='<redacted>', "
             f"timeout_seconds={self.timeout_seconds!r}, "
             f"allow_insecure_loopback={self.allow_insecure_loopback!r}, "
-            f"protocol={self.protocol!r})"
+            f"protocol={self.protocol!r}, "
+            f"structured_format={self.structured_format!r})"
         )
 
     @classmethod
@@ -95,7 +100,18 @@ class GatewayConfig:
         if protocol not in {"auto", "responses", "chat"}:
             raise ValueError("AEGIS_OPENAI_PROTOCOL must be auto, responses, or chat")
         checked_protocol = cast(Literal["auto", "responses", "chat"], protocol)
-        return cls(base_url, api_key, timeout, raw_insecure == "true", checked_protocol)
+        structured_format = source.get("AEGIS_OPENAI_STRUCTURED_FORMAT", "auto").strip().lower()
+        if structured_format not in {"auto", "json_schema", "json_object"}:
+            raise ValueError("AEGIS_OPENAI_STRUCTURED_FORMAT must be auto, json_schema, or json_object")
+        checked_format = cast(Literal["auto", "json_schema", "json_object"], structured_format)
+        return cls(
+            base_url,
+            api_key,
+            timeout,
+            raw_insecure == "true",
+            checked_protocol,
+            checked_format,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,14 +183,15 @@ class ModelGateway:
     def _candidate_modes(self, structured: bool) -> tuple[_GatewayMode, ...]:
         if self._config.protocol == "responses":
             return ("responses",)
+        chat_structured: tuple[_GatewayMode, ...] = (
+            ("chat_json_object", "chat_json_schema", "chat_plain")
+            if self._config.structured_format == "json_object"
+            else ("chat_json_schema", "chat_json_object", "chat_plain")
+        )
         if self._config.protocol == "chat":
-            return (
-                ("chat_json_schema", "chat_json_object", "chat_plain")
-                if structured
-                else ("chat_plain",)
-            )
+            return chat_structured if structured else ("chat_plain",)
         if structured:
-            return ("responses", "chat_json_schema", "chat_json_object", "chat_plain")
+            return ("responses", *chat_structured)
         return ("responses", "chat_plain")
 
     @staticmethod
@@ -315,11 +332,49 @@ class ModelGateway:
             data = json.loads(response.body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GatewayError("model relay returned invalid JSON") from exc
+        if self._is_truncated(protocol, data):
+            usage = self._extract_usage(protocol, data, request, "")
+            raise GatewayTruncationError(
+                "model relay response was truncated before a complete JSON action was produced",
+                usage=usage,
+            )
         text = self._extract_text(protocol, data)
         usage = self._extract_usage(protocol, data, request, text)
         return GatewayResponse(
             text, usage, protocol, response.headers.get("x-request-id"), data, response.status
         )
+
+    @staticmethod
+    def _is_truncated(protocol: str, data: Mapping[str, object]) -> bool:
+        """Detect outputs cut short by the relay's own token budget.
+
+        Hidden-reasoning relays may consume every completion token on
+        ``reasoning_content`` and return an empty ``content`` field with
+        ``finish_reason: "length"``.  Such a body is a successful HTTP response
+        but cannot be parsed as an action, so it must never be handed back as
+        model output.
+        """
+        if protocol != "chat":
+            return False
+        try:
+            choices = data["choices"]
+            assert isinstance(choices, list) and choices
+            choice = choices[0]
+            assert isinstance(choice, Mapping)
+            finish = choice.get("finish_reason")
+            if isinstance(finish, str) and finish.lower() == "length":
+                return True
+            message = choice.get("message")
+            if not isinstance(message, Mapping):
+                return False
+            content = message.get("content")
+            if not (isinstance(content, str) and content.strip()):
+                usage = data.get("usage")
+                if isinstance(usage, Mapping) and isinstance(usage.get("completion_tokens"), int):
+                    return True
+        except (KeyError, IndexError, TypeError, AssertionError):
+            return False
+        return False
 
     @staticmethod
     def _conservative_attempt_usage(request: GatewayRequest) -> TokenUsage:

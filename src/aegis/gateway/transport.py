@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import http.client
 import multiprocessing
+import os
+import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, cast
@@ -35,7 +39,24 @@ def _http_child(
     hard deadline and terminate the child.
     """
     try:
-        opener = urllib.request.build_opener(StdlibHTTPTransport._NoRedirect())
+        proxy = os.environ.get("AEGIS_OPENAI_HTTPS_PROXY", "").strip()
+        handlers: list[urllib.request.BaseHandler] = [StdlibHTTPTransport._NoRedirect()]
+        if proxy:
+            parsed = urllib.parse.urlsplit(proxy)
+            if parsed.scheme in {"http", "https"} and parsed.hostname:
+                handlers.append(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                )
+            else:
+                handlers.append(urllib.request.ProxyHandler({}))
+        else:
+            # Never inherit the machine's WinINET/system proxy for model
+            # traffic: routing is explicit (AEGIS_OPENAI_HTTPS_PROXY) or direct.
+            handlers.append(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(
+            _BoundedConnectHTTPSHandler(),
+            *handlers,
+        )
         request = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
         with opener.open(request, timeout=timeout) as response:
             chunks: list[bytes] = []
@@ -57,6 +78,53 @@ def _http_child(
         conn.send(("http_error", exc.code, error_body))
     except BaseException as exc:  # noqa: BLE001 - relayed to the caller
         conn.send(("error", exc))
+
+
+class _BoundedConnectHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection whose connect phase never outlasts the connect budget.
+
+    The relay deadline is intentionally generous for slow hidden-reasoning
+    responses, but a dead route must not burn the whole deadline inside
+    ``socket.create_connection``.  The connect phase is capped separately; the
+    response read keeps the caller's full timeout.
+    """
+
+    def __init__(self, host: str, **kwargs: Any) -> None:
+        self._connect_timeout = float(kwargs.pop("connect_timeout", 30.0))
+        super().__init__(host, **kwargs)
+
+    def connect(self) -> None:
+        original_timeout = self.timeout
+        bounded = (
+            self._connect_timeout
+            if original_timeout is None
+            else min(float(original_timeout), self._connect_timeout)
+        )
+        self.timeout = bounded
+        try:
+            super().connect()
+        finally:
+            self.timeout = original_timeout
+        if self.sock is not None:
+            self.sock.settimeout(original_timeout)
+
+
+class _BoundedConnectHTTPSHandler(urllib.request.HTTPSHandler):
+    _context: ssl.SSLContext
+    _connect_timeout: float
+
+    def __init__(self, *, connect_timeout: float = 30.0, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._connect_timeout = connect_timeout
+        self._context = ssl.create_default_context()
+
+    def https_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(
+            _BoundedConnectHTTPSConnection,
+            req,
+            context=self._context,
+            connect_timeout=self._connect_timeout,
+        )
 
 
 class HTTPTransport(Protocol):
@@ -114,18 +182,38 @@ class StdlibHTTPTransport:
         )
         child.start()
         child_conn.close()
-        child.join(timeout=max(0.0, deadline - time.monotonic()))
+        outcome: Any = None
+        while True:
+            cancel.raise_if_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                child.terminate()
+                try:
+                    child.join(timeout=5)
+                except Exception:
+                    pass
+                raise TimeoutError("model relay response exceeded total timeout")
+            if parent_conn.poll(timeout=min(remaining, 5.0)):
+                try:
+                    outcome = parent_conn.recv()
+                except EOFError as exc:
+                    raise RuntimeError("model relay child exited without a response") from exc
+                break
+            if not child.is_alive():
+                # The child exited before sending anything (for example an
+                # import failure during spawn bootstrap); drain the pipe so the
+                # EOF surfaces as a deterministic error instead of a hang.
+                try:
+                    outcome = parent_conn.recv()
+                except EOFError as exc:
+                    raise RuntimeError("model relay child exited without a response") from exc
+                break
+        child.join(timeout=5)
         if child.is_alive():
             child.terminate()
-            try:
-                child.join(timeout=5)
-            except Exception:
-                pass
-            raise TimeoutError("model relay response exceeded total timeout")
-        try:
-            outcome = parent_conn.recv()
-        except EOFError as exc:
-            raise RuntimeError("model relay child exited without a response") from exc
+            child.join(timeout=5)
+        if outcome is None:
+            raise RuntimeError("model relay child exited without a response")
         kind = outcome[0]
         if kind == "http_error":
             _, code, error_body = outcome
