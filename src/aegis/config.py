@@ -276,7 +276,6 @@ class CampaignConfig:
     demo_mode: bool = False
     sandbox_backend: str = "wsl"
     acceptance_profile: str | None = None
-    evolution_promotion_smoke_only: bool = False
     autonomy_v2: AutonomyV2Config | None = None
 
     _FIELDS = frozenset(
@@ -295,7 +294,6 @@ class CampaignConfig:
             "demo_mode",
             "sandbox_backend",
             "acceptance_profile",
-            "evolution_promotion_smoke_only",
             "autonomy_v2",
         }
     )
@@ -374,9 +372,6 @@ class CampaignConfig:
         ):
             if not isinstance(value, bool):
                 raise ConfigError(f"{name} must be a boolean")
-        smoke_only = raw.get("evolution_promotion_smoke_only", False)
-        if not isinstance(smoke_only, bool):
-            raise ConfigError("evolution_promotion_smoke_only must be a boolean")
         if test_mode and demo_mode:
             raise ConfigError("test_mode and demo_mode are mutually exclusive")
         if offline_research and not (test_mode or demo_mode):
@@ -418,7 +413,6 @@ class CampaignConfig:
             demo_mode,
             backend,
             acceptance_profile,
-            smoke_only,
             autonomy_v2,
         )
 
@@ -448,7 +442,6 @@ class CampaignConfig:
             "demo_mode": self.demo_mode,
             "sandbox_backend": self.sandbox_backend,
             "acceptance_profile": self.acceptance_profile,
-            "evolution_promotion_smoke_only": self.evolution_promotion_smoke_only,
         }
         if self.autonomy_v2 is not None:
             payload["autonomy_v2"] = self.autonomy_v2.to_dict()

@@ -103,14 +103,6 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "acceptance_profile"):
             CampaignConfig.from_mapping(valid_config(acceptance_profile="unknown"))
 
-    def test_smoke_only_promotion_flag_round_trips(self):
-        config = CampaignConfig.from_mapping(valid_config(evolution_promotion_smoke_only=True))
-        self.assertTrue(config.evolution_promotion_smoke_only)
-        self.assertTrue(config.to_dict()["evolution_promotion_smoke_only"])
-        self.assertFalse(CampaignConfig.from_mapping(valid_config()).evolution_promotion_smoke_only)
-        with self.assertRaisesRegex(ConfigError, "evolution_promotion_smoke_only"):
-            CampaignConfig.from_mapping(valid_config(evolution_promotion_smoke_only="yes"))
-
     def test_dynamic_v2_config_is_strict_secret_free_and_has_no_fixed_tasks(self):
         roles = {
             "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},

@@ -1,15 +1,57 @@
-# Architecture
+# AEGIS v2 architecture
 
-The append-only `EventStore` is the source of truth. `CampaignController` advances a `CampaignStateMachine`, reserves model capacity with `BudgetManager`, and runs each untrusted role through `RoleAgentRuntime` and `ToolDispatcher`.
+## Control plane
 
-The round order is fixed: prepare and stage public task material; Warrior research; Warrior implementation; freeze; Judge review; deterministic hidden evaluation and quality lock; Prosecutor audit; deterministic promotion gate. The Judge receives no hidden files through model context. `PythonTaskProvider.evaluate` imports the frozen artifact into a fresh evaluator sandbox; the trusted WSL agent retains sealed assertions and invokes the submission as a black-box worker that receives inputs but no hidden source or expected values. The Prosecutor is called only after `quality_locked` is durable.
+The append-only `EventStore` is the source of truth. `CurriculumRegistry` and
+`RoleRegistry` persist content-addressed objectives, constitutions, role
+candidates, active sets, and cycle transitions; `ContentAddressedArtifactStore`
+holds every evidence artifact (submission, judge review, quality lock,
+prosecutor audit, council, task forge, validation, attribution, qualification,
+activation).
 
-Each completed phase is a durable checkpoint. A resumed controller reconstructs the task, role outputs, frozen digest, quality lock, and promotion decision from events and starts only the first incomplete phase. Round completion is committed before workspace teardown, making teardown idempotently recoverable. Start and resume hold a non-blocking OS execution lock for the campaign; a competing live controller is rejected, while process death releases ownership in the kernel. Pause is recorded atomically, lets the already-sent gateway or promotion call finish, and rejects the next model request; resume safely replays the incomplete phase. Stop and kill are separate synchronous control paths: they replay sandbox ownership directly from the event stream and clean resources without constructing a model gateway, validating task packs, or requiring a healthy sandbox doctor. Kill calls the backend kill operation before recording the terminal cleanup result.
+`EvolutionCycleController` runs one generation: Warrior solve, Judge review,
+deterministic quality lock, Prosecutor audit, three role reflections, council
+deliberation, Judge task forge, trusted task validation/registration,
+attribution, role-candidate qualification, and activation-set commit. Every
+stage is durable before the next starts; `record_snapshot` is idempotent for
+retries, and a failed/interrupted cycle can `retry` the same generation.
 
-Sandbox ownership uses a write-ahead lifecycle: `sandbox_prepare_intent` is durable before every task-pack validation, main, review, evaluator, or promotion backend prepare call. A crash after intent but before the prepared receipt therefore remains recoverable. Stop, kill, and exception cleanup reconcile every intent without a later successful cleanup event. Cleanup success is recorded only after the backend confirms it; each failure is retained as `sandbox_cleanup_failed` and does not prevent later owned sandboxes from being attempted.
+## Role runtime
 
-Research uses a host-side `ResearchBroker`. Public result retrieval uses a pinned HTTPS transport that ignores generic proxy environment variables, validates every DNS target and redirect, and rejects private, loopback, link-local, reserved, and metadata-like targets. An explicit `AEGIS_HTTPS_PROXY` opt-in may route this transport only through an unauthenticated literal loopback HTTP CONNECT proxy. The controller still tunnels its independently approved public IP instead of the hostname, verifies the local proxy peer, and retains destination TLS hostname verification. Search discovery may use the operator-controlled local SearxNG endpoint only after an explicit opt-in. On Windows, a shell-free fixed-argument transport invokes `/usr/bin/curl` inside the dedicated WSL distribution; it accepts only the literal WSL loopback endpoint on fixed port 8888, disables proxy lookup, limits transfer size and duration, and refuses redirects. Short bounded retries cover systemd startup after WSL is awakened. Task execution remains offline and never receives the research network path.
+All three roles execute through `RoleAgentRuntime` and `ToolDispatcher`: the
+model emits exactly one JSON action per turn, token usage is verified and
+recorded, and sandbox actions stay inside a prepared WSL/Podman container with
+per-role prepare/destroy and unique sandbox ids. Prosecutor and Judge contexts
+are redacted (private reasoning and raw tool output replaced by digests).
 
-Strategies are advisory, event-sourced values. Model submissions may propose bounded strategy content, but cannot change tools, sandbox policy, budgets, tasks, scoring, or promotion. After each round, pending candidates are automatically scheduled against the current champion on the same sealed 12-task by 2-seed design. Every arm runs the real role loop in a new sandbox; candidate/champion order alternates, the model seed is sent to the relay, and confidence intervals bootstrap task clusters rather than treating within-task seeds as independent samples. Hidden evaluation locks quality. Every real relay attempt—including retries, failures, and protocol fallback—is budgeted and audited. A pair is appended only after both arms finish. Insufficient budget stops the campaign while leaving the experiment durably pending for recovery; unverified usage or a safety violation in either arm is a hard rejection.
+## Dynamic task bank
 
-Campaign configuration is strict and secret-free. Reports replay immutable events and expose detailed input, output, cached, and reasoning token usage by role.
+`DynamicTaskRegistry` is a hash-chained SQLite ledger. `GenesisSeeder` registers
+the 12 built-in packs as `FIXED_ANCHOR` only on an empty bank. `TaskForge`
+validates Judge-supplied archives (reference passes, defect/mutants killed) and
+registers dynamic tasks as quarantined until their holdout delay elapses;
+`select_dynamic_cohort` prefers eligible dynamic tasks and falls back to anchors
+only when none exist.
+
+## Trusted external writes
+
+External writes go through the plugin broker: `aegis.git_checkpoint` is an
+`EXTERNAL` action pinned to the Warrior generation, journaled intent-first by
+`SqliteConnectorJournal`, and executed by `GitCheckpointConnector` over
+`GitPublisher` (isolated clone, exact-base CAS, role path grants, secret scan,
+create-only candidate refs). Remote credentials stay in the publisher
+environment.
+
+## Repair and retry
+
+On cycle failure, `run_v2_cycle` records the original error, asks the Prosecutor
+for a bounded patch (≤10 steps), then runs `RecoverySupervisor`: publish →
+validate → activate the repaired role version, or roll back to
+last-known-good. A control-plane `retry` transition returns a failed or
+interrupted cycle to `created` for the same generation.
+
+## CLI
+
+`aegis evolution-cycle` (dry-run / run / repair), `campaign-create`, `doctor`,
+`sandbox-bootstrap`, `autonomy-preflight` (v2 gates), `knowledge-search`,
+`status`, `report`, and `replay`.

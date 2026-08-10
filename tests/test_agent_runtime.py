@@ -23,7 +23,6 @@ from aegis.challenges import SealedTaskMetadata
 from aegis.gateway.protocols import Role
 from aegis.gateway.types import GatewayResponse, TokenUsage
 from aegis.knowledge import KnowledgeStore
-from aegis.orchestrator import CampaignController, _source_consumption_action_guard
 from aegis.research.imports import validate_skill_import
 from aegis.research.paper_collector import PaperCollectionError
 from aegis.research.types import Provenance, ResearchArtifact, SearchHit
@@ -450,14 +449,6 @@ class DispatcherTests(unittest.TestCase):
                 self.assertEqual(requested["source_refs"][0]["content_sha256"], snapshot_digest)
                 self.assertEqual(requested["source_refs"][0]["blob_sha256"], hashlib.sha256(content).hexdigest())
                 self.assertFalse(requested["host_write_allowed"])
-                parsed = CampaignController._evolution_request(
-                    {"evolution_requests": [requested]},
-                    round_number=1,
-                    baseline_archive_sha256="e" * 64,
-                )
-                self.assertIsNotNone(parsed)
-                assert parsed is not None
-                self.assertEqual(parsed[2], tuple(requested["source_refs"]))
 
     def test_exact_commit_github_skill_bundle_is_recallable_and_auto_queued(self) -> None:
         repository = "https://github.com/example/skills"
@@ -1280,111 +1271,6 @@ class RuntimeTests(unittest.TestCase):
                 ["submit"],
             ],
         )
-
-    def test_source_bound_candidate_recovers_then_consumes_each_source_in_order(self) -> None:
-        sources = (
-            {
-                "artifact_id": "a" * 64,
-                "kind": "github",
-                "content_sha256": "b" * 64,
-                "locator": "path:src/example.py",
-                "blob_sha256": "c" * 64,
-            },
-            {
-                "artifact_id": "d" * 64,
-                "kind": "paper",
-                "content_sha256": "e" * 64,
-                "locator": "page:1",
-                "blob_sha256": "f" * 64,
-            },
-        )
-
-        class SourceDispatcher:
-            def allowed_actions(self, role):
-                return frozenset(
-                    {
-                        "research.recall",
-                        "research.artifact_read",
-                        "workspace.read",
-                        "workspace.write",
-                        "sandbox.exec",
-                        "submit",
-                    }
-                )
-
-            def dispatch(self, role, action):
-                if action.name == "submit":
-                    return {
-                        "summary": action.arguments["summary"],
-                        "payload": action.arguments["payload"],
-                    }
-                if action.name == "research.recall":
-                    return {"sha256": action.arguments["sha256"]}
-                if action.name == "research.artifact_read":
-                    source = next(
-                        item
-                        for item in sources
-                        if item["artifact_id"] == action.arguments["artifact_id"]
-                        and item["locator"] == action.arguments["locator"]
-                    )
-                    return {
-                        "artifact_id": source["artifact_id"],
-                        "kind": source["kind"],
-                        "locator": source["locator"],
-                        "sha256": source["blob_sha256"],
-                    }
-                if action.name == "sandbox.exec":
-                    return {"exit_code": 0, "timed_out": False}
-                return {"accepted": True}
-
-        gateway = FakeGateway(
-            [
-                call("research.artifact_read", artifact_id=sources[0]["artifact_id"], locator=sources[0]["locator"]),
-                call("workspace.read", path="src/aegis/evolvable/workflow.py"),
-                call("research.recall", sha256=sources[0]["content_sha256"]),
-                call("research.artifact_read", artifact_id=sources[0]["artifact_id"], locator=sources[0]["locator"]),
-                call("research.recall", sha256=sources[1]["content_sha256"]),
-                call("research.artifact_read", artifact_id=sources[1]["artifact_id"], locator=sources[1]["locator"]),
-                call("workspace.read", path="src/aegis/evolvable/workflow.py"),
-                call("workspace.write", path="src/aegis/evolvable/workflow.py", content_base64=""),
-                call("sandbox.exec", argv=["python3", "-m", "pytest", "tests/test_evolvable_workflow.py"]),
-                call("submit", summary="candidate verified", payload={}),
-            ]
-        )
-        result = RoleAgentRuntime(
-            gateway,
-            SourceDispatcher(),
-            "model",
-            limits=RuntimeLimits(max_steps=12),
-            action_guard=_source_consumption_action_guard(sources),
-        ).run(
-            Role.WARRIOR,
-            objective="produce one source-bound candidate",
-            context={},
-            required_action_groups=tuple(
-                [frozenset({"research.recall"}) for _ in sources]
-                + [frozenset({"research.artifact_read"}) for _ in sources]
-                + [
-                    frozenset({"workspace.read"}),
-                    frozenset({"workspace.write"}),
-                    frozenset({"sandbox.exec"}),
-                ]
-            ),
-        )
-
-        self.assertEqual(result.summary, "candidate verified")
-        self.assertFalse(result.observations[0].result["accepted"])
-        self.assertFalse(result.observations[1].result["accepted"])
-        self.assertEqual(
-            [item.action for item in result.observations[2:6]],
-            [
-                "research.recall",
-                "research.artifact_read",
-                "research.recall",
-                "research.artifact_read",
-            ],
-        )
-        self.assertTrue(all(item.result.get("accepted", True) for item in result.observations[2:]))
 
     def test_forced_action_recovers_only_from_trusted_tool_receipt(self) -> None:
         canonical = {
