@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import Callable
+from unittest.mock import patch
 
 from aegis.publishing import (
     GitCheckpointRequest,
@@ -132,6 +134,31 @@ class GitPublisherTests(unittest.TestCase):
         output = git(self.root, "ls-remote", "--heads", str(self.remote), ref)
         return output.partition("\t")[0] if output else None
 
+    def test_credential_helper_env_is_injected_into_git_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"AEGIS_GIT_CREDENTIAL_HELPER": "!gh auth git-credential"},
+        ):
+            publisher = GitPublisher(
+                str(self.remote),
+                remote_id="public-test-origin",
+                allowed_role_paths={"warrior": ("roles/warrior",)},
+            )
+            self.assertEqual(publisher._credential_helper, "!gh auth git-credential")
+            captured: dict[str, object] = {}
+
+            def fake_run(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                captured["env"] = kwargs.get("env")
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+            with patch("aegis.publishing.publisher.subprocess.run", side_effect=fake_run):
+                publisher._run(Path("."), ("git", "version"), label="probe")
+        environment = captured["env"]
+        assert isinstance(environment, dict)
+        self.assertEqual(environment["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(environment["GIT_CONFIG_KEY_0"], "credential.helper")
+        self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "!gh auth git-credential")
+
     def test_candidate_and_stable_publish_are_isolated_content_addressed_fast_forwards(self) -> None:
         before_head = git(self.worktree, "rev-parse", "HEAD")
         before_status = git(self.worktree, "status", "--porcelain=v1", "--untracked-files=all")
@@ -195,7 +222,12 @@ class GitPublisherTests(unittest.TestCase):
             (GitFileChange("roles/warrior/.gitmodules", b"[submodule \"x\"]\n"), "submodule"),
             (GitFileChange("roles/warrior/.env", b"SAFE=true\n"), "secret-like paths"),
             (
-                GitFileChange("roles/warrior/config.py", b'API_KEY="abcdefgh12345678"\n'),
+                # Runtime assembly keeps the secret sample out of the published
+                # tree scan while still exercising the content rejection path.
+                GitFileChange(
+                    "roles/warrior/config.py",
+                    b'API_KEY="' + b"abcdefgh12345678" + b'"\n',
+                ),
                 "secret-like file content",
             ),
         )

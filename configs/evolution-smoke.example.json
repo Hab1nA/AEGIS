@@ -13,7 +13,7 @@
     "council_max_tokens": 32768,
     "objective_history_window": 3,
     "objective_probation_cycles": 2,
-    "public_repo_url": null,
+    "public_repo_url": "https://github.com/Hab1nA/AEGIS",
     "builder_public_internet": true,
     "builder_block_private_networks": true,
     "runtime_network": "none",

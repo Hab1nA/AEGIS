@@ -53,6 +53,8 @@ class GitPublisher:
         remote_id: str,
         allowed_role_paths: Mapping[str, Sequence[str]],
         stable_branch: str = "stable",
+        credential_helper: str | None = None,
+        git_timeout_seconds: float = 120.0,
     ) -> None:
         if not isinstance(remote_url, str) or not remote_url:
             raise ValueError("remote_url must be non-empty")
@@ -71,6 +73,17 @@ class GitPublisher:
         self._remote_id = remote_id
         self._allowed_role_paths = normalized
         self._stable_ref = f"refs/heads/{stable_branch}"
+        helper = os.environ.get("AEGIS_GIT_CREDENTIAL_HELPER") if credential_helper is None else credential_helper
+        if helper is not None and (not isinstance(helper, str) or not helper.strip() or "\x00" in helper):
+            raise ValueError("AEGIS_GIT_CREDENTIAL_HELPER must be bounded non-empty text")
+        self._credential_helper = helper.strip() if helper else None
+        if (
+            isinstance(git_timeout_seconds, bool)
+            or not isinstance(git_timeout_seconds, (int, float))
+            or not 1 <= float(git_timeout_seconds) <= 3600
+        ):
+            raise ValueError("git_timeout_seconds must be in (0, 3600]")
+        self._git_timeout_seconds = float(git_timeout_seconds)
 
     def publish_candidate(self, request: GitCheckpointRequest) -> PublicationResult:
         roots = self._allowed_role_paths.get(request.role)
@@ -338,8 +351,8 @@ class GitPublisher:
         except UnicodeError as exc:
             raise GitPublisherError("Git returned a non-UTF-8 path") from exc
 
-    @staticmethod
     def _run(
+        self,
         cwd: Path,
         argv: tuple[str, ...],
         *,
@@ -354,6 +367,10 @@ class GitPublisher:
             "GIT_CONFIG_GLOBAL": os.devnull,
             "LC_ALL": "C",
         }
+        if self._credential_helper is not None:
+            environment["GIT_CONFIG_COUNT"] = "1"
+            environment["GIT_CONFIG_KEY_0"] = "credential.helper"
+            environment["GIT_CONFIG_VALUE_0"] = self._credential_helper
         result = subprocess.run(
             argv,
             cwd=cwd,
@@ -362,7 +379,7 @@ class GitPublisher:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            timeout=30,
+            timeout=self._git_timeout_seconds,
         )
         if result.returncode not in allowed_codes:
             # Do not echo argv, remote URL, environment, or stderr: any of those
