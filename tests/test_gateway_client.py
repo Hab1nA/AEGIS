@@ -76,10 +76,84 @@ class GatewayTests(unittest.TestCase):
         )
         self.assertEqual(ModelGateway._responses_payload(request)["reasoning_effort"], "low")
         self.assertEqual(ModelGateway._chat_payload(request)["reasoning_effort"], "low")
+        request_max = GatewayRequest(
+            "model-a", (Message("user", "hello"),), 100, reasoning_effort="max"
+        )
+        self.assertEqual(
+            ModelGateway._responses_payload(request_max)["reasoning_effort"], "max"
+        )
+        self.assertEqual(
+            ModelGateway._chat_payload(request_max)["reasoning_effort"], "max"
+        )
         with self.assertRaisesRegex(ValueError, "reasoning_effort"):
             GatewayRequest(
                 "model-a", (Message("user", "hello"),), 100, reasoning_effort="unbounded"
             )
+
+    def test_responses_json_object_structured_format_sends_json_object(self) -> None:
+        config = GatewayConfig(
+            "https://relay.invalid/v1",
+            "secret",
+            protocol="responses",
+            structured_format="json_object",
+        )
+        transport = FakeTransport(
+            [
+                response(
+                    {
+                        "output_text": "{}",
+                        "usage": {"input_tokens": 2, "output_tokens": 1},
+                    }
+                )
+            ]
+        )
+        request = GatewayRequest(
+            "model-a", (Message("user", "return JSON"),), 100, output_schema={"type": "object"}
+        )
+        result = ModelGateway(config, transport=transport).complete(request)
+        self.assertEqual(result.protocol, "responses")
+        self.assertTrue(transport.calls[0][0].endswith("/responses"))
+        self.assertEqual(
+            transport.calls[0][2]["text"],
+            {"format": {"type": "json_object"}},
+        )
+        direct = ModelGateway._responses_payload(request, json_object=True)
+        self.assertEqual(direct["text"], {"format": {"type": "json_object"}})
+
+    def test_responses_extract_text_skips_reasoning_items(self) -> None:
+        payload = {
+            "output": [
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "think think"}],
+                },
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": '{"action":"submit","arguments":{"summary":"OK"}}',
+                        }
+                    ],
+                },
+            ]
+        }
+        self.assertEqual(
+            ModelGateway._extract_text("responses", payload),
+            '{"action":"submit","arguments":{"summary":"OK"}}',
+        )
+        only_reasoning = {
+            "output": [
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "think"}],
+                }
+            ]
+        }
+        self.assertEqual(
+            ModelGateway._extract_text("responses", only_reasoning),
+            "think",
+        )
 
     def test_unsupported_responses_falls_back_to_chat(self) -> None:
         transport = FakeTransport(

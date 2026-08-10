@@ -54,6 +54,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.roles["warrior"].reasoning_effort, "low")
         self.assertEqual(config.to_dict()["roles"]["warrior"]["reasoning_effort"], "low")
 
+        value["roles"]["warrior"]["reasoning_effort"] = "max"
+        config = CampaignConfig.from_mapping(value)
+        self.assertEqual(config.roles["warrior"].reasoning_effort, "max")
+
         value["roles"]["warrior"]["reasoning_effort"] = "unbounded"
         with self.assertRaisesRegex(ConfigError, "reasoning_effort"):
             CampaignConfig.from_mapping(value)
