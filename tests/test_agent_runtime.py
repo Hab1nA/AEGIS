@@ -21,7 +21,7 @@ from aegis.agent_runtime import (
 )
 from aegis.challenges import SealedTaskMetadata
 from aegis.gateway.protocols import Role
-from aegis.gateway.types import GatewayResponse, TokenUsage
+from aegis.gateway.types import GatewayResponse, GatewayTruncationError, TokenUsage
 from aegis.knowledge import KnowledgeStore
 from aegis.research.imports import validate_skill_import
 from aegis.research.paper_collector import PaperCollectionError
@@ -1065,6 +1065,47 @@ class RuntimeTests(unittest.TestCase):
             result.observations[0].result["error"]["message"],
             "model response is not valid JSON",
         )
+
+    def test_gateway_truncation_is_an_actionable_rejection_and_usage_is_accounted(self) -> None:
+        class TruncatingGateway:
+            def __init__(self) -> None:
+                self.requests = []
+                self.responses = [
+                    GatewayTruncationError(
+                        "truncated before a complete JSON action",
+                        usage=TokenUsage(5, 200, verified=True),
+                    ),
+                    GatewayResponse(
+                        json.dumps(call("submit", summary="corrected", payload={})),
+                        TokenUsage(5, 3, verified=True),
+                        "fake",
+                    ),
+                ]
+
+            def complete(self, request, *, cancel=None):
+                self.requests.append(request)
+                outcome = self.responses.pop(0)
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+        gateway = TruncatingGateway()
+        seen_usage = []
+        result = RoleAgentRuntime(
+            gateway,
+            ToolDispatcher(MemorySandbox(), FakeResearch(), "box"),
+            "model",
+            usage_sink=seen_usage.append,
+        ).run(Role.WARRIOR, objective="work", context={})
+
+        self.assertEqual(result.summary, "corrected")
+        self.assertEqual(result.observations[0].action, "model.response")
+        self.assertEqual(
+            result.observations[0].result["error"]["type"],
+            "GatewayTruncationError",
+        )
+        self.assertIn("truncated", result.observations[0].result["error"]["message"])
+        self.assertEqual([usage.output_tokens for usage in seen_usage], [200, 3])
 
     def test_judge_context_strips_warrior_reasoning_recursively(self) -> None:
         gateway = FakeGateway([call("submit", summary="review", payload={})])

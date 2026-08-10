@@ -19,6 +19,7 @@ from aegis.gateway.types import (
     GatewayCancelled,
     GatewayHTTPError,
     GatewayRequest,
+    GatewayTruncationError,
     Message,
 )
 
@@ -116,6 +117,80 @@ class GatewayTests(unittest.TestCase):
         result = ModelGateway(config, transport=transport).complete(request)
         self.assertEqual(result.protocol, "chat")
         self.assertTrue(transport.calls[0][0].endswith("/chat/completions"))
+
+    def test_json_object_structured_format_skips_schema_probe(self) -> None:
+        config = GatewayConfig(
+            "https://relay.invalid/v1",
+            "secret",
+            protocol="chat",
+            structured_format="json_object",
+        )
+        transport = FakeTransport(
+            [
+                response(
+                    {
+                        "choices": [{"message": {"content": "{}"}}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                    }
+                )
+            ]
+        )
+        request = GatewayRequest(
+            "model-a", (Message("user", "return JSON"),), 100, output_schema={"type": "object"}
+        )
+
+        result = ModelGateway(config, transport=transport).complete(request)
+
+        self.assertEqual(result.text, "{}")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertTrue(transport.calls[0][0].endswith("/chat/completions"))
+        self.assertEqual(transport.calls[0][2]["response_format"], {"type": "json_object"})
+
+    def test_finish_reason_length_raises_gateway_truncation_error(self) -> None:
+        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat")
+        transport = FakeTransport(
+            [
+                response(
+                    {
+                        "choices": [
+                            {
+                                "message": {"content": "", "reasoning_content": "thinking"},
+                                "finish_reason": "length",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 200},
+                    }
+                )
+            ]
+        )
+        request = GatewayRequest(
+            "model-a", (Message("user", "return JSON"),), 100, output_schema={"type": "object"}
+        )
+
+        with self.assertRaises(GatewayTruncationError) as raised:
+            ModelGateway(config, transport=transport).complete(request)
+
+        self.assertIsNotNone(raised.exception.usage)
+        self.assertEqual(raised.exception.usage.output_tokens, 200)
+
+    def test_empty_content_with_full_usage_raises_gateway_truncation_error(self) -> None:
+        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat")
+        transport = FakeTransport(
+            [
+                response(
+                    {
+                        "choices": [{"message": {"content": ""}}],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 100},
+                    }
+                )
+            ]
+        )
+        request = GatewayRequest(
+            "model-a", (Message("user", "return JSON"),), 100, output_schema={"type": "object"}
+        )
+
+        with self.assertRaises(GatewayTruncationError):
+            ModelGateway(config, transport=transport).complete(request)
 
     def test_explicit_responses_protocol_does_not_fallback(self) -> None:
         config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="responses")
@@ -473,6 +548,24 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(config.base_url, "https://relay.invalid/v1")
         self.assertEqual(config.timeout_seconds, 900.0)
 
+    def test_structured_format_env_override(self) -> None:
+        config = GatewayConfig.from_env(
+            {
+                "AEGIS_OPENAI_BASE_URL": "https://relay.invalid/v1",
+                "AEGIS_OPENAI_API_KEY": "secret",
+                "AEGIS_OPENAI_STRUCTURED_FORMAT": "json_object",
+            }
+        )
+        self.assertEqual(config.structured_format, "json_object")
+        with self.assertRaisesRegex(ValueError, "AEGIS_OPENAI_STRUCTURED_FORMAT"):
+            GatewayConfig.from_env(
+                {
+                    "AEGIS_OPENAI_BASE_URL": "https://relay.invalid/v1",
+                    "AEGIS_OPENAI_API_KEY": "secret",
+                    "AEGIS_OPENAI_STRUCTURED_FORMAT": "bogus",
+                }
+            )
+
     def test_plain_http_is_rejected_except_explicit_loopback(self) -> None:
         with self.assertRaisesRegex(ValueError, "must use HTTPS"):
             GatewayConfig("http://relay.invalid/v1", "secret")
@@ -643,6 +736,46 @@ class StdlibTransportTests(unittest.TestCase):
                     )
             self.assertEqual(raised.exception.status, 429)
             self.assertTrue(raised.exception.retryable)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_large_response_does_not_deadlock_child_pipe(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        body = b'{"content":"' + b"a" * 262144 + b'"}'
+
+        class LargeResponse(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_: object) -> None:
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), LargeResponse)
+        port = server.server_address[1]
+        import threading
+
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        transport = StdlibHTTPTransport()
+        try:
+            with patch.dict(
+                "os.environ",
+                {"NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"},
+            ):
+                response = transport.post(
+                    f"http://127.0.0.1:{port}/v1/responses",
+                    headers={},
+                    body=b"{}",
+                    timeout=15,
+                    cancel=CancelToken(),
+                )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.body, body)
         finally:
             server.shutdown()
             server.server_close()

@@ -71,7 +71,27 @@ class Ports:
         self.order.append("validate")
         return {"valid": True, "forge": forged_tasks.artifact_id}
 
-    def lock_attribution(self, snapshot, quality_lock, prosecutor_audit, council, task_validation):
+    def evaluate_candidates(
+        self,
+        snapshot,
+        cohort,
+        submission,
+        prosecutor_audit,
+        quality_lock,
+        task_validation,
+    ):
+        self.order.append("candidate-eval")
+        return {"enabled": True, "candidate": None, "report": None}
+
+    def lock_attribution(
+        self,
+        snapshot,
+        quality_lock,
+        prosecutor_audit,
+        council,
+        task_validation,
+        candidate_evaluation,
+    ):
         self.order.append("attribution")
         return {"qualified_coordinates": ["warrior"]}
 
@@ -160,9 +180,10 @@ def test_full_cycle_locks_quality_before_audit_and_council_before_next_tasks() -
                 "reflect:judge",
                 "reflect:prosecutor",
                 "council",
-                "forge",
-                "validate",
-                "attribution",
+                    "forge",
+                    "validate",
+                    "candidate-eval",
+                    "attribution",
                 "qualify",
                 "activate",
             ]

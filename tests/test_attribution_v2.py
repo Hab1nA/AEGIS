@@ -114,7 +114,6 @@ class AttributionV2Tests(unittest.TestCase):
             "seed": 8,
             "model_id": "another-model",
             "environment_id": "another-environment",
-            "plugin_ids": ("filesystem-v2",),
         }
         for field, changed in scalar_changes.items():
             with self.subTest(field=field):
@@ -147,6 +146,58 @@ class AttributionV2Tests(unittest.TestCase):
         )
         self.assertEqual(target_report.disposition, AttributionDisposition.CONFOUNDED)
         self.assertIn("target_role_generation", target_report.reason)
+
+    def test_single_plugin_intervention_is_attributable(self) -> None:
+        plugin_report = qualify_attribution(
+            (
+                pair(
+                    baseline_changes={"plugin_ids": ("filesystem-v2",)},
+                    candidate_changes={"plugin_ids": ("filesystem-v2", "python-v1")},
+                ),
+            )
+        )
+        self.assertEqual(plugin_report.disposition, AttributionDisposition.QUALIFIED)
+        self.assertIn("plugin_ids", plugin_report.reason)
+
+        unchanged_quality = qualify_attribution(
+            (
+                pair(
+                    baseline_quality=0.70,
+                    candidate_quality=0.70,
+                    baseline_changes={"plugin_ids": ("filesystem-v2",)},
+                    candidate_changes={"plugin_ids": ("filesystem-v2", "python-v1")},
+                ),
+            )
+        )
+        self.assertEqual(unchanged_quality.disposition, AttributionDisposition.NOT_QUALIFIED)
+
+    def test_single_runtime_variant_intervention_is_attributable(self) -> None:
+        variant_report = qualify_attribution(
+            (
+                pair(
+                    baseline_changes={"runtime_variant": "image=default;plugins=no-plugins"},
+                    candidate_changes={"runtime_variant": "image=sha256:image;plugins=no-plugins"},
+                ),
+            )
+        )
+        self.assertEqual(variant_report.disposition, AttributionDisposition.QUALIFIED)
+        self.assertIn("runtime_variant", variant_report.reason)
+
+        multi_coordinate = qualify_attribution(
+            (
+                pair(
+                    baseline_changes={
+                        "plugin_ids": ("filesystem-v2",),
+                        "runtime_variant": "image=default;plugins=no-plugins",
+                    },
+                    candidate_changes={
+                        "plugin_ids": ("filesystem-v2", "python-v1"),
+                        "runtime_variant": "image=sha256:image;plugins=python-v1",
+                    },
+                ),
+            )
+        )
+        self.assertEqual(multi_coordinate.disposition, AttributionDisposition.CONFOUNDED)
 
     def test_cross_observation_intervention_tuple_is_locked(self) -> None:
         first = pair(task_id="task-a", seed=1)
