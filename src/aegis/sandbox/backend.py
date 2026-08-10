@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from .types import (
     CommandResult,
@@ -21,7 +21,24 @@ from .types import (
 class SandboxBackend(Protocol):
     def doctor(self) -> DoctorReport: ...
 
-    def prepare(self, sandbox_id: str) -> PreparedSandbox: ...
+    def scanner_available(self) -> bool: ...
+
+    def build_image(
+        self,
+        recipe: Mapping[str, Any],
+        *,
+        dependencies: Mapping[str, bytes] | None = None,
+        attempt_id: str | None = None,
+        timeout_seconds: float = 1800.0,
+    ) -> dict[str, Any]: ...
+
+    def scan_image(
+        self, image: str, *, timeout_seconds: float = 600.0
+    ) -> dict[str, Any]: ...
+
+    def prepare(
+        self, sandbox_id: str, *, image: str | None = None
+    ) -> PreparedSandbox: ...
 
     def stage_archive(self, sandbox_id: str, archive_base64: str, expected_digest: str) -> StagedArtifact: ...
 

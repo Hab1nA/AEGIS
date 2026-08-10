@@ -13,6 +13,8 @@ from .models import (
     QualificationPolicy,
 )
 
+_INTERVENTION_COORDINATES = frozenset({"plugin_ids", "runtime_variant"})
+
 
 def _report(
     rows: tuple[PairedObservation, ...],
@@ -81,15 +83,33 @@ def qualify_attribution(
             f"requires at least {applied.minimum_pairs} paired observations",
         )
 
-    for row in rows:
-        changed = row.confounded_fields()
-        if changed:
-            return _report(
-                rows,
-                applied,
-                AttributionDisposition.CONFOUNDED,
-                f"paired observation is confounded: {','.join(changed)}",
-            )
+    changed_sets = {row.intervention_fields() for row in rows}
+    if len(changed_sets) != 1:
+        return _report(
+            rows,
+            applied,
+            AttributionDisposition.CONFOUNDED,
+            "paired observations disagree on the intervention coordinates",
+        )
+    changed = next(iter(changed_sets))
+    if any(field not in _INTERVENTION_COORDINATES for field in changed):
+        return _report(
+            rows,
+            applied,
+            AttributionDisposition.CONFOUNDED,
+            f"paired observation changes a structural coordinate: {','.join(changed)}",
+        )
+    if len(changed) > 1:
+        return _report(
+            rows,
+            applied,
+            AttributionDisposition.CONFOUNDED,
+            f"paired observation changes multiple coordinates: {','.join(changed)}",
+        )
+    if changed:
+        intervention = changed[0]
+    else:
+        intervention = ""
     if len({_cohort_key(row) for row in rows}) != 1:
         return _report(
             rows,
@@ -146,7 +166,11 @@ def qualify_attribution(
             rows,
             applied,
             AttributionDisposition.QUALIFIED,
-            "quality improvement and cost cap passed",
+            (
+                f"quality improvement and cost cap passed over intervention {intervention}"
+                if intervention
+                else "quality improvement and cost cap passed"
+            ),
             path=QualificationPath.QUALITY_IMPROVEMENT,
             quality_delta=quality_delta,
             cost_change=cost_change,
@@ -156,7 +180,11 @@ def qualify_attribution(
             rows,
             applied,
             AttributionDisposition.QUALIFIED,
-            "quality noninferiority and cost saving passed",
+            (
+                f"quality noninferiority and cost saving passed over intervention {intervention}"
+                if intervention
+                else "quality noninferiority and cost saving passed"
+            ),
             path=QualificationPath.COST_EFFICIENCY,
             quality_delta=quality_delta,
             cost_change=cost_change,

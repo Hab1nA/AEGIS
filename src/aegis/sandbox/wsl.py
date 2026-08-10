@@ -195,10 +195,22 @@ class WslSandboxBackend:
         self._last_doctor = DoctorReport(checks)
         return self._last_doctor
 
-    def prepare(self, sandbox_id: str) -> PreparedSandbox:
+    def prepare(self, sandbox_id: str, *, image: str | None = None) -> PreparedSandbox:
         self._require_healthy()
         self._validate_id(sandbox_id)
-        self._request({"version": 1, "operation": "prepare", "sandbox_id": sandbox_id}, timeout=60)
+        payload: dict[str, object] = {
+            "version": 1,
+            "operation": "prepare",
+            "sandbox_id": sandbox_id,
+        }
+        if image is not None:
+            if (
+                not isinstance(image, str)
+                or re.search(r"(?:@sha256:|^sha256:)[0-9a-f]{64}$", image) is None
+            ):
+                raise ValueError("sandbox image must be pinned by sha256 digest")
+            payload["image"] = image
+        self._request(payload, timeout=60)
         return PreparedSandbox(sandbox_id)
 
     def exec(self, sandbox_id: str, command: CommandSpec) -> CommandResult:
@@ -348,6 +360,81 @@ class WslSandboxBackend:
     def kill(self, sandbox_id: str) -> None:
         self._validate_id(sandbox_id)
         self._request({"version": 1, "operation": "kill", "sandbox_id": sandbox_id}, timeout=10)
+
+    def scanner_available(self) -> bool:
+        """Return whether the WSL agent can scan container images."""
+        try:
+            response = self._request(
+                {"version": 1, "operation": "scanner_probe"}, timeout=15
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+            return False
+        return bool(response.get("available", False))
+
+    def build_image(
+        self,
+        recipe: Mapping[str, Any],
+        *,
+        dependencies: Mapping[str, bytes] | None = None,
+        attempt_id: str | None = None,
+        timeout_seconds: float = 1800.0,
+    ) -> dict[str, Any]:
+        """Ask the WSL agent to build one offline recipe with rootless podman."""
+        if not 0 < timeout_seconds <= 86_400:
+            raise ValueError("build timeout_seconds is outside the safe range")
+        payload: dict[str, Any] = {
+            "version": 1,
+            "operation": "build_image",
+            "recipe": dict(recipe),
+            "dependencies": {},
+            "timeout_seconds": float(timeout_seconds),
+        }
+        if attempt_id is not None:
+            if not isinstance(attempt_id, str) or not attempt_id:
+                raise ValueError("attempt_id must be non-empty text")
+            payload["attempt_id"] = attempt_id
+        else:
+            raise ValueError("build_image requires an attempt_id")
+        if dependencies:
+            encoded: dict[str, str] = {}
+            total = 0
+            for name, data in sorted(dependencies.items()):
+                if not isinstance(name, str) or not name or "\x00" in name:
+                    raise ValueError("dependency name is invalid")
+                total += len(data)
+                if total > 64 * 1024 * 1024:
+                    raise ValueError("build dependencies exceed the transfer limit")
+                encoded[name] = base64.b64encode(data).decode("ascii")
+            payload["dependencies"] = encoded
+        response = self._request(payload, timeout=timeout_seconds + 30)
+        raw = response.get("staged")
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("sandbox agent omitted build staging result")
+        return dict(raw)
+
+    def scan_image(
+        self, image: str, *, timeout_seconds: float = 600.0
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(image, str)
+            or re.search(r"(?:@sha256:|^sha256:)[0-9a-f]{64}$", image) is None
+        ):
+            raise ValueError("scan image must be pinned by sha256 digest")
+        if not 0 < timeout_seconds <= 3600:
+            raise ValueError("scan timeout_seconds is outside the safe range")
+        response = self._request(
+            {
+                "version": 1,
+                "operation": "scan_image",
+                "image": image,
+                "timeout_seconds": float(timeout_seconds),
+            },
+            timeout=timeout_seconds + 30,
+        )
+        raw = response.get("scan")
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("sandbox agent omitted scan result")
+        return dict(raw)
 
     def _artifact_request(self, operation: str, sandbox_id: str) -> FrozenArtifact:
         self._validate_id(sandbox_id)

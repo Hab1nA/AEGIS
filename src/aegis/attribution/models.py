@@ -90,10 +90,13 @@ class EvaluationArm:
     usage_verified: bool
     safety_passed: bool
     integrity_passed: bool
+    runtime_variant: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("cycle_id", "objective_id", "task_id", "model_id", "environment_id"):
             _text(getattr(self, name), name)
+        if self.runtime_variant is not None:
+            _text(self.runtime_variant, "runtime_variant", maximum=512)
         if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
             raise ValueError("seed must be a non-negative integer")
         if tuple(sorted(set(self.plugin_ids))) != self.plugin_ids:
@@ -135,14 +138,20 @@ class EvaluationArm:
             "usage_verified",
             "safety_passed",
             "integrity_passed",
+            "runtime_variant",
         }
-        _strict_keys(value, expected, "evaluation arm")
+        if set(value) != expected:
+            if not (set(value) == expected - {"runtime_variant"}):
+                raise ValueError("evaluation arm has missing or unknown fields")
         plugins = value["plugin_ids"]
         roles = value["role_generations"]
         if not isinstance(plugins, list) or not all(isinstance(item, str) for item in plugins):
             raise TypeError("plugin_ids must be an array of strings")
         if not isinstance(roles, list) or not all(isinstance(item, Mapping) for item in roles):
             raise TypeError("role_generations must be an array of objects")
+        runtime_variant = value.get("runtime_variant")
+        if runtime_variant is not None and not isinstance(runtime_variant, str):
+            raise TypeError("runtime_variant must be text or null")
         return cls(
             cycle_id=value["cycle_id"],
             objective_id=value["objective_id"],
@@ -157,6 +166,7 @@ class EvaluationArm:
             usage_verified=value["usage_verified"],
             safety_passed=value["safety_passed"],
             integrity_passed=value["integrity_passed"],
+            runtime_variant=runtime_variant,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -174,6 +184,7 @@ class EvaluationArm:
             "usage_verified": self.usage_verified,
             "safety_passed": self.safety_passed,
             "integrity_passed": self.integrity_passed,
+            "runtime_variant": self.runtime_variant,
         }
 
     def generation_for(self, role: str) -> RoleGeneration | None:
@@ -271,6 +282,19 @@ class PairedObservation:
         if left_roles.get(self.target_role) == right_roles.get(self.target_role):
             changed.append("target_role_generation")
         return tuple(changed)
+
+    def intervention_fields(self) -> tuple[str, ...]:
+        """Return the causal coordinates that differ between the two arms.
+
+        A valid single-surface intervention changes exactly one coordinate
+        (``plugin_ids`` for a plugin candidate, ``runtime_variant`` for an
+        environment candidate, or none for advisory workflow/subject
+        candidates whose effect is carried by the role generation identity).
+        """
+        changed = list(self.confounded_fields())
+        if self.baseline.runtime_variant != self.candidate.runtime_variant:
+            changed.append("runtime_variant")
+        return tuple(sorted(dict.fromkeys(changed)))
 
 
 class QualificationPath(StrEnum):

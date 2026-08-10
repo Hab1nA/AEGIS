@@ -35,6 +35,7 @@ _EVIDENCE_ACTIONS = frozenset(
         "complete_council",
         "complete_task_forge",
         "complete_task_validation",
+        "evaluate_candidates",
         "lock_attribution",
         "qualify_role_candidates",
         "commit_activation_set",

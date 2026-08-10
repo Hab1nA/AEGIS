@@ -84,6 +84,15 @@ class AutonomyV2Config:
     external_writes_via_connectors: bool = True
     role_activation_automatic: bool = True
     immutable_safety_constitution: bool = True
+    evolution_surfaces: tuple[str, ...] = (
+        "workflow",
+        "subject",
+        "plugin",
+        "environment",
+    )
+    environment_output_repository: str | None = None
+    scanner_binary: str = "trivy"
+    candidate_max_extra_steps: int = 12
 
     _FIELDS = frozenset(
         {
@@ -103,7 +112,14 @@ class AutonomyV2Config:
             "external_writes_via_connectors",
             "role_activation_automatic",
             "immutable_safety_constitution",
+            "evolution_surfaces",
+            "environment_output_repository",
+            "scanner_binary",
+            "candidate_max_extra_steps",
         }
+    )
+    _EVOLUTION_SURFACES = frozenset(
+        {"workflow", "subject", "plugin", "environment"}
     )
 
     @classmethod
@@ -159,6 +175,33 @@ class AutonomyV2Config:
         )
         if enabled and not immutable:
             raise ConfigError("autonomy_v2 safety constitution must remain immutable to roles")
+        surfaces = raw.get("evolution_surfaces", ("workflow", "subject", "plugin", "environment"))
+        if not isinstance(surfaces, (list, tuple)) or not surfaces or len(surfaces) != len(set(surfaces)):
+            raise ConfigError("autonomy_v2.evolution_surfaces must be a unique non-empty list")
+        if any(not isinstance(item, str) or item not in cls._EVOLUTION_SURFACES for item in surfaces):
+            raise ConfigError("autonomy_v2.evolution_surfaces contains an unknown surface")
+        environment_output = raw.get("environment_output_repository")
+        if environment_output is not None:
+            if (
+                not isinstance(environment_output, str)
+                or not environment_output
+                or environment_output != environment_output.strip()
+                or any(
+                    character
+                    not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-"
+                    for character in environment_output
+                )
+                or environment_output.startswith("/")
+                or ".." in environment_output
+            ):
+                raise ConfigError("autonomy_v2.environment_output_repository is invalid")
+        scanner_binary = raw.get("scanner_binary", "trivy")
+        if not isinstance(scanner_binary, str) or not scanner_binary or scanner_binary != scanner_binary.strip():
+            raise ConfigError("autonomy_v2.scanner_binary must be a non-empty trimmed string")
+        candidate_steps = _positive_int(
+            raw.get("candidate_max_extra_steps", 12),
+            "autonomy_v2.candidate_max_extra_steps",
+        )
         return cls(
             enabled=enabled,
             dynamic_only=dynamic_only,
@@ -191,6 +234,10 @@ class AutonomyV2Config:
             external_writes_via_connectors=connectors,
             role_activation_automatic=automatic,
             immutable_safety_constitution=immutable,
+            evolution_surfaces=tuple(surfaces),
+            environment_output_repository=environment_output,
+            scanner_binary=scanner_binary,
+            candidate_max_extra_steps=candidate_steps,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -211,6 +258,10 @@ class AutonomyV2Config:
             "external_writes_via_connectors": self.external_writes_via_connectors,
             "role_activation_automatic": self.role_activation_automatic,
             "immutable_safety_constitution": self.immutable_safety_constitution,
+            "evolution_surfaces": list(self.evolution_surfaces),
+            "environment_output_repository": self.environment_output_repository,
+            "scanner_binary": self.scanner_binary,
+            "candidate_max_extra_steps": self.candidate_max_extra_steps,
         }
 
 

@@ -19,6 +19,7 @@ class CycleState(StrEnum):
     COUNCIL_COMPLETED = "council_completed"
     NEXT_TASKS_FORGED = "next_tasks_forged"
     TASKS_VALIDATED = "tasks_validated"
+    CANDIDATES_EVALUATED = "candidates_evaluated"
     ATTRIBUTION_LOCKED = "attribution_locked"
     ROLE_CANDIDATES_QUALIFIED = "role_candidates_qualified"
     ACTIVATION_SET_COMMITTED = "activation_set_committed"
@@ -53,6 +54,7 @@ _ORDER = (
     CycleState.COUNCIL_COMPLETED,
     CycleState.NEXT_TASKS_FORGED,
     CycleState.TASKS_VALIDATED,
+    CycleState.CANDIDATES_EVALUATED,
     CycleState.ATTRIBUTION_LOCKED,
     CycleState.ROLE_CANDIDATES_QUALIFIED,
     CycleState.ACTIVATION_SET_COMMITTED,
@@ -78,6 +80,8 @@ _NAMED_FORWARD: dict[tuple[CycleState, str], CycleState] = {
     ): CycleState.COUNCIL_COMPLETED,
     (CycleState.COUNCIL_COMPLETED, "complete_task_forge"): CycleState.NEXT_TASKS_FORGED,
     (CycleState.NEXT_TASKS_FORGED, "complete_task_validation"): CycleState.TASKS_VALIDATED,
+    (CycleState.TASKS_VALIDATED, "evaluate_candidates"): CycleState.CANDIDATES_EVALUATED,
+    (CycleState.CANDIDATES_EVALUATED, "lock_attribution"): CycleState.ATTRIBUTION_LOCKED,
     (CycleState.TASKS_VALIDATED, "lock_attribution"): CycleState.ATTRIBUTION_LOCKED,
     (CycleState.ATTRIBUTION_LOCKED, "qualify_role_candidates"): CycleState.ROLE_CANDIDATES_QUALIFIED,
     (CycleState.ROLE_CANDIDATES_QUALIFIED, "commit_activation_set"): CycleState.ACTIVATION_SET_COMMITTED,

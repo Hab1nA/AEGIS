@@ -18,10 +18,13 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol
+
+from aegis.models import canonical_json
 
 from .sealed import (
     MAX_WORKER_OUTPUT_BYTES,
@@ -35,7 +38,10 @@ PROTOCOL_VERSION = 1
 OPERATIONS = frozenset(
     {
         "doctor",
+        "scanner_probe",
         "prepare",
+        "build_image",
+        "scan_image",
         "stage_archive",
         "configure_workspace_access",
         "exec",
@@ -72,6 +78,17 @@ MAX_ARCHIVE_ENTRIES = 4096
 MAX_PROCESS_OUTPUT_BYTES = 1024 * 1024
 MAX_WRITABLE_PATHS = 64
 ACCESS_POLICY_FILE = "workspace-access.json"
+SCANNER_BINARY = "trivy"
+_IMAGE_REFERENCE = re.compile(r"(?:@sha256:|^sha256:)[0-9a-f]{64}$")
+
+
+def _image_digest(value: str) -> str:
+    """Extract the sha256 digest from a pinned image reference."""
+    if _IMAGE_REFERENCE.search(value) is None:
+        raise RuntimeError("sandbox image must be pinned by sha256 digest")
+    if "@sha256:" in value:
+        return value.rsplit("@sha256:", 1)[1]
+    return value.removeprefix("sha256:")
 
 
 class Runner(Protocol):
@@ -245,8 +262,21 @@ class SandboxAgent:
         operation = data.get("operation")
         if operation not in OPERATIONS:
             raise ValueError("unsupported operation")
+        sandbox_operations = {
+            "prepare",
+            "stage_archive",
+            "configure_workspace_access",
+            "exec",
+            "evaluate_sealed",
+            "freeze",
+            "export",
+            "destroy",
+            "kill",
+        }
         required = (
-            {"version", "operation"} if operation == "doctor" else {"version", "operation", "sandbox_id"}
+            {"version", "operation"}
+            if operation not in sandbox_operations
+            else {"version", "operation", "sandbox_id"}
         )
         extra = (
             {"command"}
@@ -257,16 +287,55 @@ class SandboxAgent:
                 else (
                     {"archive_base64", "expected_sha256"}
                     if operation == "stage_archive"
-                    else ({"writable_paths"} if operation == "configure_workspace_access" else set())
+                    else (
+                        {"writable_paths"}
+                        if operation == "configure_workspace_access"
+                        else (
+                            {"image"}
+                            if operation == "prepare"
+                            else (
+                                {"recipe", "dependencies", "attempt_id", "timeout_seconds"}
+                                if operation == "build_image"
+                                else (
+                                    {"image", "timeout_seconds"}
+                                    if operation == "scan_image"
+                                    else set()
+                                )
+                            )
+                        )
+                    )
                 )
             )
         )
-        if set(data) != (required | extra):
+        optional: set[str] = set()
+        if operation == "prepare":
+            optional.add("image")
+        if not (required <= set(data) and set(data) <= (required | extra | optional)):
+            raise ValueError("request has missing or unknown fields")
+        if not optional and set(data) != (required | extra):
             raise ValueError("request has missing or unknown fields")
         if data.get("version") != PROTOCOL_VERSION:
             raise ValueError("unsupported protocol version")
         if operation == "doctor":
             return {"ok": True, "checks": self.doctor()}
+        if operation == "scanner_probe":
+            available, detail = self._scanner_available()
+            return {"ok": True, "available": available, "detail": detail}
+        if operation == "build_image":
+            return {
+                "ok": True,
+                "staged": self.build_image(
+                    data["recipe"],
+                    data.get("dependencies", {}),
+                    data["attempt_id"],
+                    data["timeout_seconds"],
+                ),
+            }
+        if operation == "scan_image":
+            return {
+                "ok": True,
+                "scan": self.scan_image(data["image"], data["timeout_seconds"]),
+            }
         sandbox_id = _sandbox_id(data.get("sandbox_id"))
         if operation == "destroy":
             self.destroy(sandbox_id)
@@ -276,7 +345,7 @@ class SandboxAgent:
             return {"ok": True}
         self._require_healthy()
         if operation == "prepare":
-            self.prepare(sandbox_id)
+            self.prepare(sandbox_id, image=data.get("image"))
             return {"ok": True}
         if operation == "exec":
             return {"ok": True, "result": self.execute(sandbox_id, data["command"])}
@@ -363,11 +432,13 @@ class SandboxAgent:
             if not sensitive
             else f"sensitive variables present: {','.join(sensitive)}",
         )
+        scanner_ok, scanner_detail = self._scanner_available()
+        checks["scanner_available"] = (scanner_ok, scanner_detail)
         return [
             {"name": name, "passed": checks[name][0], "detail": checks[name][1]} for name in REQUIRED_CHECKS
         ]
 
-    def prepare(self, sandbox_id: str) -> None:
+    def prepare(self, sandbox_id: str, image: object = None) -> None:
         root = self._sandbox_path(sandbox_id)
         if root.exists():
             if (root / "prepared").is_file():
@@ -376,8 +447,276 @@ class SandboxAgent:
                 return
             raise RuntimeError("sandbox already exists but is not prepared")
         root.mkdir(mode=0o700, parents=True)
+        if image is not None:
+            if not isinstance(image, str):
+                raise RuntimeError("sandbox image must be pinned by sha256 digest")
+            digest = _image_digest(image)
+            candidate = image
+            exists = self.runner(
+                [self.config.podman, "image", "exists", candidate],
+                input=None,
+                timeout=30,
+                env=self._podman_env(),
+            )
+            if exists.returncode != 0 and "@sha256:" in candidate:
+                # A locally built image may only be resolvable by its image id
+                # even though the manifest carries a repository@digest
+                # reference.  Fall back to the digest-only form before failing.
+                candidate = f"sha256:{digest}"
+                exists = self.runner(
+                    [self.config.podman, "image", "exists", candidate],
+                    input=None,
+                    timeout=30,
+                    env=self._podman_env(),
+                )
+            if exists.returncode != 0:
+                raise RuntimeError("requested sandbox image is unavailable in the distribution")
+            (root / "image").write_text(candidate + "\n", encoding="ascii")
         (root / "workspace").mkdir(mode=0o700)
         (root / "prepared").write_text("1\n", encoding="ascii")
+
+    def _sandbox_image(self, sandbox_id: str) -> str:
+        marker = self._sandbox_path(sandbox_id) / "image"
+        if marker.is_file():
+            image = marker.read_text(encoding="ascii").strip()
+            if _IMAGE_REFERENCE.search(image) is None:
+                raise RuntimeError("sandbox image marker is invalid")
+            return image
+        return self.config.image
+
+    def _scanner_available(self) -> tuple[bool, str]:
+        try:
+            result = self.runner(
+                [SCANNER_BINARY, "--version"],
+                input=None,
+                timeout=15,
+                env=self._podman_env(),
+            )
+        except Exception as exc:
+            return False, f"scanner probe failed: {exc}"
+        if result.returncode == 0:
+            return True, result.stdout.strip()[:200] or "scanner available"
+        return False, (result.stderr.strip()[:200] or "scanner binary unavailable")
+
+    def _podman_runtime_dir(self) -> str:
+        return f"/run/user/{int(self.uid_getter())}"
+
+    def _ensure_podman_socket(self) -> None:
+        """Start the rootless podman API socket when the WSL instance has no
+        live user session for it yet.  Trivy resolves images through this
+        socket, and a fresh WSL instance starts with the socket inactive."""
+        runtime_dir = self._podman_runtime_dir()
+        socket_path = Path(runtime_dir) / "podman" / "podman.sock"
+        if socket_path.exists():
+            return
+        env = dict(self.environ)
+        env["XDG_RUNTIME_DIR"] = runtime_dir
+        result = self.runner(
+            ["systemctl", "--user", "start", "podman.socket"],
+            input=None,
+            timeout=30,
+            env=env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "cannot start the podman API socket for image scanning: "
+                + (result.stderr or result.stdout or "")[:500]
+            )
+        for _ in range(40):
+            if socket_path.exists():
+                return
+            time.sleep(0.5)
+        raise RuntimeError("podman API socket did not become ready")
+
+    def build_image(
+        self,
+        recipe: object,
+        dependencies: object,
+        attempt_id: str,
+        timeout_seconds: object,
+    ) -> dict[str, Any]:
+        if not isinstance(recipe, Mapping) or not isinstance(dependencies, Mapping):
+            raise ValueError("build_image requires a recipe object and dependencies object")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("build_image requires a non-empty attempt_id")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < float(timeout_seconds) <= 86_400
+        ):
+            raise ValueError("build_image timeout is outside the safe range")
+        recipe_id = recipe.get("recipe_id")
+        parent_image = recipe.get("parent_image")
+        build_steps = recipe.get("build_steps")
+        if not isinstance(recipe_id, str) or not recipe_id.startswith("sha256:"):
+            raise ValueError("recipe_id must be a content address")
+        if not isinstance(parent_image, str) or re.search(r"@sha256:[0-9a-f]{64}$", parent_image) is None:
+            raise ValueError("parent_image must be pinned by sha256 digest")
+        if not isinstance(build_steps, list) or not build_steps or len(build_steps) > 32:
+            raise ValueError("build_steps must be a bounded non-empty list")
+        dependency_hashes: dict[str, str] = {}
+        started = time.monotonic()
+        context = Path(tempfile.mkdtemp(dir=self.config.workspace_root, prefix="aegis-build-"))
+        timed_out = False
+        exit_code = 0
+        try:
+            for name, payload in sorted(dependencies.items()):
+                if not isinstance(name, str) or not name or "\x00" in name:
+                    raise ValueError("dependency name is invalid")
+                relative = PurePosixPath(name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("dependency name is not a safe relative path")
+                if not isinstance(payload, bytes) or not payload:
+                    raise ValueError("dependency payload must be non-empty bytes")
+                target = context.joinpath(*relative.parts)
+                if target.is_symlink() or not str(target).startswith(str(context)):
+                    raise ValueError("dependency target escapes the build context")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+                dependency_hashes[name] = hashlib.sha256(payload).hexdigest()
+            lines = [f"FROM {parent_image}"]
+            for name in sorted(dependency_hashes):
+                lines.append(f"COPY {name} /opt/aegis-deps/{name}")
+            for step in build_steps:
+                if not isinstance(step, Mapping):
+                    raise ValueError("build step must be an object")
+                argv = step.get("argv")
+                cwd = step.get("cwd", ".")
+                if (
+                    not isinstance(argv, list)
+                    or not argv
+                    or len(argv) > 32
+                    or not all(isinstance(item, str) and item and "\x00" not in item for item in argv)
+                ):
+                    raise ValueError("build step argv is invalid")
+                if not isinstance(cwd, str) or cwd.startswith("/") or ".." in PurePosixPath(cwd).parts:
+                    raise ValueError("build step cwd is invalid")
+                if cwd != ".":
+                    lines.append(f"WORKDIR /{cwd}")
+                lines.append(f"RUN {json.dumps(argv)}")
+            containerfile = context / "Containerfile"
+            containerfile.write_text("\n".join(lines) + "\n", encoding="ascii")
+            iidfile = context / "image.id"
+            result = self.runner(
+                [
+                    self.config.podman,
+                    "build",
+                    "--network",
+                    "none",
+                    "--iidfile",
+                    str(iidfile),
+                    "-f",
+                    str(containerfile),
+                    str(context),
+                ],
+                input=None,
+                timeout=float(timeout_seconds),
+                env=self._podman_env(),
+            )
+            exit_code = result.returncode
+            if exit_code == 124:
+                timed_out = True
+            if exit_code != 0 and not timed_out:
+                raise RuntimeError("podman build failed: " + (result.stderr or "")[-2000:])
+            if timed_out or not iidfile.is_file():
+                raise RuntimeError("podman build timed out")
+            image_id = iidfile.read_text(encoding="ascii").strip()
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
+                raise RuntimeError("build produced an invalid image id")
+            image_sha256 = image_id.split(":")[1]
+            inspect = self.runner(
+                [self.config.podman, "image", "inspect", "--format", "{{.Size}}", image_id],
+                input=None,
+                timeout=30,
+                env=self._podman_env(),
+            )
+            size = int(inspect.stdout.strip()) if inspect.returncode == 0 and inspect.stdout.strip().isdigit() else 0
+            if size <= 0:
+                raise RuntimeError("build produced an empty image")
+            sbom_payload = {
+                "recipe_id": recipe_id,
+                "dependency_hashes": dependency_hashes,
+                "image_sha256": image_sha256,
+            }
+            sbom_sha256 = hashlib.sha256(canonical_json(sbom_payload).encode("utf-8")).hexdigest()
+            provenance_payload = {
+                "attempt_id": attempt_id,
+                "recipe_id": recipe_id,
+                "image_sha256": image_sha256,
+                "elapsed_seconds": time.monotonic() - started,
+            }
+            provenance_sha256 = hashlib.sha256(
+                canonical_json(provenance_payload).encode("utf-8")
+            ).hexdigest()
+            isolation_sha256 = hashlib.sha256(
+                "network=none;secrets=none;host_mounts=none".encode("utf-8")
+            ).hexdigest()
+            return {
+                "staged_artifact_id": f"sha256:{image_sha256}",
+                "attempt_id": attempt_id,
+                "image_sha256": image_sha256,
+                "output_size_bytes": size,
+                "sbom_sha256": sbom_sha256,
+                "provenance_sha256": provenance_sha256,
+                "isolation_receipt_sha256": isolation_sha256,
+                "elapsed_seconds": time.monotonic() - started,
+                "timed_out": timed_out,
+                "exit_code": exit_code,
+                "network_used": False,
+                "secrets_used": False,
+                "host_mounts_used": False,
+            }
+        finally:
+            shutil.rmtree(context, ignore_errors=True)
+
+    def scan_image(self, image: object, timeout_seconds: object) -> dict[str, Any]:
+        if not isinstance(image, str):
+            raise ValueError("scan_image requires a digest-pinned image")
+        image_digest = _image_digest(image)
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < float(timeout_seconds) <= 3600
+        ):
+            raise ValueError("scan_image timeout is outside the safe range")
+        available, detail = self._scanner_available()
+        if not available:
+            raise RuntimeError("image scanner is unavailable: " + detail)
+        self._ensure_podman_socket()
+        started = time.monotonic()
+        timed_out = False
+        try:
+            result = self.runner(
+                [
+                    SCANNER_BINARY,
+                    "image",
+                    "--scanners",
+                    "vuln",
+                    "--no-progress",
+                    "--exit-code",
+                    "1",
+                    "--ignore-unfixed",
+                    "--skip-db-update",
+                    "--skip-java-db-update",
+                    "--skip-version-check",
+                    f"sha256:{image_digest}",
+                ],
+                input=None,
+                timeout=float(timeout_seconds),
+                env=self._podman_env(),
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            raise RuntimeError("image scan timed out") from None
+        report_bytes = (result.stdout or "").encode("utf-8") + (result.stderr or "").encode("utf-8")
+        return {
+            "staged_artifact_id": f"sha256:{image_digest}",
+            "image_sha256": image_digest,
+            "vulnerability_report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+            "passed": result.returncode == 0,
+            "elapsed_seconds": time.monotonic() - started,
+            "timed_out": timed_out,
+        }
 
     def execute(self, sandbox_id: str, command: object) -> dict[str, Any]:
         root = self._active_root(sandbox_id)
@@ -598,8 +937,9 @@ class SandboxAgent:
             "/workspace",
             "--volume",
             f"{workspace}:/workspace:ro,Z",
-            self.config.image,
+            "--entrypoint",
             "python",
+            self._sandbox_image(sandbox_id),
             "-B",
             "-I",
             "-c",
@@ -645,7 +985,11 @@ class SandboxAgent:
                 argv.extend(["--volume", f"{source}:/workspace/{path}:rw,Z"])
         for name in sorted(env):
             argv.extend(["--env", name])
-        argv.extend([self.config.image, *args])
+        # A built environment image may inherit an application ENTRYPOINT
+        # (for example a search engine image).  The sandbox always invokes an
+        # explicit command, so override the entrypoint with its first program.
+        argv.extend(["--entrypoint", args[0]])
+        argv.extend([self._sandbox_image(sandbox_id), *args[1:]])
         return argv, child_env
 
     def freeze(self, sandbox_id: str) -> bytes:
@@ -742,6 +1086,7 @@ class SandboxAgent:
     def _podman_env(self) -> dict[str, str]:
         env = {name: value for name, value in self.environ.items() if name in PODMAN_HOST_ENV}
         env.setdefault("PATH", "/usr/bin:/bin")
+        env.setdefault("XDG_RUNTIME_DIR", self._podman_runtime_dir())
         return env
 
     def _sandbox_path(self, sandbox_id: str) -> Path:

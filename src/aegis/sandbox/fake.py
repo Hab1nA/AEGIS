@@ -7,6 +7,7 @@ import io
 import tarfile
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, Mapping
 
 from .types import (
     CommandResult,
@@ -29,11 +30,16 @@ class FakeSandboxBackend:
         healthy: bool = True,
         executor: Callable[[str, CommandSpec], CommandResult] | None = None,
         sealed_evaluator: Callable[[str, bytes, float], SealedEvaluationResult] | None = None,
+        build_image_handler: Any = None,
+        scan_image_handler: Any = None,
     ) -> None:
         self.healthy = healthy
         self.executor = executor
         self.sealed_evaluator = sealed_evaluator
+        self.build_image_handler = build_image_handler
+        self.scan_image_handler = scan_image_handler
         self.prepared: set[str] = set()
+        self.images: dict[str, str | None] = {}
         self.frozen: set[str] = set()
         self.killed: set[str] = set()
         self.commands: list[tuple[str, CommandSpec]] = []
@@ -45,11 +51,42 @@ class FakeSandboxBackend:
     def doctor(self) -> DoctorReport:
         return DoctorReport((DoctorCheck("fake_backend", self.healthy, "configured health"),))
 
-    def prepare(self, sandbox_id: str) -> PreparedSandbox:
+    def scanner_available(self) -> bool:
+        return True
+
+    def build_image(
+        self,
+        recipe: Mapping[str, Any],
+        *,
+        dependencies: Mapping[str, bytes] | None = None,
+        attempt_id: str | None = None,
+        timeout_seconds: float = 1800.0,
+    ) -> dict[str, Any]:
+        if self.build_image_handler is not None:
+            result = self.build_image_handler(recipe, dependencies, attempt_id, timeout_seconds)
+            return dict(result)
+        raise NotImplementedError("fake sandbox has no image builder configured")
+
+    def scan_image(
+        self, image: str, *, timeout_seconds: float = 600.0
+    ) -> dict[str, Any]:
+        if self.scan_image_handler is not None:
+            result = self.scan_image_handler(image, timeout_seconds)
+            return dict(result)
+        raise NotImplementedError("fake sandbox has no image scanner configured")
+
+    def prepare(self, sandbox_id: str, *, image: str | None = None) -> PreparedSandbox:
         self._validate_id(sandbox_id)
         if not self.doctor().passed:
             raise RuntimeError("sandbox doctor failed")
+        if image is not None and (
+            not isinstance(image, str)
+            or "@sha256:" not in image
+            or len(image.rsplit("@sha256:", 1)[1]) != 64
+        ):
+            raise ValueError("sandbox image must be digest-pinned")
         self.prepared.add(sandbox_id)
+        self.images[sandbox_id] = image
         self._files[sandbox_id] = {}
         return PreparedSandbox(sandbox_id)
 

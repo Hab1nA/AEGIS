@@ -86,6 +86,16 @@ class EvolutionCyclePort(Protocol):
         self, snapshot: CurriculumSnapshot, forged_tasks: ArtifactRef
     ) -> Mapping[str, Any]: ...
 
+    def evaluate_candidates(
+        self,
+        snapshot: CurriculumSnapshot,
+        cohort: DynamicTaskCohort,
+        submission: ArtifactRef,
+        prosecutor_audit: ArtifactRef,
+        quality_lock: ArtifactRef,
+        task_validation: ArtifactRef,
+    ) -> Mapping[str, Any]: ...
+
     def lock_attribution(
         self,
         snapshot: CurriculumSnapshot,
@@ -93,6 +103,7 @@ class EvolutionCyclePort(Protocol):
         prosecutor_audit: ArtifactRef,
         council: ArtifactRef,
         task_validation: ArtifactRef,
+        candidate_evaluation: ArtifactRef,
     ) -> Mapping[str, Any]: ...
 
     def qualify_role_candidates(
@@ -125,6 +136,7 @@ class CycleRunResult:
     council: ArtifactRef
     forged_tasks: ArtifactRef
     task_validation: ArtifactRef
+    candidate_evaluation: ArtifactRef
     attribution: ArtifactRef
     qualification: ArtifactRef
     activation: ArtifactRef
@@ -298,6 +310,21 @@ class EvolutionCycleController:
                 "complete_task_validation", evidence_id=task_validation.artifact_id
             )
 
+            candidate_evaluation = self._record(
+                "candidate-evaluation",
+                self._ports.evolution.evaluate_candidates(
+                    snapshot,
+                    cohort,
+                    submission,
+                    prosecutor_audit,
+                    quality_lock,
+                    task_validation,
+                ),
+            )
+            self._registry.transition_cycle(
+                "evaluate_candidates", evidence_id=candidate_evaluation.artifact_id
+            )
+
             attribution = self._record(
                 "attribution",
                 self._ports.evolution.lock_attribution(
@@ -306,6 +333,7 @@ class EvolutionCycleController:
                     prosecutor_audit,
                     council,
                     task_validation,
+                    candidate_evaluation,
                 ),
             )
             self._registry.transition_cycle("lock_attribution", evidence_id=attribution.artifact_id)
@@ -338,6 +366,7 @@ class EvolutionCycleController:
                     "council": council.artifact_id,
                     "forged_tasks": forged_tasks.artifact_id,
                     "task_validation": task_validation.artifact_id,
+                    "candidate_evaluation": candidate_evaluation.artifact_id,
                     "attribution": attribution.artifact_id,
                     "qualification": qualification.artifact_id,
                     "activation": activation.artifact_id,
@@ -360,6 +389,7 @@ class EvolutionCycleController:
             council,
             forged_tasks,
             task_validation,
+            candidate_evaluation,
             attribution,
             qualification,
             activation,

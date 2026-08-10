@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from dataclasses import asdict, is_dataclass
@@ -26,6 +27,7 @@ from aegis.dynamic_tasks import (
     TaskForge,
 )
 from aegis.event_store import EventStore
+from aegis.evolution.registry import EvolutionRegistry
 from aegis.gateway.client import GatewayConfig, ModelGateway
 from aegis.gateway.types import GatewayRequest, Message
 from aegis.knowledge import KnowledgeStore
@@ -192,7 +194,11 @@ def _evolution_cycle(args: argparse.Namespace) -> Mapping[str, Any]:
 
 
 def _run_v2_cycle_cli(
-    config: CampaignConfig, root: Path, *, repair: bool = False
+    config: CampaignConfig,
+    root: Path,
+    *,
+    repair: bool = False,
+    no_candidate_eval: bool = False,
 ) -> Mapping[str, Any]:
     """Execute one full model-driven v2 cycle through the real runtime wiring."""
     store = _store()
@@ -205,11 +211,30 @@ def _run_v2_cycle_cli(
         _require_healthy_sandbox(sandbox)
         curriculum = CurriculumRegistry(store, config.campaign_id)
         roles = RoleRegistry(store, config.campaign_id)
+        evolution = EvolutionRegistry(store, config.campaign_id)
         artifacts = ContentAddressedArtifactStore(root / "artifacts")
         runner = SandboxTaskPackRunner(sandbox, id_namespace=config.campaign_id)
         forge = TaskForge(dynamic)
         gateway = ModelGateway(GatewayConfig.from_env())
         autonomy = config.autonomy_v2
+        environment_builder = None
+        if (
+            autonomy is not None
+            and "environment" in autonomy.evolution_surfaces
+            and autonomy.environment_output_repository is not None
+            and config.sandbox_backend != "fake"
+        ):
+            from aegis.evolution.env_builder import build_wsl_environment_builder
+
+            environment_builder = build_wsl_environment_builder(
+                sandbox=sandbox,
+                research=_research(config),
+                artifacts=artifacts,
+                output_repository=autonomy.environment_output_repository,
+                builder_identity_sha256=hashlib.sha256(
+                    "aegis-env-builder-v2".encode("utf-8")
+                ).hexdigest(),
+            )
         source_commit = None
         if autonomy is not None and autonomy.public_repo_url is not None:
             source_commit = _git_head(Path(__file__).resolve().parents[2])
@@ -248,6 +273,16 @@ def _run_v2_cycle_cli(
                 if autonomy is not None and autonomy.public_repo_url is not None
                 else None
             ),
+            evolution=evolution,
+            environment_builder=environment_builder,
+            default_image=None,
+            evaluate_candidates_enabled=not no_candidate_eval,
+            candidate_max_extra_steps=(
+                autonomy.candidate_max_extra_steps
+                if autonomy is not None
+                else 12
+            ),
+            campaign_config=config,
         )
         if hasattr(result, "status"):
             return {
@@ -414,6 +449,58 @@ def _run_autonomy_preflight(campaign_id: str) -> dict[str, Any]:
     )
     _check("research_enabled", config.research_enabled, f"research_enabled={config.research_enabled}")
     _check("online_research", not config.offline_research, f"offline_research={config.offline_research}")
+
+    autonomy = config.autonomy_v2
+    known_surfaces = frozenset({"workflow", "subject", "plugin", "environment"})
+    if autonomy is None:
+        _check("evolution_surfaces_valid", False, "autonomy_v2 is not configured")
+    else:
+        surfaces_ok = bool(autonomy.evolution_surfaces) and set(
+            autonomy.evolution_surfaces
+        ) <= known_surfaces
+        _check(
+            "evolution_surfaces_valid",
+            surfaces_ok,
+            f"evolution_surfaces={list(autonomy.evolution_surfaces)}",
+        )
+        env_enabled = "environment" in autonomy.evolution_surfaces
+        env_configured = (
+            env_enabled
+            and autonomy.environment_output_repository is not None
+            and config.sandbox_backend != "fake"
+        )
+        _check(
+            "environment_builder_configured",
+            not env_enabled or env_configured,
+            (
+                "environment surface requires environment_output_repository and a real sandbox"
+                if env_enabled and not env_configured
+                else "environment surface is configured"
+            ),
+        )
+        if env_enabled and config.sandbox_backend != "fake":
+            try:
+                scanner_ok = WslSandboxBackend().scanner_available()
+            except Exception:
+                scanner_ok = False
+            _check(
+                "environment_scanner_available",
+                scanner_ok,
+                "trivy must be installed in the dedicated WSL distribution",
+            )
+        candidate_ok = (
+            config.max_agent_steps >= autonomy.candidate_max_extra_steps
+            and config.max_requests >= (budget.minimum_requests + 1)
+        )
+        _check(
+            "candidate_shadow_budget_reachable",
+            candidate_ok,
+            (
+                f"candidate_max_extra_steps={autonomy.candidate_max_extra_steps}, "
+                f"max_agent_steps={config.max_agent_steps}, "
+                f"minimum_requests={budget.minimum_requests}, max_requests={config.max_requests}"
+            ),
+        )
 
     gateway_config: GatewayConfig | None = None
     try:
@@ -631,6 +718,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="on cycle failure, run the Prosecutor repair pipeline (requires --run)",
     )
+    cycle.add_argument(
+        "--no-candidate-eval",
+        action="store_true",
+        help="skip candidate collection, shadow evaluation, and activation for this run",
+    )
     return parser
 
 
@@ -748,7 +840,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     {
                         "plan": plan,
                         "cycle": _run_v2_cycle_cli(
-                            _load(args.campaign_id), _data_dir(), repair=args.repair
+                            _load(args.campaign_id),
+                            _data_dir(),
+                            repair=args.repair,
+                            no_candidate_eval=args.no_candidate_eval,
                         ),
                     }
                 )
