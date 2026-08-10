@@ -1,0 +1,23 @@
+[Unit]
+Description=AEGIS local SearxNG research endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aegis
+Group=aegis
+Environment=HOME=/home/aegis
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+ExecStartPre=-/usr/bin/podman rm --force --time 0 aegis-search
+ExecStart=/usr/local/libexec/aegis-search-run
+ExecStop=/usr/bin/podman stop --time 10 aegis-search
+ExecStopPost=-/usr/bin/podman rm --force --time 0 aegis-search
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"increment","steps":[{"op":"construct","symbol":"AtomicCounter","args":[2],"save":"counter"},{"op":"method","object":"counter","method":"increment","args":[3],"expect":5},{"op":"method","object":"counter","method":"value","args":[],"expect":5}]}]}

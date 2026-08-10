@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"child","steps":[{"op":"call","symbol":"safe_join","args":["/tmp/base","a.txt"],"expect":{"$type":"path_suffix","value":"tmp/base/a.txt"}}]}]}

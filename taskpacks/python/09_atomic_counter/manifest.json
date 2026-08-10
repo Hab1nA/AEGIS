@@ -1,0 +1,1 @@
+{"task_id":"python-atomic-counter","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/bool"],"content_hash":"1e3650f09ea50f2c7d79b2640674f2a3925ad79c128caab2aebf5ae2a66e02d1"}

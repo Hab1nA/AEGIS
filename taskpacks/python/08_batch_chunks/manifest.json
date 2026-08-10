@@ -1,0 +1,1 @@
+{"task_id":"python-batch-chunks","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/shared"],"content_hash":"d1a9e3ef85b4fea673227b4083d6b8de07a3fc634ad99a5e9e85d183befc994b"}

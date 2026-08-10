@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"numeric","steps":[{"op":"call","symbol":"sort_versions","args":[["1.10","1.2","2.0"]],"expect":["1.2","1.10","2.0"]}]}]}

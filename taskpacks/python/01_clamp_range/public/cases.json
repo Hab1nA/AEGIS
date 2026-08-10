@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"bounds","steps":[{"op":"call","symbol":"clamp","args":[3,0,2],"expect":2},{"op":"call","symbol":"clamp","args":[-1,0,2],"expect":0},{"op":"call","symbol":"clamp","args":[1,0,2],"expect":1}]}]}

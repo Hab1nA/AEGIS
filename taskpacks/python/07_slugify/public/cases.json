@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"basic","steps":[{"op":"call","symbol":"slugify","args":["Hello World"],"expect":"hello-world"}]}]}

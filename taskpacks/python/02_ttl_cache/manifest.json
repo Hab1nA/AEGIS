@@ -1,0 +1,1 @@
+{"task_id":"python-ttl-cache","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/refresh_get"],"content_hash":"566d7d6d10532d41773a6c08073ad775b4d38e57df2a9058fd04540c4bc9304f"}

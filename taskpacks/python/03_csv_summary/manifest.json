@@ -1,0 +1,1 @@
+{"task_id":"python-csv-summary","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/float_math"],"content_hash":"14b6a251aca8e4ac47acdf15af11e2dd27fa91ece1ac80ab48560073bb743fd6"}

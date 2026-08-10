@@ -1,0 +1,1 @@
+{"task_id":"python-lru-cache","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/update_stale"],"content_hash":"c0ac8e0ab57eaba739f10d00285abb7658f7e7b9bb653923ad5e0635ec114323"}

@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"quoted-exact","steps":[{"op":"call","symbol":"sum_amounts","args":["name,amount\n\"a,b\",0.1\nc,0.2\n"],"expect":{"$type":"decimal","value":"0.3"}}]},{"name":"missing-columns","steps":[{"op":"call","symbol":"sum_amounts","args":["title,value\na,1\n"],"raises":"ValueError"}]}]}

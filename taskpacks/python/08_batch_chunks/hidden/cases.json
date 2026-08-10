@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"tail","steps":[{"op":"call","symbol":"batched","args":[{"$iterator":[0,1,2,3,4]},2],"materialize":true,"expect":[[0,1],[2,3],[4]]}]},{"name":"size-validation","steps":[{"op":"call","symbol":"batched","args":[[],0],"materialize":true,"raises":"ValueError"}]}]}

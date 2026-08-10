@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"padding-stable","steps":[{"op":"call","symbol":"sort_versions","args":[["1.0","1","1.0.1"]],"expect":["1.0","1","1.0.1"]}]},{"name":"invalid-component","steps":[{"op":"call","symbol":"sort_versions","args":[["1..2"]],"raises":"ValueError"}]}]}

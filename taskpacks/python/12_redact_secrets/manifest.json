@@ -1,0 +1,1 @@
+{"task_id":"python-redact-secrets","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/substring"],"content_hash":"65e549bac1fcf8a05b5745a834554f4551c99a698492ce0f1160f54284323f9f"}

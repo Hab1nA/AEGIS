@@ -1,0 +1,32 @@
+use_default_settings: true
+
+server:
+  bind_address: "127.0.0.1"
+  port: 8888
+  secret_key: "__GENERATE__"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+engines:
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+  - name: github
+    engine: github
+    shortcut: gh
+    categories: general
+    disabled: false
+
+outgoing:
+  request_timeout: 8.0
+  extra_proxy_timeout: 10
+  proxies:
+    all://:
+      - "__PROXY__"

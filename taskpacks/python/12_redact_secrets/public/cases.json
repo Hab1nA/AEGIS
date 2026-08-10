@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"password","steps":[{"op":"call","symbol":"redact","args":["password=abc"],"expect":"password=[REDACTED]"}]}]}

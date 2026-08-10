@@ -1,0 +1,33 @@
+{
+  "campaign_id": "autonomy-smoke-v2",
+  "max_rounds": 2,
+  "total_tokens": 14000000,
+  "max_requests": 800,
+  "wall_time_seconds": 28800,
+  "task_pack_paths": [
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\01_clamp_range",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\02_ttl_cache",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\03_csv_summary",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\04_safe_join",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\05_retry_policy",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\06_lru_cache",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\07_slugify",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\08_batch_chunks",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\09_atomic_counter",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\10_deep_merge",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\11_version_sort",
+    "C:\\absolute\\path\\to\\AEGIS\\taskpacks\\python\\12_redact_secrets"
+  ],
+  "max_agent_steps": 20,
+  "research_enabled": true,
+  "offline_research": false,
+  "test_mode": false,
+  "demo_mode": false,
+  "sandbox_backend": "wsl",
+  "acceptance_profile": "autonomous_evolution_v2",
+  "roles": {
+    "warrior": {"model": "warrior-model-id", "budget_share": 0.55, "max_output_tokens": 4096},
+    "judge": {"model": "judge-model-id", "budget_share": 0.225, "max_output_tokens": 4096},
+    "prosecutor": {"model": "prosecutor-model-id", "budget_share": 0.225, "max_output_tokens": 4096}
+  }
+}

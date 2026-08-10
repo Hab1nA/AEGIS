@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"nested","steps":[{"op":"call","symbol":"deep_merge","args":[{"a":{"x":1}},{"a":{"y":2}}],"expect":{"a":{"x":1,"y":2}}}]}]}

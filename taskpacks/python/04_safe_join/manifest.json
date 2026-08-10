@@ -1,0 +1,1 @@
+{"task_id":"python-safe-join","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/allow_root"],"content_hash":"df78f3a233c6ca60a15fe9a8772c54f56ba675a1f18c23915872ae02842cfb65"}

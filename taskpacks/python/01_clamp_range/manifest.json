@@ -1,0 +1,1 @@
+{"task_id":"python-clamp-range","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/zero_nan"],"content_hash":"767239e8ec375a47ca728daef29762c64f77407211c3178f682d12f3e64cb5e1"}

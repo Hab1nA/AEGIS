@@ -1,0 +1,1 @@
+{"task_id":"python-version-sort","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/no_padding"],"content_hash":"2a203b9f479651c207750f53c24ac443816e842c72799e0938927e3128901824"}

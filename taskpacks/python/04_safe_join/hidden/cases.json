@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"sibling-prefix-and-root","steps":[{"op":"call","symbol":"safe_join","args":["/tmp/base","../base-evil/x"],"raises":"ValueError"},{"op":"call","symbol":"safe_join","args":["/tmp/base","."],"raises":"ValueError"}]}]}

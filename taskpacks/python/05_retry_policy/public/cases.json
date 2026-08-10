@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"success-after-retry","steps":[{"op":"call","symbol":"retry","args":[{"$fixture":"flaky","name":"work","exception":"OSError","failures":1,"value":7},2,{"$type":"exception","name":"OSError"}],"expect":7,"expect_fixtures":{"work":{"count":2}}}]}]}

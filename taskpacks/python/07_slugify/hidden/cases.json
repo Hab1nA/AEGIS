@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"unicode-and-punctuation","steps":[{"op":"call","symbol":"slugify","args":[" Café -- déjà! "],"expect":"cafe-deja"}]},{"name":"empty-result","steps":[{"op":"call","symbol":"slugify","args":["!!!"],"raises":"ValueError"}]}]}

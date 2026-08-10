@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"reversed-bounds","steps":[{"op":"call","symbol":"clamp","args":[1,2,0],"raises":"ValueError"}]},{"name":"nan-preserved","steps":[{"op":"call","symbol":"clamp","args":[{"$type":"nan"},0,2],"expect":{"$type":"nan"}}]}]}

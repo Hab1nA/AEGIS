@@ -1,0 +1,1 @@
+{"task_id":"python-slugify","version":1,"language":"python","public_dir":"public","hidden_dir":"hidden","reference_dir":"reference","defect_dir":"defect","mutant_dirs":["mutants/runs"],"content_hash":"6a4a586355a97c129e152d9bac7c954c9b05fd6633c1455d47cb6f86ae12bc39"}

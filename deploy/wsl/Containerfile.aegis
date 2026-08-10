@@ -1,0 +1,7 @@
+FROM docker.io/library/python@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
+
+ARG PYTEST_VERSION=8.4.2
+ARG PYPDF_VERSION=6.14.2
+RUN python -m pip install --no-cache-dir "pytest==${PYTEST_VERSION}" "pypdf==${PYPDF_VERSION}" \
+    && python -m pytest --version \
+    && python -c "import pypdf; assert pypdf.__version__ == '${PYPDF_VERSION}'"

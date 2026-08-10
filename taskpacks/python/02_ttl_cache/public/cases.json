@@ -1,0 +1,1 @@
+{"version":1,"cases":[{"name":"hit","steps":[{"op":"construct","symbol":"TTLCache","args":[5,{"$fixture":"clock","name":"clock","value":0}],"save":"cache"},{"op":"method","object":"cache","method":"put","args":["a",3]},{"op":"set_fixture","name":"clock","value":4},{"op":"method","object":"cache","method":"get","args":["a"],"expect":3}]}]}
