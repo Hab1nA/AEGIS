@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .models import (
     GitCheckpointRequest,
@@ -103,11 +104,14 @@ class GitPublisher:
             self._validate_tree(repo, request.base_commit)
             self._git(repo, ("checkout", "--detach", request.base_commit), "checkout base")
             self._apply_changes(repo, request.changes)
-            self._git(repo, ("add", "--all", "--"), "stage checkpoint")
+            requested = {item.path for item in request.changes}
+            # Stage only the requested paths.  Credential helpers may write
+            # helper-owned state files into the working directory; staging the
+            # whole tree would accidentally include them in the checkpoint.
+            self._git(repo, ("add", "--", *sorted(requested)), "stage checkpoint")
             staged = self._nul_paths(
                 self._git_bytes(repo, ("diff", "--cached", "--name-only", "-z"), "inspect staged paths")
             )
-            requested = {item.path for item in request.changes}
             if staged != requested:
                 raise GitPublisherError("staged checkpoint paths do not exactly match the request")
             if not staged:
@@ -228,10 +232,11 @@ class GitPublisher:
 
     def _clone(self, repo: Path) -> None:
         repo.parent.mkdir(parents=True, exist_ok=True)
-        self._run(
+        self._retry_git(
             repo.parent,
             ("git", "clone", "--no-checkout", "--quiet", "--", self._remote_url, str(repo)),
             label="clone remote",
+            cleanup=lambda: shutil.rmtree(repo, ignore_errors=True),
         )
 
     def _apply_changes(self, repo: Path, changes: Sequence[GitFileChange]) -> None:
@@ -300,7 +305,7 @@ class GitPublisher:
                     raise GitPublisherError("Git tree contains secret-like content")
 
     def _remote_head(self, repo: Path, ref: str) -> str | None:
-        result = self._run(
+        result = self._retry_git(
             repo,
             ("git", "ls-remote", "--heads", "origin", ref),
             label="read remote ref",
@@ -322,7 +327,7 @@ class GitPublisher:
         # so this cannot authorize a rewrite even though Git names the option
         # ``force-with-lease``.
         expected = "" if expected_old is None else expected_old
-        result = self._run(
+        result = self._retry_git(
             repo,
             (
                 "git",
@@ -336,6 +341,29 @@ class GitPublisher:
         )
         if b"[up to date]" in result.stdout.lower():
             raise GitPublisherError("remote ref drifted to the requested value before CAS")
+
+    def _retry_git(
+        self,
+        cwd: Path,
+        argv: tuple[str, ...],
+        *,
+        label: str,
+        cleanup: Callable[[], None] | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run one git command with a single retry for transient remote/credential failures."""
+        last_error: GitPublisherError | None = None
+        for attempt in range(2):
+            try:
+                return self._run(cwd, argv, label=label)
+            except GitPublisherError as exc:
+                last_error = exc
+                if cleanup is not None:
+                    try:
+                        cleanup()
+                    except OSError:
+                        pass
+        assert last_error is not None
+        raise last_error
 
     def _git(self, repo: Path, args: tuple[str, ...], label: str) -> str:
         result = self._run(repo, ("git", *args), label=label)
