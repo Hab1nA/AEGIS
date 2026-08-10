@@ -38,6 +38,14 @@ flowchart TD
 | Git checkpoint | journaled connector + GitPublisher CAS candidate ref（需配置 public_repo_url） | `connectors/`、`publishing/` | `test_git_checkpoint_connector.py` |
 | 归因与课程层 | 每 cycle 追加 EvaluationArm 账本，产出内容寻址归因报告 | `attribution/`、`cycle_ports.py` | `test_attribution_v2.py` |
 | 可进化面契约 | workflow/subject/plugin/environment 四类表面，严格 schema 与授权规则；仅 Warrior 可提议，插件/环境/主题只能面向 Warrior | `evolution/surfaces.py` | `test_evolution_surfaces.py` |
+| Harness 代码进化 | `harness-code` 代码面：Warrior 以 `aegis.propose_harness_change` 提交真实代码补丁 + checkpoint 引用；控制面在隔离 Git clone 上验证 checkpoint 树一致、compile/import 冒烟、基线与候选双金丝雀零回归，通过后自动激活并把补丁提交到真实 harness 仓库；越权路径（评测/沙箱/发布/配置/归因）硬拒绝 | `evolution/surfaces.py`、`evolution/harness.py`、`cycle_ports.py`、`agent_runtime.py` | `test_evolution_harness.py` |
+| 检察官监督回滚 | 进化故障时检察官经 `aegis.order_rollback` 发回滚令；控制面校验回滚目标确为当前 champion 后，`HarnessRollbackExecutor` 对真实仓库 `git reset --hard` 到已认证祖先提交，并同步 `EvolutionRegistry` 回滚到上一 champion，全程事件落盘 | `evolution/harness.py`、`cycle_ports.py`、`agent_runtime.py`、`evolution/consumer.py` | `test_evolution_harness.py`（三代 e2e：激活 A→激活 B→回滚 B） |
+| MCP 桥接 | 控制面 MCP JSON-RPC 2.0 桥（HTTPS 或回环 HTTP）：`aegis.deploy_mcp` 实时 `tools/list` 校验后注册，`aegis.mcp_call` 经桥调用已授权工具，结果大小受限；沙箱保持离线 | `mcp/bridge.py`、`agent_runtime.py`、`cycle_ports.py` | `test_mcp_subagents.py` |
+| 依赖部署 | `aegis.deploy_dependency` 把 digest-pinned HTTPS 依赖组装为 brokered-public 环境配方，复用既有双构建+Trivy+CAS 激活管线 | `agent_runtime.py`、`evolution/surfaces.py` | `test_evolution_harness.py`（surface 校验）、`test_evolution_env_builder.py` |
+| 子代理运行时 | `aegis.spawn_subagent`/`reclaim_subagent`/`subagent_status` 启动真实受限 worker 进程（`python -m aegis.subagent_worker`），独立工作目录、步数/超时/结果大小/并发配额，超时即杀；`runtime` 执行器跑真实 RoleAgentRuntime，`script` 执行器供确定性验证 | `subagents.py`、`subagent_worker.py`、`agent_runtime.py`、`cycle_ports.py` | `test_mcp_subagents.py` |
+| 受限联网 | `autonomy_v2.runtime_network` 支持 `none|allowlist`，域名白名单由控制面配置；环境构建支持 brokered-public 下载 | `config.py`、`sandbox/agent.py` | `test_config.py`、`test_sandbox_agent.py` |
+| 种群管理 | OpenEvolve 式 MAP-Elites：合格候选按行为描述符（面/改动根/目标失败模式/目标摘要）归档到有界网格，同格仅更高 fitness 替换；事件流持久化、多样性报告（格子数/面分布/改动根分布） | `evolution/population.py`、`cycle_ports.py`、`cli.py` | `test_evolution_harness.py::PopulationArchiveTests` |
+| 元进化边界 | `meta_evolution_enabled` 显式授权后，Warrior 才可进化演化控制文件（`evolution/registry.py`、`evolution/consumer.py`、`cycle_recovery.py`、`repair_runtime.py`）；沙箱/发布/配置/评测/归因边界永不开禁；预检含 `meta_evolution_boundary` 门禁 | `config.py`、`evolution/surfaces.py`、`evolution/harness.py`、`cli.py` | `test_evolution_harness.py::MetaEvolutionTests` |
 | 候选消费闭环 | 每 cycle 消费 strategy.propose / evolution.request / prosecutor role_candidates，物化入 CAS 并进入 EvolutionRegistry 生命周期；同代配对影子臂归因后自动激活 | `evolution/consumer.py`、`evolution/registry.py`、`cycle_ports.py` | `test_evolution_consumer.py`、`test_evolution_registry.py`、`test_cycle_ports.py` |
 | active role set 绑定 | 每个角色解析 CompositeRoleManifest（schema v2），workflow/subject/plugin/镜像注入真实运行时信封与沙箱 prepare；旧 genesis 回退默认 | `evolution/runtime.py`、`cycle_ports.py` | `test_evolution_runtime.py`、`test_cycle_ports.py` |
 | 环境构建器接入代际 | 环境候选在影子评测前完成双构建+Trivy 扫描+发布，receipt 物化到候选，激活后 runtime_image 供后续代 prepare；本地构建镜像按 image id 解析 | `evolution/env_builder.py`、`sandbox/agent.py` | `test_evolution_env_builder.py`、`test_sandbox_image.py`、`test_cycle_ports.py` |
@@ -76,14 +84,69 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 
 真实 relay 模型（deepseek-v4-flash）按以下约定可稳定产出合法 JSON action：
 
+**网关凭据与协议要求（deepseek-v4-flash / cf.api.fan）**
+
+- `AEGIS_OPENAI_BASE_URL=https://cf.api.fan/v1`（必需）
+- `AEGIS_OPENAI_API_KEY=<sk-...>`（必需）
+- `AEGIS_OPENAI_PROTOCOL=responses`（必须直接使用 responses 协议）
+- `AEGIS_OPENAI_STRUCTURED_FORMAT=json_object`（必须使用
+  `{"type":"json_object"}` 输出格式；responses 载荷的 `text.format`
+  发送 `json_object` 而非 `json_schema`）
+- `AEGIS_OPENAI_TIMEOUT_SECONDS`（可选，默认 900）
+- campaign 配置三角色 `model: "deepseek-v4-flash"` 且
+  `reasoning_effort: "max"`（配置与网关请求均接受 `max`）
+
+环境变量由运行进程环境提供，网关与子代理 worker 均继承。真实连通性已用项目
+自身 `ModelGateway` 验证（responses + json_object + max，usage verified）。
+若 relay 偶发输出非 JSON 文本，运行时按既有 JSON 契约拒绝并让模型在界内步数
+重试。另注意：该 relay 的 `/responses` 响应以 `reasoning` 项开头、真实 JSON 在
+最后的 `message` 项（`output_text` 字段缺失）；网关提取器已按"跳过推理项、取
+最后一个 message 项文本"处理，实测单步 4 秒返回合法 JSON action。
+
+## 4c. Harness 代码进化与回滚验收记录（2026-08-10）
+
+`tests/test_evolution_harness.py::HarnessEvolutionCycleTests` 以真实 Git 仓库
+驱动三代连续 cycle 验证代码级进化闭环：
+
+- 第一代：Warrior 经 `aegis.propose_harness_change` 提交真实代码补丁（改动
+  `src/aegis/plugins/__init__.py`），控制面校验 checkpoint ref 树与提议一致 →
+  隔离 clone 编译+导入冒烟 → 基线与候选金丝雀双跑通过 → 自动激活并提交到真实
+  harness 仓库，champion 入册；
+- 第二代：基于上一激活提交再提出补丁 B，同样走金丝雀并激活，champion 血缘
+  B→A 正确；
+- 第三代：检察官发出 `aegis.order_rollback`（指向 B），控制面将真实仓库
+  `git reset --hard` 恢复到 A 的激活提交，`EvolutionRegistry` 回滚到 champion A；
+- 负面路径由单测覆盖：越权路径（tests/sandbox/config/registry/consumer）、
+  secret 内容、checkpoint 树不一致、语法错误补丁（冒烟失败）、金丝雀回归
+  （零回归门槛失败）全部拒绝或回滚。
+
+## 4d. Phase 4：种群管理与元进化验收记录（2026-08-11）
+
+`tests/test_evolution_harness.py::HarnessPhase4EndToEndTests` 用真实 Git 仓库
+连续五代验证"代码级自我进化全流程"：
+
+- 第 1 代：plugins 补丁 → 金丝雀 → 自动激活 → 种群归档（行为格 1）；
+- 第 2 代：基于第 1 代激活提交继续改 research → 激活 → 种群 2 格；
+- 第 3 代：未授权元进化时，指向 `evolution/registry.py` 的控制文件补丁被
+  边界拒绝，champion 与种群不变；
+- 第 4 代：`meta_evolution_enabled=true` 后同一补丁走完整收集→金丝雀→激活，
+  种群 3 格且包含 evolution 改动根；
+- 第 5 代：检察官回滚元进化候选，真实仓库恢复到第 2 代激活提交、注册表回退
+  到第 2 代 champion，MAP-Elites 归档保留多样性格子供后续探索。
+
+`PopulationArchiveTests` 覆盖：事件流持久化/重放、同格等 fitness 不替换、
+行为描述符（面/根/失败模式/目标摘要）与多样性报告。`MetaEvolutionTests`
+覆盖：控制文件默认拒绝、显式授权后放行、安全边界（沙箱/发布/配置/评测/归因）
+即使在元进化开启时也永远拒绝。
+
 - **DeepSeek JSON Output 模式**：`AEGIS_OPENAI_STRUCTURED_FORMAT=json_object`
   让网关对结构化请求优先发送 `response_format: {"type":"json_object"}`（回退链
   `chat_json_object → chat_json_schema → chat_plain`；relay 对 `json_schema`
   返回 400 属能力失败，会按设计回退）。system prompt 必须包含 "json" 字样，
   `RoleAgentRuntime` 的固定提示词已满足。
-- **最高推理强度**：角色配置 `reasoning_effort: "high"`。该 relay 的
+- **最高推理强度**：角色配置 `reasoning_effort: "max"`。该 relay 的
   `deepseek-v4-flash` 是隐藏推理模型，medium/未设置时曾出现长时间挂起或把
-  输出预算全部花在 `reasoning_content` 上；high 在实测中 6–21 秒稳定返回。
+  输出预算全部花在 `reasoning_content` 上；max 在实测中稳定返回。
 - **输出 token 上限**：relay 实测接受 `max_tokens` 至 65536（16384 稳定），
   campaign 示例按模型能力把 `max_output_tokens` 设为 16384，保证推理与最终
   JSON 内容都有余量，避免 `finish_reason: length` 截断。
