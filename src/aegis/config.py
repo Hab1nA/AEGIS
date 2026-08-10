@@ -16,6 +16,17 @@ from aegis.autonomy_budget import (
 
 AUTONOMY_ACCEPTANCE_PROFILES = frozenset({"autonomous_evolution_v1", "autonomous_evolution_v2"})
 
+NETWORK_ALLOWLIST_DOMAINS = (
+    "github.com",
+    "raw.githubusercontent.com",
+    "api.github.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "arxiv.org",
+    "huggingface.co",
+    "cdn-lfs.huggingface.co",
+)
+
 
 class ConfigError(ValueError):
     """Raised when a campaign configuration is incomplete or unsafe."""
@@ -81,6 +92,7 @@ class AutonomyV2Config:
     builder_public_internet: bool = True
     builder_block_private_networks: bool = True
     runtime_network: str = "none"
+    network_allowlist_domains: tuple[str, ...] = NETWORK_ALLOWLIST_DOMAINS
     external_writes_via_connectors: bool = True
     role_activation_automatic: bool = True
     immutable_safety_constitution: bool = True
@@ -90,6 +102,15 @@ class AutonomyV2Config:
         "plugin",
         "environment",
     )
+    harness_evolution_enabled: bool = False
+    harness_repo_root: str | None = None
+    harness_canary_command: tuple[str, ...] | None = None
+    harness_activation_automatic: bool = True
+    meta_evolution_enabled: bool = False
+    subagent_max_steps: int = 8
+    subagent_timeout_seconds: float = 180.0
+    subagent_max_concurrency: int = 2
+    subagent_max_result_bytes: int = 65_536
     environment_output_repository: str | None = None
     scanner_binary: str = "trivy"
     candidate_max_extra_steps: int = 12
@@ -109,17 +130,27 @@ class AutonomyV2Config:
             "builder_public_internet",
             "builder_block_private_networks",
             "runtime_network",
+            "network_allowlist_domains",
             "external_writes_via_connectors",
             "role_activation_automatic",
             "immutable_safety_constitution",
             "evolution_surfaces",
+            "harness_evolution_enabled",
+            "harness_repo_root",
+            "harness_canary_command",
+            "harness_activation_automatic",
+            "meta_evolution_enabled",
+            "subagent_max_steps",
+            "subagent_timeout_seconds",
+            "subagent_max_concurrency",
+            "subagent_max_result_bytes",
             "environment_output_repository",
             "scanner_binary",
             "candidate_max_extra_steps",
         }
     )
     _EVOLUTION_SURFACES = frozenset(
-        {"workflow", "subject", "plugin", "environment"}
+        {"workflow", "subject", "plugin", "environment", "harness-code"}
     )
 
     @classmethod
@@ -157,8 +188,92 @@ class AutonomyV2Config:
         if enabled and not block_private:
             raise ConfigError("autonomy_v2 may not allow builder access to private networks")
         runtime_network = raw.get("runtime_network", "none")
-        if runtime_network != "none":
-            raise ConfigError("autonomy_v2.runtime_network must be 'none'")
+        if runtime_network not in {"none", "allowlist"}:
+            raise ConfigError("autonomy_v2.runtime_network must be 'none' or 'allowlist'")
+        allowlist = raw.get("network_allowlist_domains", NETWORK_ALLOWLIST_DOMAINS)
+        if (
+            not isinstance(allowlist, (list, tuple))
+            or not allowlist
+            or len(allowlist) != len(set(allowlist))
+        ):
+            raise ConfigError(
+                "autonomy_v2.network_allowlist_domains must be a unique non-empty list"
+            )
+        normalized_allowlist: list[str] = []
+        for domain in allowlist:
+            if (
+                not isinstance(domain, str)
+                or not domain
+                or domain != domain.strip().lower()
+                or any(
+                    character
+                    not in "abcdefghijklmnopqrstuvwxyz0123456789.-"
+                    for character in domain
+                )
+                or domain.startswith(".")
+                or domain.endswith(".")
+                or ".." in domain
+                or "://" in domain
+            ):
+                raise ConfigError(
+                    "autonomy_v2.network_allowlist_domains entries must be plain domain names"
+                )
+            normalized_allowlist.append(domain)
+        harness_enabled = _bool(
+            raw.get("harness_evolution_enabled", False),
+            "autonomy_v2.harness_evolution_enabled",
+        )
+        harness_root = raw.get("harness_repo_root")
+        if harness_root is not None and (
+            not isinstance(harness_root, str)
+            or not harness_root.strip()
+            or harness_root != harness_root.strip()
+            or "\x00" in harness_root
+        ):
+            raise ConfigError("autonomy_v2.harness_repo_root must be null or a trimmed path")
+        harness_canary = raw.get("harness_canary_command")
+        if harness_canary is not None and (
+            not isinstance(harness_canary, (list, tuple))
+            or not harness_canary
+            or len(harness_canary) > 16
+            or any(
+                not isinstance(item, str) or not item or "\x00" in item
+                for item in harness_canary
+            )
+        ):
+            raise ConfigError(
+                "autonomy_v2.harness_canary_command must be null or a bounded argv list"
+            )
+        harness_auto = _bool(
+            raw.get("harness_activation_automatic", True),
+            "autonomy_v2.harness_activation_automatic",
+        )
+        meta_evolution = _bool(
+            raw.get("meta_evolution_enabled", False),
+            "autonomy_v2.meta_evolution_enabled",
+        )
+        subagent_steps = _positive_int(
+            raw.get("subagent_max_steps", 8), "autonomy_v2.subagent_max_steps"
+        )
+        if subagent_steps > 1000:
+            raise ConfigError("autonomy_v2.subagent_max_steps must be at most 1000")
+        subagent_timeout = raw.get("subagent_timeout_seconds", 180.0)
+        if (
+            isinstance(subagent_timeout, bool)
+            or not isinstance(subagent_timeout, (int, float))
+            or not 1 <= float(subagent_timeout) <= 3600
+        ):
+            raise ConfigError("autonomy_v2.subagent_timeout_seconds must be in [1, 3600]")
+        subagent_concurrency = _positive_int(
+            raw.get("subagent_max_concurrency", 2),
+            "autonomy_v2.subagent_max_concurrency",
+        )
+        if subagent_concurrency > 16:
+            raise ConfigError("autonomy_v2.subagent_max_concurrency must be at most 16")
+        subagent_result_bytes = _positive_int(
+            raw.get("subagent_max_result_bytes", 65_536),
+            "autonomy_v2.subagent_max_result_bytes",
+        )
         connectors = _bool(
             raw.get("external_writes_via_connectors", True),
             "autonomy_v2.external_writes_via_connectors",
@@ -231,10 +346,22 @@ class AutonomyV2Config:
             builder_public_internet=builder_public,
             builder_block_private_networks=block_private,
             runtime_network=runtime_network,
+            network_allowlist_domains=tuple(normalized_allowlist),
             external_writes_via_connectors=connectors,
             role_activation_automatic=automatic,
             immutable_safety_constitution=immutable,
             evolution_surfaces=tuple(surfaces),
+            harness_evolution_enabled=harness_enabled,
+            harness_repo_root=harness_root,
+            harness_canary_command=(
+                tuple(harness_canary) if harness_canary is not None else None
+            ),
+            harness_activation_automatic=harness_auto,
+            meta_evolution_enabled=meta_evolution,
+            subagent_max_steps=subagent_steps,
+            subagent_timeout_seconds=float(subagent_timeout),
+            subagent_max_concurrency=subagent_concurrency,
+            subagent_max_result_bytes=subagent_result_bytes,
             environment_output_repository=environment_output,
             scanner_binary=scanner_binary,
             candidate_max_extra_steps=candidate_steps,
@@ -255,10 +382,24 @@ class AutonomyV2Config:
             "builder_public_internet": self.builder_public_internet,
             "builder_block_private_networks": self.builder_block_private_networks,
             "runtime_network": self.runtime_network,
+            "network_allowlist_domains": list(self.network_allowlist_domains),
             "external_writes_via_connectors": self.external_writes_via_connectors,
             "role_activation_automatic": self.role_activation_automatic,
             "immutable_safety_constitution": self.immutable_safety_constitution,
             "evolution_surfaces": list(self.evolution_surfaces),
+            "harness_evolution_enabled": self.harness_evolution_enabled,
+            "harness_repo_root": self.harness_repo_root,
+            "harness_canary_command": (
+                list(self.harness_canary_command)
+                if self.harness_canary_command is not None
+                else None
+            ),
+            "harness_activation_automatic": self.harness_activation_automatic,
+            "meta_evolution_enabled": self.meta_evolution_enabled,
+            "subagent_max_steps": self.subagent_max_steps,
+            "subagent_timeout_seconds": self.subagent_timeout_seconds,
+            "subagent_max_concurrency": self.subagent_max_concurrency,
+            "subagent_max_result_bytes": self.subagent_max_result_bytes,
             "environment_output_repository": self.environment_output_repository,
             "scanner_binary": self.scanner_binary,
             "candidate_max_extra_steps": self.candidate_max_extra_steps,
@@ -291,8 +432,10 @@ class RoleConfig:
         ):
             raise ConfigError(f"role.budget_share must be {expected_share}")
         reasoning_effort = settable.get("reasoning_effort")
-        if reasoning_effort not in {None, "none", "low", "medium", "high"}:
-            raise ConfigError("role.reasoning_effort must be null, 'none', 'low', 'medium', or 'high'")
+        if reasoning_effort not in {None, "none", "low", "medium", "high", "max"}:
+            raise ConfigError(
+                "role.reasoning_effort must be null, 'none', 'low', 'medium', 'high', or 'max'"
+            )
         return cls(
             model.strip(),
             float(share),

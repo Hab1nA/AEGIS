@@ -210,7 +210,14 @@ class ModelGateway:
         token: CancelToken,
     ) -> GatewayResponse:
         if mode == "responses":
-            return self._call_with_retry("responses", request, token)
+            return self._call_with_retry(
+                "responses",
+                request,
+                token,
+                responses_json_object=(
+                    self._config.structured_format == "json_object"
+                ),
+            )
         if mode == "chat_json_schema":
             return self._call_with_retry("chat", request, token)
         if mode == "chat_json_object":
@@ -240,6 +247,7 @@ class ModelGateway:
         cancel: CancelToken,
         *,
         chat_json_object: bool = False,
+        responses_json_object: bool = False,
     ) -> GatewayResponse:
         last_error: BaseException | None = None
         for attempt in range(self._retry.max_attempts):
@@ -258,6 +266,7 @@ class ModelGateway:
                     request,
                     cancel,
                     chat_json_object=chat_json_object,
+                    responses_json_object=responses_json_object,
                 )
             except GatewayHTTPError as exc:
                 self._finish_attempt(lifecycle, None, exc)
@@ -298,10 +307,13 @@ class ModelGateway:
         cancel: CancelToken,
         *,
         chat_json_object: bool = False,
+        responses_json_object: bool = False,
     ) -> GatewayResponse:
         if protocol == "responses":
             path = "/responses"
-            payload = self._responses_payload(request)
+            payload = self._responses_payload(
+                request, json_object=responses_json_object
+            )
         else:
             path = "/chat/completions"
             payload = self._chat_payload(request, json_object=chat_json_object)
@@ -414,7 +426,9 @@ class ModelGateway:
         self._attempt_observer.after_attempt(attempt, result)
 
     @staticmethod
-    def _responses_payload(request: GatewayRequest) -> dict[str, object]:
+    def _responses_payload(
+        request: GatewayRequest, *, json_object: bool = False
+    ) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": request.model,
             "input": [{"role": m.role, "content": m.content} for m in request.messages],
@@ -424,14 +438,17 @@ class ModelGateway:
         if request.tools:
             payload["tools"] = list(request.tools)
         if request.output_schema:
-            payload["text"] = {
-                "format": {
-                    "type": "json_schema",
-                    "name": "role_output",
-                    "strict": True,
-                    "schema": request.output_schema,
+            if json_object:
+                payload["text"] = {"format": {"type": "json_object"}}
+            else:
+                payload["text"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "role_output",
+                        "strict": True,
+                        "schema": request.output_schema,
+                    }
                 }
-            }
         if request.seed is not None:
             payload["seed"] = request.seed
         if request.reasoning_effort is not None:
@@ -479,8 +496,32 @@ class ModelGateway:
                 else:
                     output = data["output"]
                     assert isinstance(output, list)
-                    content = output[0]["content"]
-                    text = content[0]["text"]
+                    # Hidden-reasoning relays emit a reasoning item before the
+                    # final message; output_text may be absent.  Take the last
+                    # message item's text, falling back to the first text item.
+                    text = ""
+                    first_text = ""
+                    for item in reversed(output):
+                        if not isinstance(item, Mapping):
+                            continue
+                        content = item.get("content")
+                        if not isinstance(content, list) or not content:
+                            continue
+                        candidate = content[0]
+                        candidate_text = (
+                            candidate.get("text")
+                            if isinstance(candidate, Mapping)
+                            else None
+                        )
+                        if not isinstance(candidate_text, str) or not candidate_text:
+                            continue
+                        if not first_text:
+                            first_text = candidate_text
+                        if item.get("type") == "message":
+                            text = candidate_text
+                            break
+                    if not text:
+                        text = first_text
             if not isinstance(text, str):
                 raise TypeError
             return text

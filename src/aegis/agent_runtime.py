@@ -185,6 +185,13 @@ _PERMISSIONS: Mapping[Role, frozenset[str]] = {
             "skill.list",
             "skill.stage",
             "evolution.request",
+            "aegis.propose_harness_change",
+            "aegis.deploy_mcp",
+            "aegis.mcp_call",
+            "aegis.deploy_dependency",
+            "aegis.spawn_subagent",
+            "aegis.reclaim_subagent",
+            "aegis.subagent_status",
             "workspace.read",
             "workspace.write",
             "sandbox.exec",
@@ -230,6 +237,7 @@ _PERMISSIONS: Mapping[Role, frozenset[str]] = {
             "paper.collect",
             "paper.excerpt_read",
             "skill.list",
+            "aegis.order_rollback",
             "workspace.read",
             "strategy.propose",
             "knowledge.search",
@@ -312,6 +320,14 @@ ACTION_SCHEMA: Mapping[str, Any] = {
                 "paper.collect",
                 "paper.excerpt_read",
                 "evolution.request",
+                "aegis.propose_harness_change",
+                "aegis.order_rollback",
+                "aegis.deploy_mcp",
+                "aegis.mcp_call",
+                "aegis.deploy_dependency",
+                "aegis.spawn_subagent",
+                "aegis.reclaim_subagent",
+                "aegis.subagent_status",
                 "workspace.write",
                 "workspace.read",
                 "sandbox.exec",
@@ -548,6 +564,9 @@ class ToolDispatcher:
         role_generation_id: str | None = None,
         plugin_manifests: tuple[PluginManifest, ...] = (),
         tool_broker: ToolBroker | None = None,
+        mcp_bridge: Any | None = None,
+        subagent_manager: Any | None = None,
+        meta_evolution_enabled: bool = False,
     ) -> None:
         if not sandbox_id:
             raise ValueError("sandbox_id must not be empty")
@@ -568,6 +587,9 @@ class ToolDispatcher:
         self._disabled_actions = disabled_actions
         self._role_generation_id = role_generation_id
         self._tool_broker = tool_broker
+        self._mcp_bridge = mcp_bridge
+        self._subagent_manager = subagent_manager
+        self._meta_evolution_enabled = bool(meta_evolution_enabled)
         self._plugin_actions = self._configure_plugin_actions(
             role_generation_id, plugin_manifests, tool_broker, known_actions
         )
@@ -609,6 +631,14 @@ class ToolDispatcher:
                 "paper.collect": self._paper_collect,
                 "paper.excerpt_read": self._paper_excerpt_read,
                 "evolution.request": self._evolution_request,
+                "aegis.propose_harness_change": self._propose_harness_change,
+                "aegis.order_rollback": self._order_rollback,
+                "aegis.deploy_mcp": self._deploy_mcp,
+                "aegis.mcp_call": self._mcp_call,
+                "aegis.deploy_dependency": self._deploy_dependency,
+                "aegis.spawn_subagent": self._spawn_subagent,
+                "aegis.reclaim_subagent": self._reclaim_subagent,
+                "aegis.subagent_status": self._subagent_status,
                 "workspace.write": self._workspace_write,
                 "workspace.read": self._workspace_read,
                 "sandbox.exec": self._sandbox_exec,
@@ -1414,35 +1444,7 @@ class ToolDispatcher:
             ):
                 raise ActionError(f"evolution {name} must be bounded trimmed text")
         source_refs = arguments.get("source_refs", [])
-        if not isinstance(source_refs, list) or len(source_refs) > MAX_EVOLUTION_SOURCE_REFS:
-            raise ActionError(
-                f"evolution source_refs must contain at most {MAX_EVOLUTION_SOURCE_REFS} items"
-            )
-        citations: list[Mapping[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for raw in source_refs:
-            if not isinstance(raw, Mapping) or set(raw) != {"artifact_id", "locator"}:
-                raise ActionError("evolution source ref must contain artifact_id and locator")
-            snapshot = self._archived_snapshot(raw["artifact_id"])
-            locator = raw["locator"]
-            if not isinstance(locator, str):
-                raise ActionError("evolution source locator must be a string")
-            blob = next((item for item in snapshot.blobs if item.locator == locator), None)
-            if blob is None:
-                raise ActionError("evolution source locator is not present in archived research")
-            identity = (snapshot.artifact_id, blob.locator)
-            if identity in seen:
-                raise ActionError("evolution source_refs must be unique")
-            seen.add(identity)
-            citations.append(
-                {
-                    "artifact_id": snapshot.artifact_id,
-                    "kind": snapshot.kind,
-                    "content_sha256": snapshot.content_sha256,
-                    "locator": blob.locator,
-                    "blob_sha256": blob.sha256,
-                }
-            )
+        citations = self._evolution_source_citations(source_refs)
         proposal: Mapping[str, Any] | None = None
         if "proposal" in arguments:
             from aegis.evolution.surfaces import (
@@ -1476,6 +1478,346 @@ class ToolDispatcher:
             "host_write_allowed": False,
             "proposal": proposal,
         }
+
+    def _propose_harness_change(
+        self, arguments: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Warrior-only real code-patch proposal against the harness grant."""
+        self._exact(
+            arguments,
+            {"objective", "rationale", "base_commit", "checkpoint_ref", "changes"},
+            {
+                "failure_mode_targeted",
+                "expected_fix",
+                "regression_risk",
+                "evidence_ref",
+                "source_refs",
+            },
+        )
+        objective = arguments["objective"]
+        rationale = arguments["rationale"]
+        for value, name in ((objective, "objective"), (rationale, "rationale")):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or value != value.strip()
+                or len(value.encode("utf-8")) > 2_000
+                or any(ord(character) < 32 for character in value)
+            ):
+                raise ActionError(f"harness change {name} must be bounded trimmed text")
+        failure_mode = arguments.get("failure_mode_targeted")
+        if failure_mode is not None and not isinstance(failure_mode, str):
+            raise ActionError("harness failure_mode_targeted must be null or text")
+        evidence_ref = arguments.get("evidence_ref")
+        if evidence_ref is not None and not isinstance(evidence_ref, str):
+            raise ActionError("harness evidence_ref must be null or text")
+        for name in ("expected_fix", "regression_risk"):
+            items = arguments.get(name, [])
+            if (
+                not isinstance(items, list)
+                or not items
+                or len(items) > 16
+                or any(
+                    not isinstance(item, str) or not item or item != item.strip()
+                    for item in items
+                )
+            ):
+                raise ActionError(f"harness {name} must be a bounded list of trimmed text")
+        from aegis.evolution.surfaces import (
+            EvolutionSurfaceError,
+            validate_harness_code_content,
+        )
+
+        raw_content: dict[str, Any] = {
+            "base_commit": arguments["base_commit"],
+            "checkpoint_ref": arguments["checkpoint_ref"],
+            "changes": arguments["changes"],
+            "objective": objective,
+            "rationale": rationale,
+            "failure_mode_targeted": failure_mode,
+            "expected_fix": arguments.get("expected_fix", []),
+            "regression_risk": arguments.get("regression_risk", []),
+            "evidence_ref": evidence_ref,
+        }
+        try:
+            content = validate_harness_code_content(
+                raw_content,
+                meta_evolution_enabled=self._meta_evolution_enabled,
+            )
+        except EvolutionSurfaceError as exc:
+            raise ActionError(f"harness change proposal is invalid: {exc}") from exc
+        citations = self._evolution_source_citations(arguments.get("source_refs", []))
+        return {
+            "objective": objective,
+            "rationale": rationale,
+            "source_refs": citations,
+            "candidate_only": True,
+            "host_write_allowed": False,
+            "proposal": {
+                "surface": "harness-code",
+                "target_role": "warrior",
+                "content": content,
+            },
+        }
+
+    def _order_rollback(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Prosecutor-only rollback order for a failed harness evolution."""
+        self._exact(arguments, {"candidate_id", "reason", "analysis"})
+        from aegis.evolution.harness import HarnessEvolutionError, RollbackOrder
+
+        try:
+            order = RollbackOrder.create(
+                candidate_id=arguments["candidate_id"],
+                reason=arguments["reason"][:2000],
+                analysis=arguments["analysis"][:4000],
+            )
+        except HarnessEvolutionError as exc:
+            raise ActionError(f"rollback order is invalid: {exc}") from exc
+        return order.to_mapping()
+
+    def _deploy_mcp(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Warrior-only staged deployment of a control-plane MCP server."""
+        self._exact(
+            arguments,
+            {"name", "endpoint", "tool_names", "version"},
+            {"rationale"},
+        )
+        from aegis.mcp.bridge import McpBridgeError, McpServerManifest
+
+        try:
+            manifest = McpServerManifest.create(
+                name=arguments["name"],
+                endpoint=arguments["endpoint"],
+                tool_names=arguments["tool_names"],
+                version=arguments["version"],
+                rationale=arguments.get("rationale", "warrior-deployed MCP server"),
+            )
+        except (McpBridgeError, TypeError, ValueError) as exc:
+            raise ActionError(f"MCP deployment is invalid: {exc}") from exc
+        return {"manifest": manifest.to_mapping(), "deploy_pending": True}
+
+    def _mcp_call(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Warrior-only real invocation of a deployed MCP tool."""
+        self._exact(arguments, {"server", "tool", "arguments"})
+        if self._mcp_bridge is None:
+            raise ActionError("MCP bridge is not configured")
+        from aegis.mcp.bridge import McpBridgeError
+
+        try:
+            result = self._mcp_bridge.call(
+                arguments["server"],
+                arguments["tool"],
+                arguments["arguments"],
+            )
+        except McpBridgeError as exc:
+            raise ActionError(f"MCP call failed closed: {exc}") from exc
+        return {
+            "server": arguments["server"],
+            "tool": arguments["tool"],
+            "result": result,
+        }
+
+    def _deploy_dependency(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Warrior-only staged environment deployment of one digest-pinned
+        dependency, reusing the real environment candidate pipeline."""
+        self._exact(
+            arguments,
+            {"parent_image", "dependency", "objective", "rationale"},
+            {"build_steps", "max_output_bytes", "source_refs"},
+        )
+        objective = arguments["objective"]
+        rationale = arguments["rationale"]
+        for value, name in ((objective, "objective"), (rationale, "rationale")):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or value != value.strip()
+                or len(value.encode("utf-8")) > 2_000
+            ):
+                raise ActionError(f"dependency deployment {name} must be bounded trimmed text")
+        from aegis.environments.models import (
+            BuildStep,
+            BuilderNetworkPolicy,
+            DependencyArtifact,
+            DependencyKind,
+            EnvironmentRecipe,
+        )
+        from aegis.evolution.surfaces import (
+            EvolutionSurfaceError,
+            validate_environment_content,
+        )
+
+        dependency = arguments["dependency"]
+        if (
+            not isinstance(dependency, Mapping)
+            or set(dependency) != {"name", "version", "kind", "source_url", "sha256"}
+        ):
+            raise ActionError(
+                "dependency must contain exactly name, version, kind, source_url, sha256"
+            )
+        build_steps = arguments.get("build_steps", [{"argv": ["true"]}])
+        if not isinstance(build_steps, list) or not 1 <= len(build_steps) <= 32:
+            raise ActionError("build_steps must be a bounded non-empty list")
+        try:
+            artifact = DependencyArtifact(
+                name=dependency["name"],
+                version=dependency["version"],
+                kind=DependencyKind(dependency["kind"]),
+                source_url=dependency["source_url"],
+                sha256=dependency["sha256"],
+            )
+            converted_steps = tuple(
+                BuildStep(
+                    argv=tuple(item["argv"]),
+                    cwd=item.get("cwd", "."),
+                    timeout_seconds=item.get("timeout_seconds", 300.0),
+                )
+                for item in build_steps
+            )
+            recipe = EnvironmentRecipe.create(
+                parent_image=arguments["parent_image"],
+                network_policy=BuilderNetworkPolicy.BROKERED_PUBLIC,
+                dependencies=(artifact,),
+                build_steps=converted_steps,
+                max_output_bytes=arguments.get("max_output_bytes", 1_073_741_824),
+            )
+            validated = validate_environment_content(recipe.to_dict())
+        except (TypeError, ValueError, KeyError, EvolutionSurfaceError) as exc:
+            raise ActionError(f"dependency deployment is invalid: {exc}") from exc
+        citations = self._evolution_source_citations(arguments.get("source_refs", []))
+        return {
+            "objective": objective,
+            "rationale": rationale,
+            "source_refs": citations,
+            "candidate_only": True,
+            "host_write_allowed": False,
+            "proposal": {
+                "surface": "environment",
+                "target_role": "warrior",
+                "content": validated.to_dict(),
+            },
+        }
+
+    def _spawn_subagent(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Warrior-only spawn of one bounded real subagent process."""
+        self._exact(
+            arguments,
+            {"objective", "context"},
+            {
+                "role",
+                "executor",
+                "script",
+                "input_refs",
+                "model",
+                "max_output_tokens",
+            },
+        )
+        if self._subagent_manager is None:
+            raise ActionError("subagent runtime is not configured")
+        from aegis.subagents import (
+            SubagentLimits,
+            SubagentRuntimeError,
+            SubagentSpec,
+        )
+
+        objective = arguments["objective"]
+        context = arguments["context"]
+        if (
+            not isinstance(objective, str)
+            or not objective.strip()
+            or len(objective.encode("utf-8")) > 4_096
+        ):
+            raise ActionError("subagent objective must be bounded non-empty text")
+        if not isinstance(context, Mapping):
+            raise ActionError("subagent context must be an object")
+        input_refs = arguments.get("input_refs", [])
+        if not isinstance(input_refs, list) or len(input_refs) > 16 or any(
+            not isinstance(item, str) for item in input_refs
+        ):
+            raise ActionError("subagent input_refs must be a bounded list of text")
+        try:
+            spec = SubagentSpec.create(
+                role=arguments.get("role", "warrior"),
+                objective=objective,
+                context=dict(context),
+                executor=arguments.get("executor", "script"),
+                script=arguments.get("script"),
+                input_refs=input_refs,
+                limits=SubagentLimits(
+                    max_steps=self._limits.max_steps,
+                    timeout_seconds=self._limits.max_timeout_seconds,
+                    max_result_bytes=self._limits.max_tool_output_bytes,
+                ),
+                model=arguments.get("model"),
+                max_output_tokens=arguments.get("max_output_tokens", 4096),
+            )
+            handle = self._subagent_manager.spawn(spec)
+        except (SubagentRuntimeError, TypeError, ValueError) as exc:
+            raise ActionError(f"subagent spawn failed closed: {exc}") from exc
+        return handle
+
+    def _reclaim_subagent(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Warrior-only reclaim of a finished or timed-out subagent."""
+        self._exact(arguments, {"subagent_id"}, {"timeout_seconds"})
+        if self._subagent_manager is None:
+            raise ActionError("subagent runtime is not configured")
+        from aegis.subagents import SubagentRuntimeError
+
+        timeout = arguments.get("timeout_seconds", 30.0)
+        if type(timeout) not in {int, float} or not 0 < float(timeout) <= 300:
+            raise ActionError("subagent reclaim timeout is outside the safe range")
+        try:
+            return self._subagent_manager.reclaim(
+                arguments["subagent_id"], timeout_seconds=float(timeout)
+            )
+        except SubagentRuntimeError as exc:
+            raise ActionError(f"subagent reclaim failed: {exc}") from exc
+
+    def _subagent_status(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Warrior-only status poll of one running subagent."""
+        self._exact(arguments, {"subagent_id"})
+        if self._subagent_manager is None:
+            raise ActionError("subagent runtime is not configured")
+        from aegis.subagents import SubagentRuntimeError
+
+        try:
+            return self._subagent_manager.status(arguments["subagent_id"])
+        except SubagentRuntimeError as exc:
+            raise ActionError(f"subagent status failed: {exc}") from exc
+
+    def _evolution_source_citations(
+        self, source_refs: object
+    ) -> list[Mapping[str, str]]:
+        if not isinstance(source_refs, list) or len(source_refs) > MAX_EVOLUTION_SOURCE_REFS:
+            raise ActionError(
+                f"evolution source_refs must contain at most {MAX_EVOLUTION_SOURCE_REFS} items"
+            )
+        citations: list[Mapping[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw in source_refs:
+            if not isinstance(raw, Mapping) or set(raw) != {"artifact_id", "locator"}:
+                raise ActionError("evolution source ref must contain artifact_id and locator")
+            snapshot = self._archived_snapshot(raw["artifact_id"])
+            locator = raw["locator"]
+            if not isinstance(locator, str):
+                raise ActionError("evolution source locator must be a string")
+            blob = next((item for item in snapshot.blobs if item.locator == locator), None)
+            if blob is None:
+                raise ActionError("evolution source locator is not present in archived research")
+            identity = (snapshot.artifact_id, blob.locator)
+            if identity in seen:
+                raise ActionError("evolution source_refs must be unique")
+            seen.add(identity)
+            citations.append(
+                {
+                    "artifact_id": snapshot.artifact_id,
+                    "kind": snapshot.kind,
+                    "content_sha256": snapshot.content_sha256,
+                    "locator": blob.locator,
+                    "blob_sha256": blob.sha256,
+                }
+            )
+        return citations
 
     def _knowledge_search(self, role: Role, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         self._exact(arguments, {"query"}, {"limit"})
@@ -1818,6 +2160,8 @@ class RoleAgentRuntime:
         usages: list[TokenUsage] = []
         strategy_proposals: list[Mapping[str, Any]] = []
         evolution_requests: list[Mapping[str, Any]] = []
+        rollback_orders: list[Mapping[str, Any]] = []
+        mcp_deployments: list[Mapping[str, Any]] = []
         research_actions = 0
         for step in range(1, self.limits.max_steps + 1):
             available_actions = self._convergence_actions(
@@ -2028,7 +2372,11 @@ class RoleAgentRuntime:
                     )
                     continue
                 strategy_proposals.append(result)
-            if action.name == "evolution.request":
+            if action.name in {
+                "evolution.request",
+                "aegis.propose_harness_change",
+                "aegis.deploy_dependency",
+            }:
                 if len(evolution_requests) >= MAX_EVOLUTION_REQUESTS:
                     duplicate = any(
                         json.dumps(
@@ -2057,7 +2405,8 @@ class RoleAgentRuntime:
                                     if duplicate
                                     else (
                                         "a role run may request at most "
-                                        f"{MAX_EVOLUTION_REQUESTS} evolution candidate"
+                                        f"{MAX_EVOLUTION_REQUESTS} evolution candidate; "
+                                        "aegis.propose_harness_change counts toward the same cap"
                                     )
                                 ),
                             },
@@ -2065,6 +2414,42 @@ class RoleAgentRuntime:
                     )
                     continue
                 evolution_requests.append(result)
+            if action.name == "aegis.order_rollback":
+                if len(rollback_orders) >= MAX_EVOLUTION_REQUESTS:
+                    observations[-1] = ToolObservation(
+                        step,
+                        action.name,
+                        {
+                            "accepted": False,
+                            "error": {
+                                "type": "ActionError",
+                                "message": (
+                                    "a prosecutor run may order at most "
+                                    f"{MAX_EVOLUTION_REQUESTS} rollback"
+                                ),
+                            },
+                        },
+                    )
+                    continue
+                rollback_orders.append(result)
+            if action.name == "aegis.deploy_mcp":
+                if len(mcp_deployments) >= MAX_EVOLUTION_REQUESTS:
+                    observations[-1] = ToolObservation(
+                        step,
+                        action.name,
+                        {
+                            "accepted": False,
+                            "error": {
+                                "type": "ActionError",
+                                "message": (
+                                    "a warrior run may deploy at most "
+                                    f"{MAX_EVOLUTION_REQUESTS} MCP server"
+                                ),
+                            },
+                        },
+                    )
+                    continue
+                mcp_deployments.append(result)
             if action.name == "submit":
                 completed_actions = self._successful_actions(observations[:-1])
                 missing = [
@@ -2098,6 +2483,10 @@ class RoleAgentRuntime:
                     submission["strategy_proposals"] = list(strategy_proposals)
                 if evolution_requests:
                     submission["evolution_requests"] = list(evolution_requests)
+                if rollback_orders:
+                    submission["rollback_orders"] = list(rollback_orders)
+                if mcp_deployments:
+                    submission["mcp_deployments"] = list(mcp_deployments)
                 return RoleRunResult(
                     role,
                     str(result["summary"]),

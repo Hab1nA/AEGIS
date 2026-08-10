@@ -72,10 +72,29 @@ from aegis.evolution.arm_evaluation import (
     freeze_workspace_bytes,
     stage_cohort_workspace,
 )
-from aegis.evolution.consumer import consume_cycle_proposals
+from aegis.evolution.consumer import (
+    consume_cycle_proposals,
+    consume_mcp_deployments,
+    consume_rollback_orders,
+)
+from aegis.evolution.harness import (
+    HarnessCanaryRunner,
+    HarnessEvolutionError,
+    HarnessRepo,
+    HarnessRollbackExecutor,
+    RollbackOrder,
+    changes_to_git_file_changes,
+    manifest_from_harness_content,
+)
+from aegis.evolution.population import (
+    PopulationArchive,
+    behavior_descriptor,
+    behavior_roots,
+)
 from aegis.evolution.registry import (
     CandidateState,
     EvolutionRegistry,
+    EvolutionRegistryError,
 )
 from aegis.evolution.runtime import (
     RuntimeBinding,
@@ -92,11 +111,13 @@ from aegis.evolution.runtime import (
     store_composite_manifest,
 )
 from aegis.evolution.surfaces import (
+    HARNESS_ALLOWED_ROOTS,
     EvolutionSurface,
     validate_environment_content,
 )
 from aegis.gateway.protocols import Role as GatewayRole
 from aegis.gateway.types import TokenUsage
+from aegis.mcp import McpBridge, McpBridgeError, McpServerManifest
 from aegis.models import Role, canonical_json
 from aegis.plugins import (
     EffectClass,
@@ -108,6 +129,7 @@ from aegis.publishing import GitPublisher
 from aegis.roles import RoleRegistry
 from aegis.roles.generation import GenerationBundle, RoleGeneration
 from aegis.sandbox.backend import SandboxBackend
+from aegis.subagents import SubagentLimits, SubagentManager
 from aegis.taskpacks.manifest import TaskPack
 from aegis.taskpacks.validation import TaskPackRunner
 
@@ -308,6 +330,16 @@ class ModelCyclePorts:
         evaluate_candidates_enabled: bool = True,
         candidate_max_extra_steps: int = 12,
         budget_policy_sha256: str | None = None,
+        harness_repo: HarnessRepo | None = None,
+        harness_canary_command: Sequence[str] | None = None,
+        harness_activation_automatic: bool = True,
+        mcp_bridge: McpBridge | None = None,
+        subagent_max_steps: int = 8,
+        subagent_timeout_seconds: float = 180.0,
+        subagent_max_concurrency: int = 2,
+        subagent_max_result_bytes: int = 65_536,
+        meta_evolution_enabled: bool = False,
+        population: PopulationArchive | None = None,
     ) -> None:
         self._gateway = gateway
         self._sandbox = sandbox
@@ -342,6 +374,39 @@ class ModelCyclePorts:
             b"aegis-unset-budget-policy"
         ).hexdigest()
         self._source_commit = source_commit
+        self._harness_repo = harness_repo
+        self._harness_activation_automatic = bool(harness_activation_automatic)
+        self._mcp_bridge = mcp_bridge
+        self._subagent_manager = SubagentManager(
+            limits=SubagentLimits(
+                max_steps=subagent_max_steps,
+                timeout_seconds=subagent_timeout_seconds,
+                max_result_bytes=subagent_max_result_bytes,
+            ),
+            max_concurrency=subagent_max_concurrency,
+        )
+        self._meta_evolution_enabled = bool(meta_evolution_enabled)
+        self._population = population
+        self._harness_canary: HarnessCanaryRunner | None = None
+        self._harness_rollback: HarnessRollbackExecutor | None = None
+        if harness_repo is not None:
+            self._harness_canary = HarnessCanaryRunner(
+                harness_repo,
+                canary_argv=(
+                    tuple(harness_canary_command)
+                    if harness_canary_command is not None
+                    else (
+                        "{python}",
+                        "-m",
+                        "pytest",
+                        "-q",
+                        "-p",
+                        "no:cacheprovider",
+                        "tests/test_evolution_surfaces.py",
+                    )
+                ),
+            )
+            self._harness_rollback = HarnessRollbackExecutor(harness_repo)
         self._arm_workspaces: dict[str, bytes] = {}
         workflow_ref, subject_ref = materialize_default_artifacts(artifacts)
         self._default_workflow_ref = workflow_ref
@@ -368,10 +433,13 @@ class ModelCyclePorts:
         self._checkpoint_connector: GitCheckpointConnector | None = None
         if public_repo_url is not None and source_commit is not None:
             self._journal = SqliteConnectorJournal(data_dir / "connector_journal.sqlite3")
+            role_paths: dict[str, tuple[str, ...]] = {"warrior": ("warrior",)}
+            if harness_repo is not None:
+                role_paths["warrior"] = ("warrior", *HARNESS_ALLOWED_ROOTS)
             publisher = GitPublisher(
                 public_repo_url,
                 remote_id="aegis-public",
-                allowed_role_paths={"warrior": ("warrior",)},
+                allowed_role_paths=role_paths,
             )
             connector = GitCheckpointConnector(publisher)
             self._checkpoint_connector = connector
@@ -486,6 +554,9 @@ class ModelCyclePorts:
             "disabled_actions": (
                 frozenset() if role is Role.WARRIOR else frozenset({"evolution.request"})
             ),
+            "mcp_bridge": self._mcp_bridge,
+            "subagent_manager": self._subagent_manager,
+            "meta_evolution_enabled": self._meta_evolution_enabled,
         }
         broker_tuple = self._broker_for_binding(role, binding, sandbox_id)
         if broker_tuple is not None:
@@ -975,6 +1046,46 @@ class ModelCyclePorts:
         submission_data = _brief(self._artifacts, submission)
         audit_data = _brief(self._artifacts, prosecutor_audit)
         collection_evidence_id = f"cycle:{snapshot.cycle_number}:candidate-evaluation"
+        rollback_orders = tuple(consume_rollback_orders(submission_data)) + tuple(
+            consume_rollback_orders(audit_data)
+        )
+        result["rollbacks"] = [
+            self._execute_rollback_order(order) for order in rollback_orders
+        ]
+        result["mcp_deployments"] = []
+        for manifest in consume_mcp_deployments(submission_data):
+            if self._mcp_bridge is None:
+                result["mcp_deployments"].append(
+                    {
+                        "manifest_id": manifest.manifest_id,
+                        "name": manifest.name,
+                        "deployed": False,
+                        "error": "MCP bridge is not configured",
+                    }
+                )
+                continue
+            try:
+                receipt = self._mcp_bridge.deploy(manifest)
+            except McpBridgeError as exc:
+                result["mcp_deployments"].append(
+                    {
+                        "manifest_id": manifest.manifest_id,
+                        "name": manifest.name,
+                        "deployed": False,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            ref = self._artifacts.put_json("mcp", manifest.to_mapping())
+            result["mcp_deployments"].append(
+                {
+                    "manifest_id": manifest.manifest_id,
+                    "name": manifest.name,
+                    "deployed": True,
+                    "artifact_id": ref.artifact_id,
+                    "tools_available": receipt["tools_available"],
+                }
+            )
         consumed = consume_cycle_proposals(
             registry=self._evolution,
             artifacts=self._artifacts,
@@ -982,6 +1093,7 @@ class ModelCyclePorts:
             prosecutor_audit=audit_data,
             objective_id=snapshot.objective.objective_id,
             collection_evidence_id=collection_evidence_id,
+            meta_evolution_enabled=self._meta_evolution_enabled,
         )
         result["collected"] = [
             item.to_mapping() for item in consumed if item.collected
@@ -999,9 +1111,19 @@ class ModelCyclePorts:
                 item
                 for item in self._evolution.validated_candidates()
                 if item.target_role is Role.WARRIOR
+                and item.surface is EvolutionSurface.HARNESS_CODE
             ),
             None,
         )
+        if candidate is None:
+            candidate = next(
+                (
+                    item
+                    for item in self._evolution.validated_candidates()
+                    if item.target_role is Role.WARRIOR
+                ),
+                None,
+            )
         if candidate is None:
             result["role_generations"] = self._record_role_generations(snapshot)
             return result
@@ -1012,6 +1134,102 @@ class ModelCyclePorts:
             "artifact_id": candidate.artifact_id,
             "artifact_sha256": candidate.artifact_sha256,
         }
+        if candidate.surface is EvolutionSurface.HARNESS_CODE:
+            if self._harness_canary is None or self._harness_repo is None:
+                self._evolution.reject(
+                    candidate.candidate_id,
+                    reason=(
+                        "harness_code surface enabled but no harness repository "
+                        "is configured"
+                    ),
+                )
+                result["rejected"].append(
+                    {
+                        "surface": candidate.surface.value,
+                        "target_role": candidate.target_role.value,
+                        "artifact_id": candidate.artifact_id,
+                        "error": "harness repository is not configured",
+                    }
+                )
+                result["role_generations"] = self._record_role_generations(snapshot)
+                return result
+            try:
+                content = _load_json_artifact(
+                    self._artifacts, "harness-code", candidate.artifact_id
+                )
+                changes = changes_to_git_file_changes(content["changes"])
+                verdict = self._harness_canary.run(content, changes)
+            except (HarnessEvolutionError, ValueError, TypeError, KeyError) as exc:
+                self._evolution.reject(
+                    candidate.candidate_id,
+                    reason=f"harness validation failed: {type(exc).__name__}: {exc}",
+                )
+                result["rejected"].append(
+                    {
+                        "surface": candidate.surface.value,
+                        "target_role": candidate.target_role.value,
+                        "artifact_id": candidate.artifact_id,
+                        "error": f"harness validation failed: {type(exc).__name__}: {exc}",
+                    }
+                )
+                result["role_generations"] = self._record_role_generations(snapshot)
+                return result
+            evidence_ref = self._artifacts.put_json(
+                "harness-canary", verdict.to_mapping()
+            )
+            result["harness_canary"] = {
+                "passed": verdict.passed,
+                "reason": verdict.reason,
+                "evidence_id": evidence_ref.artifact_id,
+            }
+            if not verdict.passed:
+                self._evolution.reject(
+                    candidate.candidate_id,
+                    reason=f"harness canary failed: {verdict.reason}",
+                )
+                result["rejected"].append(
+                    {
+                        "surface": candidate.surface.value,
+                        "target_role": candidate.target_role.value,
+                        "artifact_id": candidate.artifact_id,
+                        "error": verdict.reason,
+                    }
+                )
+                result["role_generations"] = self._record_role_generations(snapshot)
+                return result
+            self._evolution.qualify(
+                candidate.candidate_id,
+                qualification_evidence_id=evidence_ref.artifact_id,
+            )
+            population_entry = self._register_population(
+                candidate, evidence_id=evidence_ref.artifact_id
+            )
+            result["population_entry"] = population_entry
+            result["activation"] = {
+                "activated": False,
+                "qualified": candidate.candidate_id,
+            }
+            if self._harness_activation_automatic:
+                try:
+                    manifest = manifest_from_harness_content(content)
+                    activation_commit = self._harness_repo.activate(
+                        changes,
+                        message=f"evolution: {manifest.surface} {manifest.manifest_id}",
+                    )
+                except HarnessEvolutionError as exc:
+                    result["activation"]["activation_error"] = str(exc)[:2000]
+                else:
+                    self._evolution.activate(
+                        candidate.candidate_id,
+                        activation_evidence_id=evidence_ref.artifact_id,
+                    )
+                    result["activation"] = {
+                        "activated": True,
+                        "qualified": candidate.candidate_id,
+                        "activation_commit": activation_commit,
+                    }
+            result["role_generations"] = self._record_role_generations(snapshot)
+            return result
         if candidate.surface is EvolutionSurface.ENVIRONMENT:
             if self._environment_builder is None:
                 self._evolution.reject(
@@ -1144,6 +1362,9 @@ class ModelCyclePorts:
                 candidate.candidate_id,
                 qualification_evidence_id=collection_evidence_id,
             )
+            self._register_population(
+                candidate, evidence_id=collection_evidence_id
+            )
             result["activation"] = {
                 "activated": False,
                 "qualified": candidate.candidate_id,
@@ -1156,6 +1377,96 @@ class ModelCyclePorts:
             }
         result["role_generations"] = self._record_role_generations(snapshot)
         return result
+
+    def _register_population(
+        self,
+        candidate: Any,
+        *,
+        evidence_id: str,
+    ) -> Mapping[str, Any] | None:
+        """Register one qualified candidate in the MAP-Elites archive."""
+        if self._population is None:
+            return None
+        try:
+            content = _load_json_artifact(
+                self._artifacts, candidate.surface.value, candidate.artifact_id
+            )
+        except (KeyError, ValueError, TypeError):
+            return None
+        if not isinstance(content, Mapping):
+            return None
+        roots = behavior_roots(content, surface=candidate.surface)
+        cell = behavior_descriptor(
+            surface=candidate.surface,
+            changed_roots=roots,
+            failure_mode=content.get("failure_mode_targeted"),
+            objective=str(content.get("objective", "")),
+        )
+        entry = self._population.register(
+            candidate_id=candidate.candidate_id,
+            cell=cell,
+            fitness=1.0,
+            evidence_id=evidence_id,
+            descriptor=cell,
+        )
+        return entry.to_mapping()
+
+    def _execute_rollback_order(self, order: RollbackOrder) -> Mapping[str, Any]:
+        """Execute one Prosecutor rollback order against the live harness repo
+        and the evolution registry, fail-closed when the order cannot be
+        verified against the current champion."""
+        if self._harness_rollback is None or self._evolution is None:
+            return {
+                "order_id": order.order_id,
+                "executed": False,
+                "error": "harness rollback executor is not configured",
+            }
+        champion = self._evolution.champion(
+            EvolutionSurface.HARNESS_CODE, Role.WARRIOR
+        )
+        if champion is None or champion.candidate_id != order.candidate_id:
+            return {
+                "order_id": order.order_id,
+                "executed": False,
+                "error": (
+                    "rollback candidate is not the active harness champion"
+                ),
+            }
+        try:
+            content = _load_json_artifact(
+                self._artifacts, "harness-code", champion.artifact_id
+            )
+            outcome = self._harness_rollback.execute(
+                order, base_commit=content["base_commit"]
+            )
+        except (HarnessEvolutionError, ValueError, TypeError, KeyError) as exc:
+            return {
+                "order_id": order.order_id,
+                "executed": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        try:
+            self._evolution.rollback(
+                EvolutionSurface.HARNESS_CODE,
+                Role.WARRIOR,
+                reason=order.reason[:2000],
+                expected_champion_id=order.candidate_id,
+            )
+        except EvolutionRegistryError as exc:
+            return {
+                "order_id": order.order_id,
+                "executed": True,
+                "restored_commit": outcome["restored_commit"],
+                "evidence_id": outcome["evidence_id"],
+                "registry_rollback_error": str(exc),
+            }
+        return {
+            "order_id": order.order_id,
+            "executed": True,
+            "restored_commit": outcome["restored_commit"],
+            "evidence_id": outcome["evidence_id"],
+            "analysis": order.analysis[:4000],
+        }
 
     def _paired_arm(
         self,
@@ -1694,6 +2005,16 @@ def run_v2_cycle(
     evaluate_candidates_enabled: bool = True,
     candidate_max_extra_steps: int = 12,
     campaign_config: Any = None,
+    harness_repo: HarnessRepo | None = None,
+    harness_canary_command: Sequence[str] | None = None,
+    harness_activation_automatic: bool = True,
+    mcp_bridge: McpBridge | None = None,
+    subagent_max_steps: int = 8,
+    subagent_timeout_seconds: float = 180.0,
+    subagent_max_concurrency: int = 2,
+    subagent_max_result_bytes: int = 65_536,
+    meta_evolution_enabled: bool = False,
+    population: PopulationArchive | None = None,
 ) -> Any:
     constitution = genesis_constitution()
     objective = genesis_objective(constitution)
@@ -1749,6 +2070,16 @@ def run_v2_cycle(
         evaluate_candidates_enabled=evaluate_candidates_enabled,
         candidate_max_extra_steps=candidate_max_extra_steps,
         budget_policy_sha256=policy_hash,
+        harness_repo=harness_repo,
+        harness_canary_command=harness_canary_command,
+        harness_activation_automatic=harness_activation_automatic,
+        mcp_bridge=mcp_bridge,
+        subagent_max_steps=subagent_max_steps,
+        subagent_timeout_seconds=subagent_timeout_seconds,
+        subagent_max_concurrency=subagent_max_concurrency,
+        subagent_max_result_bytes=subagent_max_result_bytes,
+        meta_evolution_enabled=meta_evolution_enabled,
+        population=population,
     )
     try:
         state = curriculum.projection.cycle_state

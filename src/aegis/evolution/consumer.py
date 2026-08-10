@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from aegis.artifacts import ContentAddressedArtifactStore
+from aegis.mcp import McpBridgeError, McpServerManifest
 from aegis.models import Role
 
+from .harness import HarnessEvolutionError, RollbackOrder
 from .registry import CandidateState, EvolutionRegistry, EvolutionRegistryError
 from .surfaces import (
     EvolutionProposal,
@@ -265,6 +267,7 @@ def consume_cycle_proposals(
     prosecutor_audit: Mapping[str, Any],
     objective_id: str,
     collection_evidence_id: str,
+    meta_evolution_enabled: bool = False,
 ) -> tuple[ConsumedCandidate, ...]:
     """Scan one cycle's evidence and collect every valid evolution candidate."""
     consumed: list[ConsumedCandidate] = []
@@ -284,7 +287,9 @@ def consume_cycle_proposals(
             continue
         try:
             proposal = validate_evolution_proposal(
-                raw["proposal"], proposer=Role.WARRIOR
+                raw["proposal"],
+                proposer=Role.WARRIOR,
+                meta_evolution_enabled=meta_evolution_enabled,
             )
         except EvolutionSurfaceError as exc:
             consumed.append(
@@ -422,8 +427,44 @@ def consume_cycle_proposals(
     return tuple(consumed)
 
 
+def consume_rollback_orders(submission: Mapping[str, Any]) -> tuple[RollbackOrder, ...]:
+    """Extract Prosecutor rollback orders from one cycle's submission."""
+    nested = submission.get("submission")
+    if isinstance(nested, Mapping):
+        submission = nested
+    orders: list[RollbackOrder] = []
+    for raw in submission.get("rollback_orders", []):
+        if not isinstance(raw, Mapping):
+            continue
+        try:
+            orders.append(RollbackOrder.from_mapping(raw))
+        except HarnessEvolutionError:
+            continue
+    return tuple(orders)
+
+
+def consume_mcp_deployments(
+    submission: Mapping[str, Any],
+) -> tuple[McpServerManifest, ...]:
+    """Extract staged MCP server manifests from one cycle's submission."""
+    nested = submission.get("submission")
+    if isinstance(nested, Mapping):
+        submission = nested
+    manifests: list[McpServerManifest] = []
+    for raw in submission.get("mcp_deployments", []):
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("manifest"), Mapping):
+            continue
+        try:
+            manifests.append(McpServerManifest.from_mapping(raw["manifest"]))
+        except McpBridgeError:
+            continue
+    return tuple(manifests)
+
+
 __all__ = [
     "ConsumedCandidate",
     "EvolutionConsumerError",
+    "consume_mcp_deployments",
+    "consume_rollback_orders",
     "consume_cycle_proposals",
 ]

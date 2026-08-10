@@ -36,19 +36,19 @@
       "model": "deepseek-v4-flash",
       "budget_share": 0.55,
       "max_output_tokens": 16384,
-      "reasoning_effort": "high"
+      "reasoning_effort": "max"
     },
     "judge": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
       "max_output_tokens": 16384,
-      "reasoning_effort": "high"
+      "reasoning_effort": "max"
     },
     "prosecutor": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
       "max_output_tokens": 16384,
-      "reasoning_effort": "high"
+      "reasoning_effort": "max"
     }
   }
 }

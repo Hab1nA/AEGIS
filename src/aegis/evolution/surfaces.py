@@ -8,6 +8,7 @@ registry, and it is always consumed as untrusted data.
 
 from __future__ import annotations
 
+import base64
 import re
 from dataclasses import dataclass
 from enum import StrEnum
@@ -39,6 +40,14 @@ SURFACE_SCHEMA_VERSION = 2
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _OCI_DIGEST = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9-]{0,63}-sha256:[0-9a-f]{64}\Z")
+_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+_CHECKPOINT_REF = re.compile(r"refs/heads/candidate/warrior/gen-[0-9a-f]{40}\Z")
+
+
+MAX_HARNESS_CHANGES = 64
+MAX_HARNESS_FILE_BYTES = 786_432
+MAX_HARNESS_TEXT_BYTES = 2_000
+MAX_HARNESS_ITEM_BYTES = 512
 
 
 class EvolutionSurface(StrEnum):
@@ -46,6 +55,121 @@ class EvolutionSurface(StrEnum):
     SUBJECT = "subject"
     PLUGIN = "plugin"
     ENVIRONMENT = "environment"
+    HARNESS_CODE = "harness-code"
+
+
+"""Harness code root policy for the Warrior code-evolution surface.
+
+The Warrior may evolve the coding-agent harness itself, but the evaluation
+side (taskpacks/evaluation/dynamic tasks/curriculum), the safety boundary
+(sandbox), the external-write boundary (publishing/connectors), and the
+attribution standard are deliberately closed: an agent must not edit its own
+exam, its own jail, or its own score function.
+"""
+
+HARNESS_ALLOWED_ROOTS: tuple[str, ...] = (
+    "src/aegis/agent_runtime.py",
+    "src/aegis/plugins/",
+    "src/aegis/gateway/",
+    "src/aegis/roles/",
+    "src/aegis/research/",
+    "src/aegis/evolution/",
+)
+
+HARNESS_FORBIDDEN_ROOTS: tuple[str, ...] = (
+    "src/aegis/sandbox/",
+    "src/aegis/publishing/",
+    "src/aegis/connectors/",
+    "src/aegis/taskpacks/",
+    "src/aegis/evaluation/",
+    "src/aegis/dynamic_tasks/",
+    "src/aegis/curriculum/",
+    "src/aegis/attribution/",
+    "tests/",
+    "docs/",
+    "src/aegis/config.py",
+)
+
+HARNESS_FORBIDDEN_FILES: frozenset[str] = frozenset(
+    {
+        "src/aegis/evolution/registry.py",
+        "src/aegis/evolution/consumer.py",
+    }
+)
+
+META_FORBIDDEN_FILES: frozenset[str] = frozenset(
+    {
+        "src/aegis/evolution/registry.py",
+        "src/aegis/evolution/consumer.py",
+    }
+)
+
+META_ALLOWED_ROOTS: tuple[str, ...] = (
+    "src/aegis/cycle_recovery.py",
+    "src/aegis/repair_runtime.py",
+)
+
+HARNESS_SECRET_PATH_PARTS: frozenset[str] = frozenset(
+    {
+        ".env",
+        ".npmrc",
+        ".pypirc",
+        "credentials",
+        "credentials.json",
+        "id_rsa",
+        "id_ed25519",
+        "secrets",
+        "secrets.json",
+    }
+)
+
+HARNESS_SECRET_SUFFIXES: tuple[str, ...] = (".key", ".pem", ".p12", ".pfx")
+
+
+def validate_harness_path(
+    path: object, *, meta_evolution_enabled: bool = False
+) -> str:
+    """Reject any harness path outside the Warrior code-evolution grant."""
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\\" in path
+        or "\x00" in path
+        or len(path) > MAX_HARNESS_ITEM_BYTES
+    ):
+        raise EvolutionSurfaceError(
+            "harness path must be a bounded, safe POSIX relative path"
+        )
+    parts = tuple(path.split("/"))
+    if (
+        path.startswith("/")
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(part.lower() == ".git" for part in parts)
+    ):
+        raise EvolutionSurfaceError("harness path must be traversal-free")
+    lowered = tuple(part.lower() for part in parts)
+    if (
+        any(part in HARNESS_SECRET_PATH_PARTS for part in lowered)
+        or path.lower().endswith(HARNESS_SECRET_SUFFIXES)
+    ):
+        raise EvolutionSurfaceError("harness path looks like a secret file")
+    if path in HARNESS_FORBIDDEN_FILES and not meta_evolution_enabled:
+        raise EvolutionSurfaceError(
+            f"harness path is a protected control file: {path}"
+        )
+    if any(path == root or path.startswith(root) for root in HARNESS_FORBIDDEN_ROOTS):
+        raise EvolutionSurfaceError(
+            f"harness path is outside the evolvable harness grant: {path}"
+        )
+    if meta_evolution_enabled and path in META_ALLOWED_ROOTS:
+        return path
+    if not any(
+        path == root or path.startswith(root) for root in HARNESS_ALLOWED_ROOTS
+    ):
+        raise EvolutionSurfaceError(
+            f"harness path is not under an allowed harness root: {path}"
+        )
+    return path
 
 
 class EvolutionSurfaceError(RuntimeError):
@@ -306,8 +430,144 @@ def _environment_recipe_from_mapping(value: Mapping[str, Any]) -> EnvironmentRec
     return recipe
 
 
+def _harness_changes_from_mapping(
+    value: object, *, meta_evolution_enabled: bool = False
+) -> tuple[Mapping[str, Any], ...]:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_HARNESS_CHANGES:
+        raise EvolutionSurfaceError(
+            f"harness changes must be a list of 1..{MAX_HARNESS_CHANGES} items"
+        )
+    converted: list[Mapping[str, Any]] = []
+    paths: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping) or set(item) != {
+            "path",
+            "delete",
+            "content_base64",
+            "executable",
+        }:
+            raise EvolutionSurfaceError(
+                "harness change must contain exactly path, delete, content_base64, executable"
+            )
+        path = validate_harness_path(
+            item["path"], meta_evolution_enabled=meta_evolution_enabled
+        )
+        delete = item["delete"]
+        encoded = item["content_base64"]
+        executable = item["executable"]
+        if not isinstance(delete, bool) or not isinstance(executable, bool):
+            raise EvolutionSurfaceError("harness change delete and executable must be booleans")
+        if delete:
+            if executable or encoded != "":
+                raise EvolutionSurfaceError(
+                    "harness deletion must not carry content or executable mode"
+                )
+        else:
+            if not isinstance(encoded, str) or len(encoded) > MAX_HARNESS_FILE_BYTES * 4 // 3 + 16:
+                raise EvolutionSurfaceError("harness content_base64 is outside the size bound")
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise EvolutionSurfaceError("harness content_base64 is invalid") from exc
+            if not content or len(content) > MAX_HARNESS_FILE_BYTES:
+                raise EvolutionSurfaceError("harness file content is empty or oversized")
+            if b"PRIVATE KEY" in content:
+                raise EvolutionSurfaceError("harness file content looks like a secret")
+        if path in paths:
+            raise EvolutionSurfaceError("harness change paths must be unique")
+        paths.add(path)
+        converted.append(
+            {
+                "path": path,
+                "delete": delete,
+                "content_base64": encoded,
+                "executable": executable,
+            }
+        )
+    return tuple(sorted(converted, key=lambda item: item["path"]))
+
+
+def validate_harness_code_content(
+    value: object, *, meta_evolution_enabled: bool = False
+) -> Mapping[str, Any]:
+    """Validate one real code-patch proposal against the harness grant.
+
+    The content is a strict, bounded JSON patch: an exact base commit, the
+    journaled checkpoint ref that already carries the same changes, the file
+    changes themselves, and an AHE-style change manifest (targeted failure
+    mode, expected fix, regression risk).
+    """
+    data = _strict_object(
+        value,
+        {
+            "base_commit",
+            "checkpoint_ref",
+            "changes",
+            "objective",
+            "rationale",
+            "failure_mode_targeted",
+            "expected_fix",
+            "regression_risk",
+            "evidence_ref",
+        },
+        "harness_code",
+    )
+    base_commit = data["base_commit"]
+    if not isinstance(base_commit, str) or _COMMIT.fullmatch(base_commit) is None:
+        raise EvolutionSurfaceError("harness_code.base_commit must be a full Git commit id")
+    checkpoint_ref = data["checkpoint_ref"]
+    if (
+        not isinstance(checkpoint_ref, str)
+        or _CHECKPOINT_REF.fullmatch(checkpoint_ref) is None
+    ):
+        raise EvolutionSurfaceError(
+            "harness_code.checkpoint_ref must be a Warrior candidate ref"
+        )
+    objective = _text(
+        data["objective"], "harness_code.objective", maximum=MAX_HARNESS_TEXT_BYTES
+    )
+    rationale = _text(
+        data["rationale"], "harness_code.rationale", maximum=MAX_HARNESS_TEXT_BYTES
+    )
+    failure_mode = data["failure_mode_targeted"]
+    if failure_mode is not None and not isinstance(failure_mode, str):
+        raise EvolutionSurfaceError(
+            "harness_code.failure_mode_targeted must be null or text"
+        )
+    if failure_mode is not None and len(failure_mode.encode("utf-8")) > MAX_HARNESS_TEXT_BYTES:
+        raise EvolutionSurfaceError("harness_code.failure_mode_targeted exceeds the size bound")
+    evidence_ref = data["evidence_ref"]
+    if evidence_ref is not None and not isinstance(evidence_ref, str):
+        raise EvolutionSurfaceError("harness_code.evidence_ref must be null or text")
+    if evidence_ref is not None and len(evidence_ref.encode("utf-8")) > MAX_HARNESS_TEXT_BYTES:
+        raise EvolutionSurfaceError("harness_code.evidence_ref exceeds the size bound")
+    expected_fix = _string_list(
+        data["expected_fix"], "harness_code.expected_fix"
+    )
+    regression_risk = _string_list(
+        data["regression_risk"], "harness_code.regression_risk"
+    )
+    return {
+        "base_commit": base_commit,
+        "checkpoint_ref": checkpoint_ref,
+        "changes": _harness_changes_from_mapping(
+            data["changes"], meta_evolution_enabled=meta_evolution_enabled
+        ),
+        "objective": objective,
+        "rationale": rationale,
+        "failure_mode_targeted": failure_mode,
+        "expected_fix": expected_fix,
+        "regression_risk": regression_risk,
+        "evidence_ref": evidence_ref,
+    }
+
+
 def validate_surface_content(
-    surface: EvolutionSurface, value: object, *, target_role: Role
+    surface: EvolutionSurface,
+    value: object,
+    *,
+    target_role: Role,
+    meta_evolution_enabled: bool = False,
 ) -> Mapping[str, Any] | PluginManifest | EnvironmentRecipe:
     if surface is EvolutionSurface.WORKFLOW:
         return validate_workflow_content(value)
@@ -317,6 +577,10 @@ def validate_surface_content(
         return validate_plugin_content(value, target_role=target_role)
     if surface is EvolutionSurface.ENVIRONMENT:
         return validate_environment_content(value)
+    if surface is EvolutionSurface.HARNESS_CODE:
+        return validate_harness_code_content(
+            value, meta_evolution_enabled=meta_evolution_enabled
+        )
     raise AssertionError("unreachable")
 
 
@@ -353,7 +617,7 @@ class EvolutionProposal:
 
 
 def validate_evolution_proposal(
-    value: object, *, proposer: Role
+    value: object, *, proposer: Role, meta_evolution_enabled: bool = False
 ) -> EvolutionProposal:
     """Validate one untrusted ``evolution.request`` proposal envelope."""
     data = _strict_object(
@@ -373,11 +637,18 @@ def validate_evolution_proposal(
         raise EvolutionSurfaceError("environment proposals may only target the Warrior")
     if surface is EvolutionSurface.SUBJECT and target_role is not Role.WARRIOR:
         raise EvolutionSurfaceError("subject proposals may only target the Warrior")
+    if surface is EvolutionSurface.HARNESS_CODE and target_role is not Role.WARRIOR:
+        raise EvolutionSurfaceError("harness_code proposals may only target the Warrior")
     if surface is EvolutionSurface.WORKFLOW and target_role is not proposer:
         raise EvolutionSurfaceError(
             "workflow proposals through evolution.request may only target the proposer"
         )
-    content = validate_surface_content(surface, data["content"], target_role=target_role)
+    content = validate_surface_content(
+        surface,
+        data["content"],
+        target_role=target_role,
+        meta_evolution_enabled=meta_evolution_enabled,
+    )
     return EvolutionProposal(surface, target_role, content)
 
 
@@ -419,7 +690,19 @@ __all__ = [
     "EvolutionProposal",
     "EvolutionSurface",
     "EvolutionSurfaceError",
+    "HARNESS_ALLOWED_ROOTS",
+    "HARNESS_FORBIDDEN_FILES",
+    "HARNESS_FORBIDDEN_ROOTS",
+    "HARNESS_SECRET_PATH_PARTS",
+    "HARNESS_SECRET_SUFFIXES",
+    "META_ALLOWED_ROOTS",
+    "META_FORBIDDEN_FILES",
+    "MAX_HARNESS_CHANGES",
+    "MAX_HARNESS_FILE_BYTES",
+    "MAX_HARNESS_TEXT_BYTES",
     "content_digest",
+    "validate_harness_code_content",
+    "validate_harness_path",
     "validate_environment_content",
     "validate_evolution_proposal",
     "validate_plugin_content",

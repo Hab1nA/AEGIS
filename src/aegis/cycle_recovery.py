@@ -174,9 +174,7 @@ class CycleRepairValidator:
         safety_passed = True
         for change in candidate.checkpoint.changes:
             lowered = tuple(part.lower() for part in change.path.split("/"))
-            if change.path.split("/")[0] != "warrior" or any(
-                item in self._FORBIDDEN for item in lowered
-            ):
+            if not self._path_authorized(change.path, lowered):
                 qualified = False
             if change.content is not None and b"PRIVATE KEY" in change.content:
                 safety_passed = False
@@ -190,6 +188,27 @@ class CycleRepairValidator:
         )
         self.results[intent.intent_id] = result
         return result
+
+    @classmethod
+    def _path_authorized(cls, path: str, lowered: tuple[str, ...]) -> bool:
+        """Repair patches stay inside the role grant: the legacy Warrior role
+        directory, or the evolvable harness roots (with the protected control
+        files closed)."""
+        if path.split("/")[0] == "warrior":
+            return not any(item in cls._FORBIDDEN for item in lowered)
+        from aegis.evolution.surfaces import (
+            HARNESS_ALLOWED_ROOTS,
+            HARNESS_FORBIDDEN_FILES,
+            HARNESS_FORBIDDEN_ROOTS,
+        )
+
+        if path in HARNESS_FORBIDDEN_FILES or any(
+            path == root or path.startswith(root) for root in HARNESS_FORBIDDEN_ROOTS
+        ):
+            return False
+        return any(
+            path == root or path.startswith(root) for root in HARNESS_ALLOWED_ROOTS
+        )
 
 
 class CycleRepairActivator:

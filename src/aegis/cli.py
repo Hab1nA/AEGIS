@@ -212,6 +212,9 @@ def _run_v2_cycle_cli(
         curriculum = CurriculumRegistry(store, config.campaign_id)
         roles = RoleRegistry(store, config.campaign_id)
         evolution = EvolutionRegistry(store, config.campaign_id)
+        from aegis.evolution.population import PopulationArchive
+
+        population = PopulationArchive(store, config.campaign_id)
         artifacts = ContentAddressedArtifactStore(root / "artifacts")
         runner = SandboxTaskPackRunner(sandbox, id_namespace=config.campaign_id)
         forge = TaskForge(dynamic)
@@ -238,6 +241,29 @@ def _run_v2_cycle_cli(
         source_commit = None
         if autonomy is not None and autonomy.public_repo_url is not None:
             source_commit = _git_head(Path(__file__).resolve().parents[2])
+        harness_repo = None
+        if (
+            autonomy is not None
+            and autonomy.harness_evolution_enabled
+            and autonomy.harness_repo_root is not None
+        ):
+            from aegis.evolution.harness import HarnessRepo
+
+            harness_repo = HarnessRepo(
+                Path(autonomy.harness_repo_root),
+                meta_evolution_enabled=autonomy.meta_evolution_enabled,
+            )
+        from aegis.mcp import McpBridge
+
+        mcp_bridge = McpBridge()
+        harness_role_paths = {"warrior": ("warrior",)}
+        if harness_repo is not None:
+            from aegis.evolution.surfaces import HARNESS_ALLOWED_ROOTS
+
+            harness_role_paths["warrior"] = (
+                "warrior",
+                *HARNESS_ALLOWED_ROOTS,
+            )
         result = run_v2_cycle(
             gateway=gateway,
             sandbox=sandbox,
@@ -268,12 +294,16 @@ def _run_v2_cycle_cli(
                 GitPublisher(
                     autonomy.public_repo_url,
                     remote_id="aegis-public",
-                    allowed_role_paths={"warrior": ("warrior",)},
+                    allowed_role_paths=harness_role_paths,
                 )
                 if autonomy is not None and autonomy.public_repo_url is not None
                 else None
             ),
             evolution=evolution,
+            population=population,
+            meta_evolution_enabled=(
+                autonomy.meta_evolution_enabled if autonomy is not None else False
+            ),
             environment_builder=environment_builder,
             default_image=None,
             evaluate_candidates_enabled=not no_candidate_eval,
@@ -283,6 +313,30 @@ def _run_v2_cycle_cli(
                 else 12
             ),
             campaign_config=config,
+            harness_repo=harness_repo,
+            harness_canary_command=(
+                autonomy.harness_canary_command
+                if autonomy is not None
+                else None
+            ),
+            harness_activation_automatic=(
+                autonomy.harness_activation_automatic
+                if autonomy is not None
+                else True
+            ),
+            mcp_bridge=mcp_bridge,
+            subagent_max_steps=(
+                autonomy.subagent_max_steps if autonomy is not None else 8
+            ),
+            subagent_timeout_seconds=(
+                autonomy.subagent_timeout_seconds if autonomy is not None else 180.0
+            ),
+            subagent_max_concurrency=(
+                autonomy.subagent_max_concurrency if autonomy is not None else 2
+            ),
+            subagent_max_result_bytes=(
+                autonomy.subagent_max_result_bytes if autonomy is not None else 65_536
+            ),
         )
         if hasattr(result, "status"):
             return {
@@ -451,7 +505,9 @@ def _run_autonomy_preflight(campaign_id: str) -> dict[str, Any]:
     _check("online_research", not config.offline_research, f"offline_research={config.offline_research}")
 
     autonomy = config.autonomy_v2
-    known_surfaces = frozenset({"workflow", "subject", "plugin", "environment"})
+    known_surfaces = frozenset(
+        {"workflow", "subject", "plugin", "environment", "harness-code"}
+    )
     if autonomy is None:
         _check("evolution_surfaces_valid", False, "autonomy_v2 is not configured")
     else:
@@ -462,6 +518,47 @@ def _run_autonomy_preflight(campaign_id: str) -> dict[str, Any]:
             "evolution_surfaces_valid",
             surfaces_ok,
             f"evolution_surfaces={list(autonomy.evolution_surfaces)}",
+        )
+        harness_enabled_surface = "harness-code" in autonomy.evolution_surfaces
+        harness_configured = (
+            harness_enabled_surface
+            and autonomy.harness_evolution_enabled
+            and autonomy.harness_repo_root is not None
+        )
+        if harness_configured:
+            from aegis.evolution.harness import HarnessRepo
+
+            try:
+                HarnessRepo(Path(autonomy.harness_repo_root))
+            except Exception as exc:
+                harness_configured = False
+                harness_detail = (
+                    f"harness repo root is not a usable Git repository: {exc}"
+                )
+            else:
+                harness_detail = "harness repository configured"
+        else:
+            harness_detail = (
+                "harness_code surface requires harness_evolution_enabled and harness_repo_root"
+                if harness_enabled_surface
+                else "harness surface is not configured"
+            )
+        _check(
+            "harness_repository_configured",
+            not harness_enabled_surface or harness_configured,
+            harness_detail,
+        )
+        meta_ok = not autonomy.meta_evolution_enabled or (
+            harness_enabled_surface and harness_configured
+        )
+        _check(
+            "meta_evolution_boundary",
+            meta_ok,
+            (
+                "meta_evolution_enabled requires harness-code surface with a configured harness repo"
+                if not meta_ok
+                else "meta evolution boundary is explicitly authorized"
+            ),
         )
         env_enabled = "environment" in autonomy.evolution_surfaces
         env_configured = (

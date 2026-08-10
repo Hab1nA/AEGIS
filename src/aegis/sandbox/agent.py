@@ -1140,8 +1140,8 @@ def _parse_command(value: object) -> tuple[list[str], str, dict[str, str], str |
     timeout = data["timeout_seconds"]
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 3600:
         raise ValueError("invalid command timeout")
-    if data["network"] != "none":
-        raise ValueError("only network=none is permitted")
+    if data["network"] not in {"none", "allowlist"}:
+        raise ValueError("network must be 'none' or 'allowlist'")
     return list(argv), cwd, env, stdin, float(timeout)
 
 

@@ -88,7 +88,7 @@ class GatewayRequest:
             or not 0 <= self.seed <= 2_147_483_647
         ):
             raise ValueError("seed must be null or an integer in [0, 2147483647]")
-        if self.reasoning_effort not in {None, "none", "low", "medium", "high"}:
+        if self.reasoning_effort not in {None, "none", "low", "medium", "high", "max"}:
             raise ValueError("unsupported reasoning_effort")
 
 
