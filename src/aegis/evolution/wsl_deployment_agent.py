@@ -11,10 +11,15 @@ from typing import Any
 
 from aegis.models import canonical_json
 
+from .source import SOURCE_MIRROR_PATH
+
 _posix_os: Any = importlib.import_module("os")
+_posix_pwd: Any = importlib.import_module("pwd")
+_posix_grp: Any = importlib.import_module("grp")
 
 CAMPAIGNS_ROOT = Path("/var/lib/aegis/campaigns")
 MAX_CAMPAIGN_VOLUME_BYTES = 8 * 1024 * 1024 * 1024
+SOURCE_MIRROR = Path(SOURCE_MIRROR_PATH)
 FIXED_AGENTS = (
     Path("/usr/local/bin/aegis-harness-agent"),
     Path("/usr/local/bin/aegis-supervisor-agent"),
@@ -46,6 +51,31 @@ def doctor() -> list[dict[str, Any]]:
         if not invalid_agents
         else "invalid fixed agents: " + ",".join(invalid_agents),
     )
+
+    mirror_ok = False
+    mirror_detail = f"missing source mirror at {SOURCE_MIRROR_PATH}"
+    try:
+        if SOURCE_MIRROR.is_dir() and not SOURCE_MIRROR.is_symlink():
+            if (SOURCE_MIRROR / "HEAD").is_file():
+                mirror_ok = True
+                mirror_detail = f"source mirror exists at {SOURCE_MIRROR_PATH}"
+                try:
+                    mirror_uid = SOURCE_MIRROR.stat().st_uid
+                    aegis_uid = _posix_pwd.getpwnam("aegis").pw_uid
+                    aegis_gid = _posix_grp.getgrnam("aegis").gr_gid
+                    owned = mirror_uid == aegis_uid
+                    group_readable = (SOURCE_MIRROR.stat().st_mode & 0o040) != 0 and aegis_gid == SOURCE_MIRROR.stat().st_gid
+                    if not (owned or group_readable):
+                        mirror_ok = False
+                        mirror_detail = (
+                            "source mirror is not readable by the aegis agent user"
+                        )
+                except KeyError:
+                    mirror_ok = False
+                    mirror_detail = "aegis agent user is not defined"
+    except OSError as exc:
+        mirror_detail = f"cannot inspect source mirror: {exc}"
+    checks["source_mirror"] = (mirror_ok, mirror_detail)
 
     mount = _campaign_mount()
     if mount is None:
@@ -105,6 +135,7 @@ def doctor() -> list[dict[str, Any]]:
 
     order = (
         "fixed_agents",
+        "source_mirror",
         "campaign_volume_ext4",
         "campaign_volume_bounded",
         "windows_mounts_disabled",

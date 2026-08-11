@@ -211,19 +211,20 @@ class WslSupervisor:
         try:
             result = subprocess.run(
                 self.transport_argv(),
-                input=wire,
+                input=wire.encode("utf-8"),
                 capture_output=True,
-                text=True,
+                text=False,
                 shell=False,
                 timeout=timeout,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise WslSupervisorError(f"WSL supervisor transport failed: {exc}") from exc
-        if len(result.stdout.encode("utf-8", errors="replace")) > _MAX_RESPONSE_BYTES:
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        if len(stdout.encode("utf-8", errors="replace")) > _MAX_RESPONSE_BYTES:
             raise WslSupervisorError("WSL supervisor response exceeded its size limit")
         try:
-            decoded = json.loads(result.stdout)
+            decoded = json.loads(stdout)
         except json.JSONDecodeError as exc:
             raise WslSupervisorError("WSL supervisor returned invalid JSON") from exc
         if not isinstance(decoded, Mapping):

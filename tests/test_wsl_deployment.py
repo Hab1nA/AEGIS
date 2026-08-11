@@ -28,6 +28,7 @@ SOURCE_REF = "a" * 40
 def _doctor_response(*, failed: str | None = None) -> dict[str, Any]:
     names = (
         "fixed_agents",
+        "source_mirror",
         "campaign_volume_ext4",
         "campaign_volume_bounded",
         "windows_mounts_disabled",

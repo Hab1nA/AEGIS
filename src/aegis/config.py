@@ -14,6 +14,7 @@ from aegis.autonomy_budget import (
     AUTONOMY_MIN_OUTPUT_TOKENS,
     AUTONOMY_ROLE_SHARES,
 )
+from aegis.evolution.source import is_local_source_mirror
 
 AUTONOMY_ACCEPTANCE_PROFILES = frozenset({"autonomous_evolution_v1", "autonomous_evolution_v2"})
 
@@ -63,6 +64,8 @@ def _optional_public_github_url(value: Any, name: str) -> str | None:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise ConfigError(f"{name} must be null or a non-empty URL")
     parsed = urlsplit(value)
+    if is_local_source_mirror(value):
+        return value
     if (
         parsed.scheme != "https"
         or parsed.hostname != "github.com"
@@ -72,7 +75,10 @@ def _optional_public_github_url(value: Any, name: str) -> str | None:
         or parsed.fragment
         or not parsed.path.strip("/")
     ):
-        raise ConfigError(f"{name} must be a credential-free https://github.com URL")
+        raise ConfigError(
+            f"{name} must be a credential-free https://github.com URL or the "
+            "exact WSL source mirror"
+        )
     return value
 
 

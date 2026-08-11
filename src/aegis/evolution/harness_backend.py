@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from aegis.models import canonical_json
 
 from .harness import validate_harness_patch_paths
+from .source import is_local_source_mirror
 
 _SAFE_DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _SAFE_OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -319,19 +320,20 @@ class WslHarnessBackend:
         try:
             result = subprocess.run(
                 self.transport_argv(),
-                input=wire,
+                input=wire.encode("utf-8"),
                 capture_output=True,
-                text=True,
+                text=False,
                 shell=False,
                 timeout=timeout,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise HarnessBackendError(f"WSL harness transport failed: {exc}") from exc
-        if len(result.stdout.encode("utf-8", errors="replace")) > _MAX_RESPONSE_BYTES:
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        if len(stdout.encode("utf-8", errors="replace")) > _MAX_RESPONSE_BYTES:
             raise HarnessBackendError("WSL harness response exceeded limit")
         try:
-            decoded = json.loads(result.stdout)
+            decoded = json.loads(stdout)
         except json.JSONDecodeError as exc:
             raise HarnessBackendError("WSL harness agent returned invalid JSON") from exc
         if result.returncode != 0 and not isinstance(decoded, Mapping):
@@ -343,6 +345,8 @@ class WslHarnessBackend:
 
 def _validate_source_url(value: str) -> None:
     _bounded_text(value, "source_url", 2048)
+    if is_local_source_mirror(value):
+        return
     parsed = urlsplit(value)
     if (
         parsed.scheme != "https"

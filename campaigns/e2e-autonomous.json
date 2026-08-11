@@ -1,0 +1,83 @@
+{
+  "campaign_id": "e2e-autonomous",
+  "acceptance_profile": "autonomous_evolution_v2",
+  "max_rounds": 24,
+  "total_tokens": 1200000,
+  "max_requests": 1200,
+  "wall_time_seconds": 14400,
+  "max_agent_steps": 20,
+  "research_enabled": true,
+  "offline_research": false,
+  "test_mode": false,
+  "demo_mode": false,
+  "sandbox_backend": "wsl",
+  "task_pack_paths": [],
+  "roles": {
+    "warrior": {
+      "model": "deepseek-v4-flash",
+      "budget_share": 0.55,
+      "max_output_tokens": 4096
+    },
+    "judge": {
+      "model": "deepseek-v4-flash",
+      "budget_share": 0.225,
+      "max_output_tokens": 4096
+    },
+    "prosecutor": {
+      "model": "deepseek-v4-flash",
+      "budget_share": 0.225,
+      "max_output_tokens": 4096
+    }
+  },
+  "autonomy_v2": {
+    "enabled": true,
+    "dynamic_only": true,
+    "task_holdout_delay_cycles": 1,
+    "council_max_messages": 24,
+    "council_max_tokens": 32768,
+    "objective_history_window": 3,
+    "objective_probation_cycles": 2,
+    "public_repo_url": "file:///var/lib/aegis/source-mirror.git",
+    "public_stable_branch": "master",
+    "candidate_branch_prefix": "candidate",
+    "builder_public_internet": true,
+    "builder_block_private_networks": true,
+    "runtime_network": "none",
+    "network_allowlist_domains": [
+      "github.com",
+      "raw.githubusercontent.com",
+      "api.github.com",
+      "pypi.org",
+      "files.pythonhosted.org",
+      "arxiv.org",
+      "huggingface.co",
+      "cdn-lfs.huggingface.co"
+    ],
+    "external_writes_via_connectors": true,
+    "role_activation_automatic": true,
+    "immutable_safety_constitution": true,
+    "evolution_surfaces": [
+      "workflow",
+      "subject",
+      "plugin",
+      "harness-code"
+    ],
+    "harness_evolution_enabled": true,
+    "harness_repo_root": null,
+    "harness_source_ref": "fadf2578674ebf742c51f584ae1fd67be45d780d",
+    "harness_canary_command": [
+      "python3",
+      "-c",
+      "import aegis.evolution.cycle_entrypoint"
+    ],
+    "harness_activation_automatic": true,
+    "meta_evolution_enabled": true,
+    "subagent_max_steps": 8,
+    "subagent_timeout_seconds": 180.0,
+    "subagent_max_concurrency": 2,
+    "subagent_max_result_bytes": 65536,
+    "environment_output_repository": null,
+    "scanner_binary": "trivy",
+    "candidate_max_extra_steps": 12
+  }
+}

@@ -134,11 +134,16 @@ def test_backend_rejects_tampered_or_cross_request_receipt() -> None:
 def test_transport_command_is_fixed_and_shell_free(monkeypatch: pytest.MonkeyPatch) -> None:
     observed: dict[str, Any] = {}
 
-    def run(argv: object, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def run(argv: object, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
         observed["argv"] = argv
         observed.update(kwargs)
-        request = json.loads(str(kwargs["input"]))
-        return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "receipt": _receipt(request)}), "")
+        request = json.loads(kwargs["input"].decode("utf-8"))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps({"ok": True, "receipt": _receipt(request)}).encode("utf-8"),
+            b"",
+        )
 
     monkeypatch.setattr(subprocess, "run", run)
     backend = WslHarnessBackend(distribution="AEGIS-Sandbox")

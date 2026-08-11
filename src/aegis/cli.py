@@ -640,11 +640,11 @@ def _run_autonomy_preflight(campaign_id: str) -> dict[str, Any]:
                 and autonomy.harness_source_ref is not None
             )
             harness_detail = (
-                "production WSL harness backend has a public pinned source"
+                "production WSL harness backend has a pinned source"
                 if harness_configured
                 else (
-                    "production harness requires WSL, no host path, a public URL, "
-                    "and a pinned source ref"
+                    "production harness requires WSL, no host path, a public URL "
+                    "or WSL source mirror, and a pinned source ref"
                 )
             )
         else:

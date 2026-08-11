@@ -65,6 +65,7 @@ class WslEvolutionDeployment:
         checks: list[DoctorCheck] = []
         expected = {
             "fixed_agents",
+            "source_mirror",
             "campaign_volume_ext4",
             "campaign_volume_bounded",
             "windows_mounts_disabled",

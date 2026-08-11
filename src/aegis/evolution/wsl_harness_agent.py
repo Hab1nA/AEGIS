@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 from aegis.models import canonical_json
 
 from .harness import validate_harness_patch_paths
+from .source import is_local_source_mirror
 
 CAMPAIGNS_ROOT = Path("/var/lib/aegis/campaigns")
 _fcntl: Any | None
@@ -140,7 +141,17 @@ class HarnessAgent:
         (campaign / "events").mkdir(mode=0o700)
         (campaign / "artifacts").mkdir(mode=0o700)
         (campaign / "operations").mkdir(mode=0o700)
-        _git(None, "clone", "--bare", "--filter=blob:none", "--", source_url, str(repo), timeout=3600)
+        _git(
+            None,
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            "--",
+            source_url,
+            str(repo),
+            timeout=3600,
+            allow_local_mirror=is_local_source_mirror(source_url),
+        )
         try:
             _git(repo, "fetch", "--no-tags", "origin", source_ref, timeout=3600)
             resolved = self._resolve(repo, "FETCH_HEAD")
@@ -433,6 +444,7 @@ def _git(
     check: bool = True,
     timeout: float = 120,
     text: bool = True,
+    allow_local_mirror: bool = False,
 ) -> subprocess.CompletedProcess[Any]:
     env = {
         "PATH": "/usr/bin:/bin",
@@ -440,7 +452,7 @@ def _git(
         "LC_ALL": "C.UTF-8",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_ALLOW_PROTOCOL": "https",
+        "GIT_ALLOW_PROTOCOL": "https:file" if allow_local_mirror else "https",
     }
     try:
         result = subprocess.run(
@@ -463,6 +475,8 @@ def _git(
 
 def _source_url(value: object) -> str:
     source = _required_value(value, "source_url", 2048)
+    if is_local_source_mirror(source):
+        return source
     parsed = urlsplit(source)
     if (
         parsed.scheme != "https"
@@ -474,7 +488,9 @@ def _source_url(value: object) -> str:
         or parsed.fragment
         or "\\" in source
     ):
-        raise AgentError("source_url must be credential-free HTTPS")
+        raise AgentError(
+            "source_url must be credential-free HTTPS or the exact WSL source mirror"
+        )
     assert parsed.hostname is not None
     _reject_private_hostname(parsed.hostname)
     return source
