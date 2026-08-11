@@ -96,17 +96,18 @@ class WslEvolutionDeployment:
                 self.transport_argv(),
                 input="",
                 capture_output=True,
-                text=True,
+                text=False,
                 shell=False,
                 timeout=timeout,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise WslEvolutionDeploymentError(f"WSL evolution doctor failed: {exc}") from exc
-        if len(result.stdout.encode("utf-8", errors="replace")) > _MAX_RESPONSE_BYTES:
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        if len(stdout.encode("utf-8", errors="replace")) > _MAX_RESPONSE_BYTES:
             raise WslEvolutionDeploymentError("evolution doctor response exceeded limit")
         try:
-            decoded = json.loads(result.stdout)
+            decoded = json.loads(stdout)
         except json.JSONDecodeError as exc:
             raise WslEvolutionDeploymentError("evolution doctor returned invalid JSON") from exc
         if not isinstance(decoded, Mapping):

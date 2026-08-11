@@ -684,8 +684,9 @@ class StdlibTransportTests(unittest.TestCase):
         with patch("aegis.gateway.transport.urllib.request.build_opener", return_value=sentinel) as build:
             transport = StdlibHTTPTransport()
         self.assertIs(transport._opener, sentinel)
-        self.assertEqual(len(build.call_args.args), 1)
+        self.assertEqual(len(build.call_args.args), 2)
         self.assertIsInstance(build.call_args.args[0], StdlibHTTPTransport._NoRedirect)
+        self.assertIsInstance(build.call_args.args[1], urllib.request.ProxyHandler)
 
     def test_redirect_is_explicit_error_and_authorization_is_never_replayed(self) -> None:
         class RedirectingOpener:

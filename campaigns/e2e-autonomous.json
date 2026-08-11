@@ -2,9 +2,9 @@
   "campaign_id": "e2e-autonomous",
   "acceptance_profile": "autonomous_evolution_v2",
   "max_rounds": 24,
-  "total_tokens": 1200000,
-  "max_requests": 1200,
-  "wall_time_seconds": 14400,
+  "total_tokens": 50000000,
+  "max_requests": 5000,
+  "wall_time_seconds": 28800,
   "max_agent_steps": 20,
   "research_enabled": true,
   "offline_research": false,
@@ -16,17 +16,17 @@
     "warrior": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.55,
-      "max_output_tokens": 4096
+      "max_output_tokens": 32768
     },
     "judge": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
-      "max_output_tokens": 4096
+      "max_output_tokens": 32768
     },
     "prosecutor": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
-      "max_output_tokens": 4096
+      "max_output_tokens": 32768
     }
   },
   "autonomy_v2": {

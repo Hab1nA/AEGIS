@@ -6,6 +6,7 @@ import http.client
 import multiprocessing
 import os
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -147,11 +148,37 @@ class StdlibHTTPTransport:
             del req, fp, code, msg, headers, newurl
             return None
 
-    def __init__(self, opener: urllib.request.OpenerDirector | None = None) -> None:
+    def __init__(
+        self,
+        opener: urllib.request.OpenerDirector | None = None,
+        *,
+        prefer_worker_thread: bool | None = None,
+    ) -> None:
         # urllib's default opener follows redirects and may replay Authorization
         # to another origin. Refusing all redirects is the only safe default for
         # an authenticated model POST.
-        self._opener = opener or urllib.request.build_opener(self._NoRedirect())
+        self._opener = opener or self._build_opener()
+        self._prefer_worker_thread = (
+            sys.platform == "win32" if prefer_worker_thread is None else prefer_worker_thread
+        )
+
+    @classmethod
+    def _build_opener(cls) -> urllib.request.OpenerDirector:
+        proxy = os.environ.get("AEGIS_OPENAI_HTTPS_PROXY", "").strip()
+        handlers: list[urllib.request.BaseHandler] = [cls._NoRedirect()]
+        if proxy:
+            parsed = urllib.parse.urlsplit(proxy)
+            if parsed.scheme in {"http", "https"} and parsed.hostname:
+                handlers.append(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                )
+            else:
+                handlers.append(urllib.request.ProxyHandler({}))
+        else:
+            # Never inherit the machine's WinINET/system proxy for model
+            # traffic: routing is explicit (AEGIS_OPENAI_HTTPS_PROXY) or direct.
+            handlers.append(urllib.request.ProxyHandler({}))
+        return urllib.request.build_opener(*handlers)
 
     def post(
         self,
@@ -165,11 +192,18 @@ class StdlibHTTPTransport:
         cancel.raise_if_cancelled()
         request = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
         deadline = time.monotonic() + timeout
-        if self._opener is not None and not isinstance(
-            self._opener, urllib.request.OpenerDirector
+        if (
+            self._prefer_worker_thread
+            or (
+                self._opener is not None
+                and not isinstance(self._opener, urllib.request.OpenerDirector)
+            )
         ):
-            # Injected test openers are not spawnable; keep the bounded
-            # worker-thread path for them.
+            # Injected test openers are not spawnable, and multiprocessing
+            # spawn on Windows imposes a slow interpreter bootstrap on every
+            # attempt.  The worker-thread path is bounded by the same hard
+            # deadline (it closes the socket when the caller gives up), so it
+            # is the preferred production path on Windows.
             return self._post_worker_thread(
                 url, headers, body, timeout, deadline, request, cancel
             )
