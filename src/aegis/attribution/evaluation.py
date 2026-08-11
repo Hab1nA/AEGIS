@@ -13,7 +13,9 @@ from .models import (
     QualificationPolicy,
 )
 
-_INTERVENTION_COORDINATES = frozenset({"plugin_ids", "runtime_variant"})
+_INTERVENTION_COORDINATES = frozenset(
+    {"plugin_ids", "runtime_variant", "mcp_binding_ids"}
+)
 
 
 def _report(
@@ -52,6 +54,7 @@ def _cohort_key(row: PairedObservation) -> tuple[object, ...]:
         baseline.model_id,
         baseline.environment_id,
         baseline.plugin_ids,
+        baseline.mcp_binding_ids,
         teammate_generations,
         baseline.generation_for(row.target_role),
         candidate.generation_for(row.target_role),
@@ -133,17 +136,37 @@ def qualify_attribution(
             AttributionDisposition.SAFETY_REJECTED,
             "safety failure is non-compensable",
         )
-    if any(not arm.usage_verified for arm in arms):
+    quality_delta = fmean(row.candidate.quality - row.baseline.quality for row in rows)
+    usage_verified = all(arm.usage_verified for arm in arms)
+    baseline_cost = sum(row.baseline.cost_units for row in rows)
+    candidate_cost = sum(row.candidate.cost_units for row in rows)
+    observed_cost_change = (
+        candidate_cost / baseline_cost - 1.0
+        if usage_verified and baseline_cost > 0
+        else 0.0
+    )
+    if quality_delta >= applied.quality_improvement:
+        return _report(
+            rows,
+            applied,
+            AttributionDisposition.QUALIFIED,
+            (
+                f"quality improvement passed over intervention {intervention}; cost is observational"
+                if intervention
+                else "quality improvement passed; cost is observational"
+            ),
+            path=QualificationPath.QUALITY_IMPROVEMENT,
+            quality_delta=quality_delta,
+            cost_change=observed_cost_change,
+        )
+    if not usage_verified:
         return _report(
             rows,
             applied,
             AttributionDisposition.UNVERIFIED_USAGE,
-            "verified usage is required for both paired arms",
+            "unverified usage prevents only the cost-efficiency claim",
+            quality_delta=quality_delta,
         )
-
-    quality_delta = fmean(row.candidate.quality - row.baseline.quality for row in rows)
-    baseline_cost = sum(row.baseline.cost_units for row in rows)
-    candidate_cost = sum(row.candidate.cost_units for row in rows)
     if baseline_cost <= 0:
         return _report(
             rows,
@@ -152,29 +175,11 @@ def qualify_attribution(
             "baseline aggregate cost must be positive",
             quality_delta=quality_delta,
         )
-    cost_change = candidate_cost / baseline_cost - 1.0
-    quality_win = (
-        quality_delta >= applied.quality_improvement
-        and cost_change <= applied.max_cost_increase
-    )
+    cost_change = observed_cost_change
     efficiency_win = (
         quality_delta >= -applied.noninferiority_margin
         and -cost_change >= applied.minimum_cost_saving
     )
-    if quality_win:
-        return _report(
-            rows,
-            applied,
-            AttributionDisposition.QUALIFIED,
-            (
-                f"quality improvement and cost cap passed over intervention {intervention}"
-                if intervention
-                else "quality improvement and cost cap passed"
-            ),
-            path=QualificationPath.QUALITY_IMPROVEMENT,
-            quality_delta=quality_delta,
-            cost_change=cost_change,
-        )
     if efficiency_win:
         return _report(
             rows,

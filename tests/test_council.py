@@ -5,20 +5,38 @@ import pytest
 from aegis.council import (
     CouncilMessage,
     CouncilMessageType,
+    CouncilOutcome,
     CouncilProposalKind,
     CouncilProtocolError,
     CouncilTranscript,
     EvidenceClaim,
+    ObjectiveAdmissionDecision,
     ObjectiveAmendment,
     ShadowObjectiveResult,
     SupportDecision,
     evaluate_objective_amendment,
 )
+from aegis.curriculum import Constitution, ObjectiveSuccessCriterion, ObjectiveVersion
 from aegis.models import Role
 
 
 def digest(char: str) -> str:
     return "sha256:" + char * 64
+
+
+def objectives() -> tuple[ObjectiveVersion, ObjectiveVersion]:
+    constitution = Constitution(version=1, safety_rules=("Bounded control plane.",))
+    weights = {"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1}
+    parent = ObjectiveVersion(
+        1, constitution.constitution_id, "Parent objective.",
+        (ObjectiveSuccessCriterion("quality", 0.5),), (), weights,
+    )
+    candidate = ObjectiveVersion(
+        2, constitution.constitution_id, "Candidate objective.",
+        (ObjectiveSuccessCriterion("quality", 0.6),), (), weights,
+        parent.objective_id,
+    )
+    return parent, candidate
 
 
 def claim(name: str = "c1") -> EvidenceClaim:
@@ -127,15 +145,15 @@ def test_unanimity_cannot_override_integrity_or_historical_regression() -> None:
                 support=SupportDecision.SUPPORT,
             )
         )
+    parent, candidate = objectives()
     amendment = ObjectiveAmendment(
-        "objective-2",
-        digest("1"),
-        digest("2"),
-        2,
-        {"quality": 2.0, "efficiency": 1.0},
+        "objective-2", parent.objective_id, candidate, 2,
         "shift effort toward demonstrated quality",
     )
-    passing = tuple(ShadowObjectiveResult(digest(char), 1.0, 1.0) for char in "345")
+    passing = tuple(
+        ShadowObjectiveResult(candidate.objective_id, f"curriculum-snapshot-sha256:{char * 64}", 1.0, 1.0)
+        for char in "345"
+    )
     assert evaluate_objective_amendment(
         amendment,
         transcript.messages,
@@ -150,7 +168,9 @@ def test_unanimity_cannot_override_integrity_or_historical_regression() -> None:
         current_cycle=1,
         integrity_objection=True,
     ).admitted
-    regressing = passing[:2] + (ShadowObjectiveResult(digest("6"), 1.0, 0.5),)
+    regressing = passing[:2] + (
+        ShadowObjectiveResult(candidate.objective_id, "curriculum-snapshot-sha256:" + "6" * 64, 1.0, 0.5),
+    )
     assert not evaluate_objective_amendment(
         amendment,
         transcript.messages,
@@ -161,15 +181,11 @@ def test_unanimity_cannot_override_integrity_or_historical_regression() -> None:
 
 
 def test_objective_weights_are_normalized_and_delayed() -> None:
+    parent, candidate = objectives()
     amendment = ObjectiveAmendment(
-        "p",
-        digest("1"),
-        digest("2"),
-        3,
-        {"quality": 2.0, "cost": 1.0},
-        "bounded target change",
+        "p", parent.objective_id, candidate, 3, "bounded target change",
     )
-    assert amendment.capability_weights == {"cost": pytest.approx(1 / 3), "quality": pytest.approx(2 / 3)}
+    assert set(amendment.capability_weights) == {"quality", "generalization", "retention", "efficiency"}
     decision = evaluate_objective_amendment(
         amendment,
         (),
@@ -179,3 +195,22 @@ def test_objective_weights_are_normalized_and_delayed() -> None:
     )
     assert not decision.admitted
     assert "next cycle" in decision.reason
+
+
+def test_council_outcome_is_strict_and_shadow_history_is_snapshot_keyed() -> None:
+    transcript = reflected_transcript()
+    proposal = message(Role.PROSECUTOR, CouncilMessageType.PROPOSAL, proposal_id="p")
+    transcript.append(proposal)
+    parent, candidate = objectives()
+    amendment = ObjectiveAmendment("p", parent.objective_id, candidate, 2, "bounded change")
+    shadows = tuple(
+        ShadowObjectiveResult(candidate.objective_id, "curriculum-snapshot-sha256:" + char * 64, 1, 1)
+        for char in "abc"
+    )
+    decision = ObjectiveAdmissionDecision(False, "insufficient independent role support", None)
+    outcome = CouncilOutcome("cycle-1", transcript.messages, amendment, shadows, False, decision)
+    assert CouncilOutcome.from_mapping(outcome.to_mapping()) == outcome
+    malformed = dict(outcome.to_mapping())
+    malformed["unknown"] = True
+    with pytest.raises(CouncilProtocolError, match="missing or unknown"):
+        CouncilOutcome.from_mapping(malformed)

@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 from aegis.sandbox.types import CommandResult, CommandSpec
 from aegis.subagents import SubagentLimits, SubagentRuntimeError, SubagentSpec
@@ -131,12 +131,14 @@ def _run_script(spec: SubagentSpec, workdir: Path) -> tuple[str, Mapping[str, An
 def _run_runtime(spec: SubagentSpec, workdir: Path) -> tuple[str, Mapping[str, Any], int, bool]:
     from aegis.agent_runtime import (
         _PERMISSIONS,
+        Research,
         RoleAgentRuntime,
         RuntimeLimits,
         ToolDispatcher,
     )
     from aegis.gateway.client import GatewayConfig, ModelGateway
-    from aegis.models import Role
+    from aegis.gateway.protocols import Role
+    from aegis.sandbox.backend import SandboxBackend
 
     if spec.model is None:
         raise SubagentRuntimeError("runtime executor requires a model in the spec")
@@ -148,8 +150,8 @@ def _run_runtime(spec: SubagentSpec, workdir: Path) -> tuple[str, Mapping[str, A
     sandbox = LocalWorkspaceSandbox(workdir)
     allowed = frozenset({"workspace.read", "workspace.write", "submit"})
     dispatcher = ToolDispatcher(
-        sandbox,
-        None,  # research is intentionally unavailable to subagents
+        cast(SandboxBackend, sandbox),
+        cast(Research, None),  # research is intentionally unavailable to subagents
         "subagent-runtime",
         limits=RuntimeLimits(max_steps=spec.limits.max_steps),
         disabled_actions=frozenset(_PERMISSIONS[Role.WARRIOR] - allowed),

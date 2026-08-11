@@ -21,6 +21,7 @@ ROLE_CANDIDATE_VALIDATED_V2 = "role_candidate_validated_v2"
 ROLE_CANDIDATE_QUALIFIED_V2 = "role_candidate_qualified_v2"
 ROLE_ACTIVE_SET_COMMITTED_V2 = "role_active_set_committed_v2"
 ROLE_ACTIVE_SET_ROLLED_BACK_V2 = "role_active_set_rolled_back_v2"
+ROLE_ACTIVE_SET_OBJECTIVE_REBOUND_V2 = "role_active_set_objective_rebound_v2"
 
 _KNOWN_EVENTS = frozenset(
     {
@@ -29,6 +30,7 @@ _KNOWN_EVENTS = frozenset(
         ROLE_CANDIDATE_QUALIFIED_V2,
         ROLE_ACTIVE_SET_COMMITTED_V2,
         ROLE_ACTIVE_SET_ROLLED_BACK_V2,
+        ROLE_ACTIVE_SET_OBJECTIVE_REBOUND_V2,
     }
 )
 
@@ -315,6 +317,41 @@ class RoleRegistry:
             },
         )
 
+    def rebind_objective(
+        self,
+        objective_id: str,
+        *,
+        evidence_id: str,
+        expected_current_active_set_id: str,
+    ) -> RoleRegistryProjection:
+        """Create a new revision with identical role versions bound to another objective."""
+        objective_id = _required_text(objective_id, "objective_id")
+        evidence_id = _required_text(evidence_id, "evidence_id")
+        expected_current_active_set_id = _required_text(
+            expected_current_active_set_id, "expected_current_active_set_id"
+        )
+        current = self._projection.current_active_set
+        if current is None or current.active_role_set_id != expected_current_active_set_id:
+            raise RoleRegistryError("expected current active set does not match")
+        if current.objective_id == objective_id:
+            raise RoleRegistryError("active role set is already bound to the objective")
+        rebound = ActiveRoleSet(
+            revision=current.revision + 1,
+            objective_id=objective_id,
+            warrior=current.warrior,
+            judge=current.judge,
+            prosecutor=current.prosecutor,
+        )
+        return self._append(
+            ROLE_ACTIVE_SET_OBJECTIVE_REBOUND_V2,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "objective_id": objective_id,
+                "evidence_id": evidence_id,
+                "expected_current_active_set_id": expected_current_active_set_id,
+                "active_set": rebound.to_mapping(),
+            },
+        )
     def _record(self, candidate_id: str) -> RoleCandidateRecord:
         try:
             return self._projection.candidates[candidate_id]
@@ -434,6 +471,8 @@ class RoleRegistry:
             return self._apply_commit(projection, payload, event_type)
         if event_type == ROLE_ACTIVE_SET_ROLLED_BACK_V2:
             return self._apply_rollback(projection, payload, event_type)
+        if event_type == ROLE_ACTIVE_SET_OBJECTIVE_REBOUND_V2:
+            return self._apply_objective_rebind(projection, payload, event_type)
         raise AssertionError("unreachable")
 
     @classmethod
@@ -656,4 +695,44 @@ class RoleRegistry:
             projection,
             candidates=candidates,
             current_active_set_id=target.active_role_set_id,
+        )
+
+    @staticmethod
+    def _apply_objective_rebind(
+        projection: RoleRegistryProjection, payload: object, event_type: str
+    ) -> RoleRegistryProjection:
+        data = _strict_payload(
+            payload,
+            {"schema_version", "objective_id", "evidence_id", "expected_current_active_set_id", "active_set"},
+            event_type,
+        )
+        objective_id = _required_text(data["objective_id"], "objective_id")
+        _required_text(data["evidence_id"], "evidence_id")
+        expected = _required_text(
+            data["expected_current_active_set_id"], "expected_current_active_set_id"
+        )
+        current = projection.current_active_set
+        if current is None or current.active_role_set_id != expected:
+            raise RoleRegistryError("rebind expected current active set does not match")
+        if current.objective_id == objective_id:
+            raise RoleRegistryError("active role set is already bound to the objective")
+        stored = ActiveRoleSet.from_mapping(data["active_set"])
+        expected_set = ActiveRoleSet(
+            revision=current.revision + 1,
+            objective_id=objective_id,
+            warrior=current.warrior,
+            judge=current.judge,
+            prosecutor=current.prosecutor,
+        )
+        if stored != expected_set:
+            raise RoleRegistryError("rebound active set changes role versions or revision")
+        active_sets = dict(projection.active_sets)
+        parents = dict(projection.active_set_parents)
+        active_sets[stored.active_role_set_id] = stored
+        parents[stored.active_role_set_id] = current.active_role_set_id
+        return replace(
+            projection,
+            active_sets=active_sets,
+            active_set_parents=parents,
+            current_active_set_id=stored.active_role_set_id,
         )

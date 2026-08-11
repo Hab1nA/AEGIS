@@ -10,19 +10,24 @@ from typing import Any, Mapping, cast
 from aegis.artifacts import ArtifactRef, ContentAddressedArtifactStore
 from aegis.config import CampaignConfig, RoleConfig
 from aegis.curriculum.models import RoleVersionIdentity
+from aegis.mcp import McpCandidate
 from aegis.models import Role, canonical_json
 from aegis.plugins.abi import PluginManifest
 
+from .control_core import DEFAULT_CONTROL_CORE_POLICY, ControlCorePolicy
 from .registry import EvolutionCandidateRecord, EvolutionRegistry
 from .surfaces import (
     EvolutionSurface,
+    validate_control_core_content,
     validate_environment_content,
+    validate_mcp_content,
     validate_plugin_content,
     validate_subject_content,
     validate_workflow_content,
 )
 
-ROLE_MANIFEST_SCHEMA_VERSION = 2
+ROLE_MANIFEST_SCHEMA_VERSION = 4
+_LEGACY_ROLE_MANIFEST_SCHEMA_VERSION = 3
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _ARTIFACT = re.compile(r"[a-z][a-z0-9-]{0,63}-sha256:[0-9a-f]{64}\Z")
 _OCI_DIGEST = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
@@ -71,6 +76,9 @@ class CompositeRoleManifest:
     plugin_artifact_ids: tuple[str, ...]
     runtime_image: str | None
     budget_policy_sha256: str
+    mcp_artifact_ids: tuple[str, ...] = ()
+    control_core_artifact_id: str | None = None
+    schema_version: int = ROLE_MANIFEST_SCHEMA_VERSION
     manifest_id: str = ""
 
     def __post_init__(self) -> None:
@@ -87,10 +95,32 @@ class CompositeRoleManifest:
             _artifact_id(item, "plugin_artifact_id", "plugin")
         if tuple(sorted(set(self.plugin_artifact_ids))) != self.plugin_artifact_ids:
             raise EvolutionRuntimeError("plugin_artifact_ids must be unique and canonically sorted")
+        if not isinstance(self.mcp_artifact_ids, tuple) or any(
+            not isinstance(item, str) for item in self.mcp_artifact_ids
+        ):
+            raise EvolutionRuntimeError("mcp_artifact_ids must be a tuple of strings")
+        for item in self.mcp_artifact_ids:
+            _artifact_id(item, "mcp_artifact_id", "mcp")
+        if tuple(sorted(set(self.mcp_artifact_ids))) != self.mcp_artifact_ids:
+            raise EvolutionRuntimeError("mcp_artifact_ids must be unique and canonically sorted")
         if self.runtime_image is not None:
             if not isinstance(self.runtime_image, str) or _OCI_DIGEST.fullmatch(self.runtime_image) is None:
                 raise EvolutionRuntimeError("runtime_image must be digest-pinned")
         _digest(self.budget_policy_sha256, "budget_policy_sha256")
+        if self.schema_version not in {
+            _LEGACY_ROLE_MANIFEST_SCHEMA_VERSION,
+            ROLE_MANIFEST_SCHEMA_VERSION,
+        }:
+            raise EvolutionRuntimeError("unsupported role manifest schema version")
+        if self.schema_version == _LEGACY_ROLE_MANIFEST_SCHEMA_VERSION:
+            if self.control_core_artifact_id is not None:
+                raise EvolutionRuntimeError("legacy role manifests cannot bind control-core")
+        elif self.control_core_artifact_id is not None:
+            _artifact_id(
+                self.control_core_artifact_id,
+                "control_core_artifact_id",
+                "control-core",
+            )
         payload = self._payload()
         digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
         expected = f"role-manifest-sha256:{digest}"
@@ -99,8 +129,8 @@ class CompositeRoleManifest:
         object.__setattr__(self, "manifest_id", expected)
 
     def _payload(self) -> dict[str, Any]:
-        return {
-            "schema_version": ROLE_MANIFEST_SCHEMA_VERSION,
+        payload: dict[str, Any] = {
+            "schema_version": self.schema_version,
             "role": self.role.value,
             "model_profile_sha256": self.model_profile_sha256,
             "workflow_artifact_id": self.workflow_artifact_id,
@@ -108,16 +138,21 @@ class CompositeRoleManifest:
             "plugin_artifact_ids": list(self.plugin_artifact_ids),
             "runtime_image": self.runtime_image,
             "budget_policy_sha256": self.budget_policy_sha256,
+            "mcp_artifact_ids": list(self.mcp_artifact_ids),
         }
+        if self.schema_version >= ROLE_MANIFEST_SCHEMA_VERSION:
+            payload["control_core_artifact_id"] = self.control_core_artifact_id
+        return payload
 
     def to_mapping(self) -> dict[str, Any]:
         return {"manifest_id": self.manifest_id, **self._payload()}
 
     @classmethod
     def from_mapping(cls, value: object) -> "CompositeRoleManifest":
-        data = _strict_mapping(
-            value,
-            {
+        if not isinstance(value, Mapping):
+            raise EvolutionRuntimeError("role manifest must be a string-keyed mapping")
+        schema_version = value.get("schema_version")
+        fields = {
                 "manifest_id",
                 "schema_version",
                 "role",
@@ -127,11 +162,13 @@ class CompositeRoleManifest:
                 "plugin_artifact_ids",
                 "runtime_image",
                 "budget_policy_sha256",
-            },
-            "role manifest",
-        )
-        if data["schema_version"] != ROLE_MANIFEST_SCHEMA_VERSION:
+                "mcp_artifact_ids",
+            }
+        if schema_version == ROLE_MANIFEST_SCHEMA_VERSION:
+            fields.add("control_core_artifact_id")
+        elif schema_version != _LEGACY_ROLE_MANIFEST_SCHEMA_VERSION:
             raise EvolutionRuntimeError("unsupported role manifest schema version")
+        data = _strict_mapping(value, fields, "role manifest")
         try:
             role = Role(data["role"])
         except (TypeError, ValueError) as exc:
@@ -139,6 +176,9 @@ class CompositeRoleManifest:
         plugins = data["plugin_artifact_ids"]
         if not isinstance(plugins, list) or not all(isinstance(item, str) for item in plugins):
             raise EvolutionRuntimeError("plugin_artifact_ids must be an array of strings")
+        mcps = data["mcp_artifact_ids"]
+        if not isinstance(mcps, list) or not all(isinstance(item, str) for item in mcps):
+            raise EvolutionRuntimeError("mcp_artifact_ids must be an array of strings")
         return cls(
             role=role,
             model_profile_sha256=cast(str, data["model_profile_sha256"]),
@@ -147,6 +187,11 @@ class CompositeRoleManifest:
             plugin_artifact_ids=tuple(plugins),
             runtime_image=data["runtime_image"],
             budget_policy_sha256=cast(str, data["budget_policy_sha256"]),
+            mcp_artifact_ids=tuple(mcps),
+            control_core_artifact_id=cast(
+                str | None, data.get("control_core_artifact_id")
+            ),
+            schema_version=cast(int, schema_version),
             manifest_id=cast(str, data["manifest_id"]),
         )
 
@@ -158,6 +203,8 @@ class RuntimeBinding:
     plugins: tuple[PluginManifest, ...]
     runtime_image: str | None
     manifest: CompositeRoleManifest | None
+    mcps: tuple[McpCandidate, ...] = ()
+    control_core: ControlCorePolicy = DEFAULT_CONTROL_CORE_POLICY
 
     def runtime_variant(self) -> str:
         image = self.runtime_image or "default-image"
@@ -246,6 +293,8 @@ def build_composite_manifest(
     plugin_artifact_ids: tuple[str, ...],
     runtime_image: str | None,
     budget_policy_sha256: str,
+    mcp_artifact_ids: tuple[str, ...] = (),
+    control_core_artifact_id: str | None = None,
 ) -> CompositeRoleManifest:
     return CompositeRoleManifest(
         role=role,
@@ -255,6 +304,8 @@ def build_composite_manifest(
         plugin_artifact_ids=plugin_artifact_ids,
         runtime_image=runtime_image,
         budget_policy_sha256=budget_policy_sha256,
+        mcp_artifact_ids=mcp_artifact_ids,
+        control_core_artifact_id=control_core_artifact_id,
     )
 
 
@@ -300,6 +351,34 @@ def _load_plugin_manifest(
     except Exception as exc:
         raise EvolutionRuntimeError(f"active plugin artifact failed validation: {exc}") from exc
     return manifest
+
+
+def _load_mcp_candidate(
+    artifacts: ContentAddressedArtifactStore, artifact_id: str
+) -> McpCandidate:
+    payload = _load_json_artifact(artifacts, "mcp", artifact_id)
+    try:
+        return validate_mcp_content(payload)
+    except Exception as exc:
+        raise EvolutionRuntimeError(
+            f"active MCP artifact failed validation: {exc}"
+        ) from exc
+
+
+def _load_control_core_policy(
+    artifacts: ContentAddressedArtifactStore, artifact_id: str
+) -> ControlCorePolicy:
+    payload = _load_json_artifact(artifacts, "control-core", artifact_id)
+    try:
+        validated = validate_control_core_content(payload)
+        policy = ControlCorePolicy.from_mapping(validated)
+    except Exception as exc:
+        raise EvolutionRuntimeError(
+            f"active control-core artifact failed validation: {exc}"
+        ) from exc
+    if policy.policy_id != artifact_id:
+        raise EvolutionRuntimeError("active control-core policy identity mismatch")
+    return policy
 
 
 def _load_environment_image(
@@ -384,8 +463,29 @@ def resolve_role_binding(
             _load_plugin_manifest(artifacts, item, role)
             for item in manifest.plugin_artifact_ids
         )
+        mcps = tuple(
+            _load_mcp_candidate(artifacts, item)
+            for item in manifest.mcp_artifact_ids
+        )
         runtime_image = manifest.runtime_image
-        return RuntimeBinding(workflow, subject, plugins, runtime_image, manifest)
+        control_core_artifact_id = manifest.control_core_artifact_id
+        if evolution is not None:
+            control_core_champion = evolution.champion(
+                EvolutionSurface.CONTROL_CORE, role
+            )
+            control_core_artifact_id = (
+                control_core_champion.artifact_id
+                if control_core_champion is not None
+                else None
+            )
+        control_core = (
+            _load_control_core_policy(artifacts, control_core_artifact_id)
+            if control_core_artifact_id is not None
+            else DEFAULT_CONTROL_CORE_POLICY
+        )
+        return RuntimeBinding(
+            workflow, subject, plugins, runtime_image, manifest, mcps, control_core
+        )
 
     workflow = validate_workflow_content(
         _load_json_artifact(artifacts, "workflow", default_workflow_ref.artifact_id)
@@ -401,8 +501,17 @@ def resolve_role_binding(
         plugin_artifact_ids=(),
         runtime_image=default_image,
         budget_policy_sha256=budget_policy_sha256,
+        control_core_artifact_id=None,
     )
-    return RuntimeBinding(workflow, subject, (), default_image, default_manifest)
+    return RuntimeBinding(
+        workflow,
+        subject,
+        (),
+        default_image,
+        default_manifest,
+        (),
+        DEFAULT_CONTROL_CORE_POLICY,
+    )
 
 
 def champion_binding_for_role(
@@ -421,7 +530,10 @@ def champion_binding_for_role(
     workflow_ref = default_workflow_ref
     subject_ref = default_subject_ref
     plugin_artifact_ids: list[str] = []
+    mcp_artifact_ids: list[str] = []
     runtime_image = default_image
+    control_core_artifact_id: str | None = None
+    control_core = DEFAULT_CONTROL_CORE_POLICY
     workflow_champion = evolution.champion(EvolutionSurface.WORKFLOW, role)
     if workflow_champion is not None:
         workflow_ref = ArtifactRef("workflow", workflow_champion.artifact_id, 0)
@@ -431,6 +543,9 @@ def champion_binding_for_role(
     plugin_champion = evolution.champion(EvolutionSurface.PLUGIN, role)
     if plugin_champion is not None:
         plugin_artifact_ids.append(plugin_champion.artifact_id)
+    mcp_champion = evolution.champion(EvolutionSurface.MCP, role)
+    if mcp_champion is not None:
+        mcp_artifact_ids.append(mcp_champion.artifact_id)
     env_champion = evolution.champion(EvolutionSurface.ENVIRONMENT, role)
     if env_champion is not None:
         image = _load_environment_image(
@@ -438,6 +553,12 @@ def champion_binding_for_role(
         )
         if image is not None:
             runtime_image = image
+    control_core_champion = evolution.champion(EvolutionSurface.CONTROL_CORE, role)
+    if control_core_champion is not None:
+        control_core_artifact_id = control_core_champion.artifact_id
+        control_core = _load_control_core_policy(
+            artifacts, control_core_champion.artifact_id
+        )
     workflow = validate_workflow_content(
         _load_json_artifact(artifacts, "workflow", workflow_ref.artifact_id)
     )
@@ -448,6 +569,10 @@ def champion_binding_for_role(
         _load_plugin_manifest(artifacts, item, role)
         for item in plugin_artifact_ids
     )
+    mcps = tuple(
+        _load_mcp_candidate(artifacts, item)
+        for item in mcp_artifact_ids
+    )
     manifest = build_composite_manifest(
         role=role,
         model_profile_sha256=model_profile_hash(role_config),
@@ -456,8 +581,12 @@ def champion_binding_for_role(
         plugin_artifact_ids=tuple(sorted(set(plugin_artifact_ids))),
         runtime_image=runtime_image,
         budget_policy_sha256=budget_policy_sha256,
+        mcp_artifact_ids=tuple(sorted(set(mcp_artifact_ids))),
+        control_core_artifact_id=control_core_artifact_id,
     )
-    return RuntimeBinding(workflow, subject, plugins, runtime_image, manifest)
+    return RuntimeBinding(
+        workflow, subject, plugins, runtime_image, manifest, mcps, control_core
+    )
 
 
 def candidate_binding(
@@ -472,6 +601,8 @@ def candidate_binding(
     subject = champion.subject
     plugins = champion.plugins
     runtime_image = champion.runtime_image
+    mcps = champion.mcps
+    control_core = champion.control_core
     if candidate.surface is EvolutionSurface.WORKFLOW:
         workflow = validate_workflow_content(
             _load_json_artifact(artifacts, "workflow", candidate.artifact_id)
@@ -494,10 +625,24 @@ def candidate_binding(
         )
         if image is not None:
             runtime_image = image
+    elif candidate.surface is EvolutionSurface.MCP:
+        mcp_candidate = _load_mcp_candidate(artifacts, candidate.artifact_id)
+        mcps = tuple(
+            item
+            for item in mcps
+            if item.binding.server_name != mcp_candidate.binding.server_name
+        ) + (mcp_candidate,)
+        mcps = tuple(sorted(mcps, key=lambda item: item.binding.binding_id))
+    elif candidate.surface is EvolutionSurface.CONTROL_CORE:
+        control_core = _load_control_core_policy(
+            artifacts, candidate.artifact_id
+        )
     else:
         raise AssertionError("unreachable")
     manifest = champion.manifest
-    return RuntimeBinding(workflow, subject, plugins, runtime_image, manifest)
+    return RuntimeBinding(
+        workflow, subject, plugins, runtime_image, manifest, mcps, control_core
+    )
 
 
 def candidate_manifest(
@@ -511,6 +656,19 @@ def candidate_manifest(
     base = champion.manifest
     plugin_ids = tuple(item.artifact_id for item in champion.plugins)
     runtime_image = champion.runtime_image
+    mcp_ids = tuple(
+        sorted(
+            {
+                item
+                for item in (
+                    champion.manifest.mcp_artifact_ids
+                    if champion.manifest is not None
+                    else ()
+                )
+            }
+        )
+    )
+    control_core_artifact_id = base.control_core_artifact_id
     if candidate.surface is EvolutionSurface.PLUGIN:
         plugin_ids = tuple(sorted(set(plugin_ids) | {candidate.artifact_id}))
     elif candidate.surface is EvolutionSurface.ENVIRONMENT:
@@ -519,6 +677,12 @@ def candidate_manifest(
         )
         if image is not None:
             runtime_image = image
+    elif candidate.surface is EvolutionSurface.MCP:
+        mcp_ids = tuple(sorted(set(mcp_ids) | {candidate.artifact_id}))
+    elif candidate.surface is EvolutionSurface.CONTROL_CORE:
+        # Reloading validates both the narrow grant and exact content address.
+        _load_control_core_policy(artifacts, candidate.artifact_id)
+        control_core_artifact_id = candidate.artifact_id
     return CompositeRoleManifest(
         role=base.role,
         model_profile_sha256=base.model_profile_sha256,
@@ -535,6 +699,8 @@ def candidate_manifest(
         plugin_artifact_ids=plugin_ids,
         runtime_image=runtime_image,
         budget_policy_sha256=base.budget_policy_sha256,
+        mcp_artifact_ids=mcp_ids,
+        control_core_artifact_id=control_core_artifact_id,
     )
 
 

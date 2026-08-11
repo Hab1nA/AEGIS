@@ -2,9 +2,11 @@
 
 from .models import (
     MANDATORY_PROTECTED_CONTROLS,
+    OBJECTIVE_CAPABILITIES,
     ActiveRoleSet,
     Constitution,
     CurriculumSnapshot,
+    ObjectiveSuccessCriterion,
     ObjectiveVersion,
     RoleVersionIdentity,
 )
@@ -21,12 +23,14 @@ from .registry import (
     CURRICULUM_SNAPSHOT_RECORDED_V2,
     CYCLE_STATE_CHANGED_V2,
     OBJECTIVE_ACTIVATED_V2,
+    OBJECTIVE_PROBATION_OBSERVED_V2,
     OBJECTIVE_PROBATION_STARTED_V2,
     OBJECTIVE_PROVISIONAL_V2,
     OBJECTIVE_ROLLED_BACK_V2,
     CurriculumRegistry,
     CurriculumRegistryError,
     CycleProjection,
+    ObjectiveProbationObservation,
     ObjectiveStatus,
 )
 from .state_machine import (
@@ -39,6 +43,7 @@ from .state_machine import (
 
 __all__ = [
     "MANDATORY_PROTECTED_CONTROLS",
+    "OBJECTIVE_CAPABILITIES",
     "ActiveRoleSet",
     "Constitution",
     "CapabilityGap",
@@ -56,10 +61,13 @@ __all__ = [
     "CycleState",
     "CycleStateMachine",
     "InvalidCycleTransitionError",
+    "ObjectiveSuccessCriterion",
     "ObjectiveVersion",
+    "ObjectiveProbationObservation",
     "ObjectiveStatus",
     "OBJECTIVE_ACTIVATED_V2",
     "OBJECTIVE_PROBATION_STARTED_V2",
+    "OBJECTIVE_PROBATION_OBSERVED_V2",
     "OBJECTIVE_PROVISIONAL_V2",
     "OBJECTIVE_ROLLED_BACK_V2",
     "RoleVersionIdentity",

@@ -12,9 +12,9 @@ import hashlib
 import math
 from dataclasses import dataclass
 from enum import StrEnum
-from types import MappingProxyType
-from typing import Mapping
+from typing import Any, Mapping
 
+from aegis.curriculum.models import ObjectiveVersion
 from aegis.models import Role, canonical_json
 
 
@@ -64,6 +64,21 @@ def _digest(value: object, name: str) -> str:
     return text.lower()
 
 
+def _prefixed_digest(value: object, name: str, prefix: str) -> str:
+    text = _text(value, name, max_length=128)
+    if not text.startswith(prefix) or len(text) != len(prefix) + 64:
+        raise CouncilProtocolError(f"{name} must be a {prefix} identity")
+    try:
+        int(text.removeprefix(prefix), 16)
+    except ValueError as exc:
+        raise CouncilProtocolError(f"{name} must be a {prefix} identity") from exc
+    return text.lower()
+
+
+def _objective_id(value: object, name: str) -> str:
+    return _prefixed_digest(value, name, ObjectiveVersion.ID_PREFIX)
+
+
 def _content_digest(payload: Mapping[str, object]) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
@@ -101,6 +116,16 @@ class EvidenceClaim:
             "falsifier": self.falsifier,
             "confidence": self.confidence,
         }
+
+    @classmethod
+    def from_dict(cls, value: object) -> EvidenceClaim:
+        data = _strict_mapping(
+            value, {"claim_id", "statement", "evidence_refs", "falsifier", "confidence"}, "claim"
+        )
+        refs = data["evidence_refs"]
+        if not isinstance(refs, (list, tuple)):
+            raise CouncilProtocolError("evidence_refs must be an array")
+        return cls(data["claim_id"], data["statement"], tuple(refs), data["falsifier"], data["confidence"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,52 +206,116 @@ class CouncilMessage:
             "token_usage": self.token_usage,
         }
 
+    def to_mapping(self) -> dict[str, object]:
+        return {**self._identity_payload(), "message_id": self.message_id}
+
+    @classmethod
+    def from_mapping(cls, value: object) -> CouncilMessage:
+        data = _strict_mapping(
+            value,
+            {
+                "cycle_id", "sender", "message_type", "claims", "summary", "proposal_id",
+                "parent_message_id", "proposal_kind", "support", "token_usage", "message_id",
+            },
+            "council message",
+        )
+        claims = data["claims"]
+        if not isinstance(claims, (list, tuple)):
+            raise CouncilProtocolError("claims must be an array")
+        try:
+            return cls(
+                cycle_id=data["cycle_id"], sender=Role(data["sender"]),
+                message_type=CouncilMessageType(data["message_type"]),
+                claims=tuple(EvidenceClaim.from_dict(item) for item in claims),
+                summary=data["summary"], proposal_id=data["proposal_id"],
+                parent_message_id=data["parent_message_id"],
+                proposal_kind=(
+                    None
+                    if data["proposal_kind"] is None
+                    else CouncilProposalKind(data["proposal_kind"])
+                ),
+                support=(None if data["support"] is None else SupportDecision(data["support"])),
+                token_usage=data["token_usage"], message_id=data["message_id"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise CouncilProtocolError("council message has invalid enum fields") from exc
+
+
+def _strict_mapping(value: object, expected: set[str], name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise CouncilProtocolError(f"{name} must be a string-keyed mapping")
+    if set(value) != expected:
+        raise CouncilProtocolError(f"{name} has missing or unknown fields")
+    return value
+
 
 @dataclass(frozen=True, slots=True)
 class ObjectiveAmendment:
     proposal_id: str
     parent_objective_id: str
-    proposed_objective_id: str
+    candidate_objective: ObjectiveVersion
     effective_cycle: int
-    capability_weights: Mapping[str, float]
     rationale: str
 
     def __post_init__(self) -> None:
         _text(self.proposal_id, "proposal_id", max_length=128)
-        _digest(self.parent_objective_id, "parent_objective_id")
-        _digest(self.proposed_objective_id, "proposed_objective_id")
+        _objective_id(self.parent_objective_id, "parent_objective_id")
+        if not isinstance(self.candidate_objective, ObjectiveVersion):
+            raise CouncilProtocolError("candidate_objective must be an ObjectiveVersion")
+        if self.candidate_objective.parent_objective_id != self.parent_objective_id:
+            raise CouncilProtocolError("candidate objective must directly reference parent_objective_id")
         if isinstance(self.effective_cycle, bool) or not isinstance(self.effective_cycle, int):
             raise CouncilProtocolError("effective_cycle must be an integer")
         if self.effective_cycle <= 0:
             raise CouncilProtocolError("effective_cycle must be positive")
-        if not isinstance(self.capability_weights, Mapping) or not self.capability_weights:
-            raise CouncilProtocolError("capability_weights must be a non-empty mapping")
-        normalized: dict[str, float] = {}
-        for name, raw_weight in self.capability_weights.items():
-            _text(name, "capability name", max_length=128)
-            if isinstance(raw_weight, bool) or not isinstance(raw_weight, (int, float)):
-                raise CouncilProtocolError("capability weights must be numeric")
-            weight = float(raw_weight)
-            if not math.isfinite(weight) or weight < 0:
-                raise CouncilProtocolError("capability weights must be finite and non-negative")
-            normalized[name] = weight
-        if not any(weight > 0 for weight in normalized.values()):
-            raise CouncilProtocolError("at least one capability weight must be positive")
-        total = sum(normalized.values())
-        normalized = {name: weight / total for name, weight in sorted(normalized.items())}
-        object.__setattr__(self, "capability_weights", MappingProxyType(normalized))
         _text(self.rationale, "rationale")
+
+    @property
+    def proposed_objective_id(self) -> str:
+        return self.candidate_objective.objective_id
+
+    @property
+    def capability_weights(self) -> Mapping[str, float]:
+        return self.candidate_objective.capability_weights
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "proposal_id": self.proposal_id,
+            "parent_objective_id": self.parent_objective_id,
+            "candidate_objective": self.candidate_objective.to_mapping(),
+            "effective_cycle": self.effective_cycle,
+            "rationale": self.rationale,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> ObjectiveAmendment:
+        data = _strict_mapping(
+            value,
+            {"proposal_id", "parent_objective_id", "candidate_objective", "effective_cycle", "rationale"},
+            "objective amendment",
+        )
+        return cls(
+            data["proposal_id"], data["parent_objective_id"],
+            ObjectiveVersion.from_mapping(data["candidate_objective"]),
+            data["effective_cycle"], data["rationale"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class ShadowObjectiveResult:
-    objective_id: str
+    candidate_objective_id: str
+    historical_snapshot_id: str
     baseline_utility: float
     candidate_utility: float
     non_inferiority_margin: float = 0.0
 
     def __post_init__(self) -> None:
-        _digest(self.objective_id, "objective_id")
+        _objective_id(self.candidate_objective_id, "candidate_objective_id")
+        _prefixed_digest(
+            self.historical_snapshot_id,
+            "historical_snapshot_id",
+            "curriculum-snapshot-sha256:",
+        )
         for name in ("baseline_utility", "candidate_utility", "non_inferiority_margin"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -242,12 +331,162 @@ class ShadowObjectiveResult:
     def passes(self) -> bool:
         return self.candidate_utility >= self.baseline_utility - self.non_inferiority_margin
 
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "candidate_objective_id": self.candidate_objective_id,
+            "historical_snapshot_id": self.historical_snapshot_id,
+            "baseline_utility": self.baseline_utility,
+            "candidate_utility": self.candidate_utility,
+            "non_inferiority_margin": self.non_inferiority_margin,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> ShadowObjectiveResult:
+        data = _strict_mapping(
+            value,
+            {
+                "candidate_objective_id",
+                "historical_snapshot_id",
+                "baseline_utility",
+                "candidate_utility",
+                "non_inferiority_margin",
+            },
+            "shadow objective result",
+        )
+        return cls(**data)
+
 
 @dataclass(frozen=True, slots=True)
 class ObjectiveAdmissionDecision:
     admitted: bool
     reason: str
     provisional_until_cycle: int | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.admitted, bool):
+            raise CouncilProtocolError("admitted must be a boolean")
+        _text(self.reason, "reason")
+        if self.provisional_until_cycle is not None and (
+            isinstance(self.provisional_until_cycle, bool)
+            or not isinstance(self.provisional_until_cycle, int)
+            or self.provisional_until_cycle <= 0
+        ):
+            raise CouncilProtocolError("provisional_until_cycle must be a positive integer")
+        if self.admitted != (self.provisional_until_cycle is not None):
+            raise CouncilProtocolError("only admitted objectives may have a provisional deadline")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "admitted": self.admitted,
+            "reason": self.reason,
+            "provisional_until_cycle": self.provisional_until_cycle,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> ObjectiveAdmissionDecision:
+        data = _strict_mapping(
+            value, {"admitted", "reason", "provisional_until_cycle"}, "objective admission decision"
+        )
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True)
+class CouncilOutcome:
+    """Strict, durable result of one complete objective-governance session."""
+
+    cycle_id: str
+    messages: tuple[CouncilMessage, ...]
+    amendment: ObjectiveAmendment | None
+    shadow_results: tuple[ShadowObjectiveResult, ...]
+    integrity_objection: bool
+    decision: ObjectiveAdmissionDecision | None
+
+    def __post_init__(self) -> None:
+        _text(self.cycle_id, "cycle_id", max_length=128)
+        if not isinstance(self.messages, tuple) or any(
+            not isinstance(item, CouncilMessage) for item in self.messages
+        ):
+            raise CouncilProtocolError("messages must be a tuple of CouncilMessage values")
+        if any(item.cycle_id != self.cycle_id for item in self.messages):
+            raise CouncilProtocolError("council outcome contains a message from another cycle")
+        transcript = CouncilTranscript(self.cycle_id)
+        for message in self.messages:
+            transcript.append(message)
+        if self.amendment is not None and not isinstance(self.amendment, ObjectiveAmendment):
+            raise CouncilProtocolError("amendment must be an ObjectiveAmendment")
+        if not isinstance(self.shadow_results, tuple) or any(
+            not isinstance(item, ShadowObjectiveResult) for item in self.shadow_results
+        ):
+            raise CouncilProtocolError("shadow_results must be a tuple of ShadowObjectiveResult values")
+        if not isinstance(self.integrity_objection, bool):
+            raise CouncilProtocolError("integrity_objection must be a boolean")
+        if self.decision is not None and not isinstance(self.decision, ObjectiveAdmissionDecision):
+            raise CouncilProtocolError("decision must be an ObjectiveAdmissionDecision")
+        if self.amendment is None:
+            if self.shadow_results or self.decision is not None:
+                raise CouncilProtocolError(
+                    "an outcome without an amendment cannot have shadow results or a decision"
+                )
+        else:
+            if self.decision is None:
+                raise CouncilProtocolError("an amendment outcome requires an admission decision")
+            if any(
+                item.candidate_objective_id != self.amendment.proposed_objective_id
+                for item in self.shadow_results
+            ):
+                raise CouncilProtocolError("shadow result is bound to another candidate objective")
+            proposals = {
+                item.proposal_id
+                for item in self.messages
+                if item.message_type is CouncilMessageType.PROPOSAL
+            }
+            if self.amendment.proposal_id not in proposals:
+                raise CouncilProtocolError("amendment does not reference a transcript proposal")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "cycle_id": self.cycle_id,
+            "messages": [item.to_mapping() for item in self.messages],
+            "amendment": None if self.amendment is None else self.amendment.to_mapping(),
+            "shadow_results": [item.to_mapping() for item in self.shadow_results],
+            "integrity_objection": self.integrity_objection,
+            "decision": None if self.decision is None else self.decision.to_mapping(),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> CouncilOutcome:
+        data = _strict_mapping(
+            value,
+            {
+                "cycle_id",
+                "messages",
+                "amendment",
+                "shadow_results",
+                "integrity_objection",
+                "decision",
+            },
+            "council outcome",
+        )
+        messages = data["messages"]
+        shadows = data["shadow_results"]
+        if not isinstance(messages, (list, tuple)) or not isinstance(shadows, (list, tuple)):
+            raise CouncilProtocolError("messages and shadow_results must be arrays")
+        return cls(
+            cycle_id=data["cycle_id"],
+            messages=tuple(CouncilMessage.from_mapping(item) for item in messages),
+            amendment=(
+                None
+                if data["amendment"] is None
+                else ObjectiveAmendment.from_mapping(data["amendment"])
+            ),
+            shadow_results=tuple(ShadowObjectiveResult.from_mapping(item) for item in shadows),
+            integrity_objection=data["integrity_objection"],
+            decision=(
+                None
+                if data["decision"] is None
+                else ObjectiveAdmissionDecision.from_mapping(data["decision"])
+            ),
+        )
 
 
 def evaluate_objective_amendment(
@@ -257,7 +496,7 @@ def evaluate_objective_amendment(
     *,
     current_cycle: int,
     integrity_objection: bool,
-    required_support: int = 2,
+    required_support: int = 0,
     required_history: int = 3,
     probation_cycles: int = 2,
 ) -> ObjectiveAdmissionDecision:
@@ -274,18 +513,28 @@ def evaluate_objective_amendment(
     )
     if len({message.sender for message in relevant}) != len(relevant):
         return ObjectiveAdmissionDecision(False, "a role submitted multiple support decisions", None)
-    supports = sum(message.support is SupportDecision.SUPPORT for message in relevant)
-    if supports < required_support:
-        return ObjectiveAdmissionDecision(False, "insufficient independent role support", None)
+    del required_support
+    prosecutor_votes = tuple(
+        message for message in relevant if message.sender is Role.PROSECUTOR
+    )
+    if len(prosecutor_votes) != 1 or prosecutor_votes[0].support is not SupportDecision.SUPPORT:
+        return ObjectiveAdmissionDecision(
+            False, "Prosecutor did not issue the final approval", None
+        )
     if len(shadow_results) < required_history:
         return ObjectiveAdmissionDecision(False, "insufficient historical objective shadow coverage", None)
-    if len({result.objective_id for result in shadow_results}) != len(shadow_results):
+    if any(
+        result.candidate_objective_id != amendment.proposed_objective_id
+        for result in shadow_results
+    ):
+        return ObjectiveAdmissionDecision(False, "historical shadow result targets another objective", None)
+    if len({result.historical_snapshot_id for result in shadow_results}) != len(shadow_results):
         return ObjectiveAdmissionDecision(False, "duplicate historical objective shadow result", None)
     if not all(result.passes for result in shadow_results):
         return ObjectiveAdmissionDecision(False, "candidate regresses under a historical objective", None)
     return ObjectiveAdmissionDecision(
         True,
-        "admitted provisionally after bounded council and historical shadow checks",
+        "admitted by Prosecutor after bounded council critique and historical shadow checks",
         amendment.effective_cycle + probation_cycles,
     )
 

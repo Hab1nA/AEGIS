@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from aegis.curriculum import Constitution, ObjectiveVersion, RoleVersionIdentity
+from aegis.curriculum import Constitution, ObjectiveSuccessCriterion, ObjectiveVersion, RoleVersionIdentity
 from aegis.event_store import EventStore, EventStoreSequenceConflict
 from aegis.models import Role
 from aegis.roles import (
@@ -33,8 +33,9 @@ class RoleRegistryV2Tests(unittest.TestCase):
             version=1,
             constitution_id=self.constitution.constitution_id,
             statement="Improve reliable software-engineering performance.",
-            success_criteria=("Pass independent and joint evaluation gates.",),
+            success_criteria=(ObjectiveSuccessCriterion("quality", 0.5),),
             capability_tags=("debugging", "testing"),
+            capability_weights={"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1},
         )
 
     def tearDown(self) -> None:
@@ -260,8 +261,9 @@ class RoleRegistryV2Tests(unittest.TestCase):
             version=1,
             constitution_id=self.constitution.constitution_id,
             statement="A distinct target.",
-            success_criteria=("Remain distinct.",),
+            success_criteria=(ObjectiveSuccessCriterion("quality", 0.5),),
             capability_tags=(),
+            capability_weights={"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1},
         )
         with self.assertRaisesRegex(RoleRegistryError, "different objective"):
             registry.commit_active_set(
@@ -288,8 +290,9 @@ class RoleRegistryV2Tests(unittest.TestCase):
             parent_objective_id=self.objective.objective_id,
             constitution_id=self.constitution.constitution_id,
             statement="A successor objective requiring fresh joint qualification.",
-            success_criteria=("Qualify the complete role vector.",),
+            success_criteria=(ObjectiveSuccessCriterion("quality", 0.5),),
             capability_tags=("debugging", "testing"),
+            capability_weights={"quality": 2, "generalization": 1, "retention": 1, "efficiency": 1},
         )
         warrior = self.identity(
             Role.WARRIOR,
@@ -318,13 +321,45 @@ class RoleRegistryV2Tests(unittest.TestCase):
                 expected_current_active_set_id=baseline_id,
             )
 
+    def test_objective_rebind_preserves_role_versions_and_creates_revision(self) -> None:
+        registry = RoleRegistry(self.store, self.campaign_id)
+        genesis = self.genesis(registry)
+        baseline_id = registry.projection.current_active_set_id
+        assert baseline_id is not None
+        next_objective = ObjectiveVersion(
+            version=2,
+            parent_objective_id=self.objective.objective_id,
+            constitution_id=self.constitution.constitution_id,
+            statement="A probation objective using the existing role vector.",
+            success_criteria=(ObjectiveSuccessCriterion("quality", 0.5),),
+            capability_tags=(),
+            capability_weights={"quality": 2, "generalization": 1, "retention": 1, "efficiency": 1},
+        )
+        registry.rebind_objective(
+            next_objective.objective_id,
+            evidence_id="objective-rebind:test",
+            expected_current_active_set_id=baseline_id,
+        )
+        recovered = RoleRegistry(self.store, self.campaign_id).projection
+        active = recovered.current_active_set
+        assert active is not None
+        self.assertEqual(active.revision, 1)
+        self.assertEqual(active.objective_id, next_objective.objective_id)
+        for role in Role:
+            self.assertEqual(active.for_role(role), genesis[role])
+            self.assertIs(
+                recovered.candidates[genesis[role].role_version_id].state,
+                RoleCandidateState.ACTIVE,
+            )
+        self.assertEqual(recovered.active_set_parents[active.active_role_set_id], baseline_id)
+
     def test_cold_start_rejects_tampered_known_event(self) -> None:
         identity = self.identity(Role.WARRIOR, label="tampered")
         self.store.append(
             role_registry_stream_id(self.campaign_id),
             "role_candidate_collected_v2",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "identity": identity.to_mapping(),
                 "objective_id": self.objective.objective_id,
                 "state": "active",

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,10 +41,10 @@ from aegis.evolution.population import (
 )
 from aegis.evolution.registry import EvolutionRegistry
 from aegis.evolution.surfaces import (
-    EvolutionSurface,
-    EvolutionSurfaceError,
     META_ALLOWED_ROOTS,
     META_FORBIDDEN_FILES,
+    EvolutionSurface,
+    EvolutionSurfaceError,
     validate_harness_code_content,
     validate_harness_path,
 )
@@ -51,6 +53,7 @@ from aegis.models import Role
 from aegis.research.types import Provenance, ResearchArtifact, SearchHit
 from aegis.roles import RoleRegistry
 from aegis.sandbox.fake import FakeSandboxBackend
+from aegis.sandbox.types import CommandResult, CommandSpec
 from aegis.taskpacks.builtin import load_builtin_python_taskpacks
 from aegis.taskpacks.manifest import TaskPack
 from aegis.taskpacks.validation import ExecutionResult
@@ -161,6 +164,18 @@ class FakeGateway:
         )
 
 
+class WritingFakeSandboxBackend(FakeSandboxBackend):
+    def exec(self, sandbox_id: str, command: CommandSpec) -> CommandResult:
+        argv = command.argv
+        if len(argv) == 5 and argv[:2] == ("python3", "-c") and "base64" in argv[2]:
+            self._require_runnable(sandbox_id)
+            payload = base64.b64decode(argv[4], validate=True)
+            self.commands.append((sandbox_id, command))
+            self._files.setdefault(sandbox_id, {})[argv[3]] = payload
+            return CommandResult(0, str(len(payload)), "", 0.0)
+        return super().exec(sandbox_id, command)
+
+
 class FakeResearch:
     def search(self, query: str, *, limit: int = 10):
         return [SearchHit("https://example.test/paper", "Paper", "abstract")]
@@ -207,7 +222,7 @@ def role_configs() -> dict[str, RoleConfig]:
 
 
 def plain_actions(archive: bytes) -> list[dict[str, object]]:
-    return [
+    actions = [
         submit(
             "solved",
             {
@@ -228,28 +243,27 @@ def plain_actions(archive: bytes) -> list[dict[str, object]]:
         submit("reflect-warrior", {"claims": ["keep workspace autonomy"]}),
         submit("reflect-judge", {"claims": ["forge harder tasks"]}),
         submit("reflect-prosecutor", {"claims": ["watch token drift"]}),
-        submit("council", {"proposal": "test the next hypothesis", "agenda": ["x"]}),
-        submit(
-            "forged",
-            {
-                "proposals": [
-                    {
-                        "task_id": "dynamic-next",
-                        "difficulty": 2,
-                        "capability_tags": ["python"],
-                        "cost_units": 10,
-                        "stop_conditions": ["pass the sealed suite"],
-                    }
-                ],
-                "archives": [
-                    {
-                        "task_id": "dynamic-next",
-                        "archive_base64": base64.b64encode(archive).decode("ascii"),
-                    }
-                ],
-            },
-        ),
+        submit("council", {"proposal": None, "agenda": ["x"]}),
     ]
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as source:
+        for member in source.getmembers():
+            if not member.isfile():
+                continue
+            extracted = source.extractfile(member)
+            assert extracted is not None
+            actions.append(
+                {
+                    "action": "workspace.write",
+                    "arguments": {
+                        "path": f"drafts/dynamic-next/{member.name}",
+                        "content_base64": base64.b64encode(extracted.read()).decode(
+                            "ascii"
+                        ),
+                    },
+                }
+            )
+    actions.append(submit("authored", {"draft_paths": ["drafts/dynamic-next"]}))
+    return actions
 
 
 def warrior_proposal_action(
@@ -370,6 +384,7 @@ class HarnessRepoTests(unittest.TestCase):
             activation_commit = harness.activate(
                 changes, message="evolution: round-trip"
             )
+            self.assertNotEqual(activation_commit, base)
             self.assertEqual(
                 (repo / "src/aegis/plugins/__init__.py").read_text(encoding="utf-8"),
                 "MARKER = \"patched\"\n",
@@ -564,7 +579,7 @@ class RuntimeActionTests(unittest.TestCase):
 
 
 class HarnessEvolutionCycleTests(unittest.TestCase):
-    def test_activate_then_prosecutor_rollback(self) -> None:
+    def test_harness_candidate_waits_for_fresh_full_cycle_evidence(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             store = EventStore(root / "events.sqlite3")
@@ -615,7 +630,7 @@ class HarnessEvolutionCycleTests(unittest.TestCase):
             ) -> object:
                 return run_v2_cycle(
                     gateway=FakeGateway(actions),
-                    sandbox=FakeSandboxBackend(),
+                    sandbox=WritingFakeSandboxBackend(),
                     research=FakeResearch(),
                     knowledge=None,
                     skills=None,
@@ -637,96 +652,24 @@ class HarnessEvolutionCycleTests(unittest.TestCase):
                 )
 
             try:
-                # Cycle 1: Warrior proposes patch A -> canary -> automatic activation.
-                run_cycle(
+                result = run_cycle(
                     cycle_actions(
                         warrior_proposal=warrior_proposal_action(base, ref_a, patch_a)
                     )
                 )
                 self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
-                champion_a = evolution.champion(
-                    EvolutionSurface.HARNESS_CODE, Role.WARRIOR
+                self.assertIsNone(
+                    evolution.champion(EvolutionSurface.HARNESS_CODE, Role.WARRIOR)
                 )
-                self.assertIsNotNone(champion_a)
-                self.assertEqual(champion_a.state.value, "active")
-                head_after_a = _git(harness_repo, "rev-parse", "HEAD").strip()
-                self.assertNotEqual(head_after_a, base)
-
-                # Cycle 2: Warrior proposes patch B on top of A's activation commit.
-                patch_b = b'MARKER = "patched"\nCONST = 2\n'
-                ref_b = _checkpoint_ref("gen-b")
-                _commit_on(
-                    harness_repo,
-                    head_after_a,
-                    "src/aegis/plugins/__init__.py",
-                    patch_b,
-                    ref_b,
+                pending = evolution.validated_candidates()
+                self.assertEqual(len(pending), 1)
+                self.assertIs(pending[0].surface, EvolutionSurface.HARNESS_CODE)
+                self.assertEqual(_git(harness_repo, "rev-parse", "HEAD").strip(), base)
+                candidate = json.loads(
+                    artifacts.get(result.candidate_evaluation).decode("utf-8")
                 )
-                run_cycle(
-                    cycle_actions(
-                        warrior_proposal=warrior_proposal_action(
-                            head_after_a, ref_b, patch_b
-                        )
-                    )
-                )
-                champion_b = evolution.champion(
-                    EvolutionSurface.HARNESS_CODE, Role.WARRIOR
-                )
-                self.assertIsNotNone(champion_b)
-                self.assertEqual(
-                    champion_b.parent_candidate_id, champion_a.candidate_id
-                )
-
-                # Cycle 3: the Prosecutor orders a rollback of champion B.  The
-                # control plane resets the live harness repo and the registry.
-                order = RollbackOrder.create(
-                    candidate_id=champion_b.candidate_id,
-                    reason="new constant bricks the harness",
-                    analysis="canary regression observed after activation",
-                )
-                prosecutor_actions = [
-                    {
-                        "action": "aegis.order_rollback",
-                        "arguments": {
-                            "candidate_id": order.candidate_id,
-                            "reason": order.reason,
-                            "analysis": order.analysis,
-                        },
-                    },
-                    submit(
-                        "audited",
-                        {
-                            "usage_verified": True,
-                            "safety_passed": True,
-                            "integrity_passed": True,
-                            "curriculum": [
-                                {"capability": "debugging", "hypothesis": "x"}
-                            ],
-                        },
-                    ),
-                ]
-                run_cycle(
-                    cycle_actions(
-                        warrior_proposal=None,
-                        prosecutor_actions=prosecutor_actions,
-                    )
-                )
-                champion_after = evolution.champion(
-                    EvolutionSurface.HARNESS_CODE, Role.WARRIOR
-                )
-                self.assertEqual(
-                    champion_after.candidate_id, champion_a.candidate_id
-                )
-                self.assertEqual(
-                    _git(harness_repo, "rev-parse", "HEAD").strip(),
-                    head_after_a,
-                )
-                self.assertEqual(
-                    (harness_repo_root / "src/aegis/plugins/__init__.py").read_text(
-                        encoding="utf-8"
-                    ),
-                    'MARKER = "patched"\nCONST = 1\n',
-                )
+                self.assertNotIn("harness_canary", candidate)
+                self.assertIn("Fresh holdout", candidate["activation"]["reason"])
             finally:
                 dynamic.close()
                 store.close()
@@ -875,7 +818,7 @@ class MetaEvolutionTests(unittest.TestCase):
 
 
 class HarnessPhase4EndToEndTests(unittest.TestCase):
-    def test_full_multi_generation_self_evolution_loop(self) -> None:
+    def test_meta_harness_candidate_remains_pending_after_canary(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             store = EventStore(root / "events.sqlite3")
@@ -905,7 +848,7 @@ class HarnessPhase4EndToEndTests(unittest.TestCase):
             ) -> object:
                 return run_v2_cycle(
                     gateway=FakeGateway(actions),
-                    sandbox=FakeSandboxBackend(),
+                    sandbox=WritingFakeSandboxBackend(),
                     research=FakeResearch(),
                     knowledge=None,
                     skills=None,
@@ -956,164 +899,34 @@ class HarnessPhase4EndToEndTests(unittest.TestCase):
             try:
                 base = _git(harness_repo, "rev-parse", "HEAD").strip()
 
-                # Generation 1: plugins patch -> activate -> population cell 1.
-                patch_plugins = b'MARKER = "patched"\nCONST = 1\n'
-                ref_plugins = _checkpoint_ref("gen-plugins")
+                patch_plugins = b"# evolution registry control file\n# meta-evolved\n"
+                ref_plugins = _checkpoint_ref("gen-meta")
                 _commit_on(
                     harness_repo,
                     base,
-                    "src/aegis/plugins/__init__.py",
+                    "src/aegis/evolution/registry.py",
                     patch_plugins,
                     ref_plugins,
                 )
                 run_cycle(
                     actions_for(
-                        warrior_proposal=propose(base, ref_plugins, patch_plugins)
-                    )
-                )
-                champion_1 = evolution.champion(
-                    EvolutionSurface.HARNESS_CODE, Role.WARRIOR
-                )
-                self.assertIsNotNone(champion_1)
-                head_1 = _git(harness_repo, "rev-parse", "HEAD").strip()
-                self.assertNotEqual(head_1, base)
-
-                # Generation 2: research patch -> activate; next generation is
-                # based on the activated code from generation 1.
-                patch_research = b'RESEARCH_MARKER = "patched"\n'
-                ref_research = _checkpoint_ref("gen-research")
-                _commit_on(
-                    harness_repo,
-                    head_1,
-                    "src/aegis/research/__init__.py",
-                    patch_research,
-                    ref_research,
-                )
-                run_cycle(
-                    actions_for(
                         warrior_proposal=propose(
-                            head_1,
-                            ref_research,
-                            patch_research,
-                            path="src/aegis/research/__init__.py",
-                        )
-                    )
-                )
-                champion_2 = evolution.champion(
-                    EvolutionSurface.HARNESS_CODE, Role.WARRIOR
-                )
-                self.assertEqual(
-                    champion_2.parent_candidate_id, champion_1.candidate_id
-                )
-                head_2 = _git(harness_repo, "rev-parse", "HEAD").strip()
-                self.assertNotEqual(head_2, head_1)
-                self.assertEqual(population.diversity_report()["cell_count"], 2)
-
-                # Generation 3: control-file proposal WITHOUT meta
-                # authorization is rejected; nothing activates.
-                patch_registry = (
-                    b"# evolution registry control file\n# meta-evolved\n"
-                )
-                ref_registry = _checkpoint_ref("gen-registry")
-                _commit_on(
-                    harness_repo,
-                    head_2,
-                    "src/aegis/evolution/registry.py",
-                    patch_registry,
-                    ref_registry,
-                )
-                run_cycle(
-                    actions_for(
-                        warrior_proposal=propose(
-                            head_2,
-                            ref_registry,
-                            patch_registry,
-                            path="src/aegis/evolution/registry.py",
-                        )
-                    )
-                )
-                self.assertEqual(
-                    evolution.champion(
-                        EvolutionSurface.HARNESS_CODE, Role.WARRIOR
-                    ).candidate_id,
-                    champion_2.candidate_id,
-                )
-                self.assertEqual(population.diversity_report()["cell_count"], 2)
-
-                # Generation 4: meta evolution enabled -> the same control-file
-                # patch is collected, canaried, activated, and registered.
-                run_cycle(
-                    actions_for(
-                        warrior_proposal=propose(
-                            head_2,
-                            ref_registry,
-                            patch_registry,
+                            base,
+                            ref_plugins,
+                            patch_plugins,
                             path="src/aegis/evolution/registry.py",
                         )
                     ),
                     meta=True,
                 )
-                champion_meta = evolution.champion(
-                    EvolutionSurface.HARNESS_CODE, Role.WARRIOR
+                self.assertIsNone(
+                    evolution.champion(EvolutionSurface.HARNESS_CODE, Role.WARRIOR)
                 )
-                self.assertNotEqual(
-                    champion_meta.candidate_id, champion_2.candidate_id
-                )
-                head_3 = _git(harness_repo, "rev-parse", "HEAD").strip()
-                self.assertNotEqual(head_3, head_2)
-                self.assertEqual(population.diversity_report()["cell_count"], 3)
-                self.assertIn(
-                    "evolution", population.diversity_report()["harness_roots"]
-                )
-
-                # Generation 5: the Prosecutor rolls the meta candidate back;
-                # the live repo and registry return to generation 2's champion.
-                order = RollbackOrder.create(
-                    candidate_id=champion_meta.candidate_id,
-                    reason="meta patch regressed the evolution control path",
-                    analysis="canary regression after meta activation",
-                )
-                prosecutor_actions = [
-                    {
-                        "action": "aegis.order_rollback",
-                        "arguments": {
-                            "candidate_id": order.candidate_id,
-                            "reason": order.reason,
-                            "analysis": order.analysis,
-                        },
-                    },
-                    submit(
-                        "audited",
-                        {
-                            "usage_verified": True,
-                            "safety_passed": True,
-                            "integrity_passed": True,
-                            "curriculum": [
-                                {"capability": "debugging", "hypothesis": "x"}
-                            ],
-                        },
-                    ),
-                ]
-                run_cycle(
-                    actions_for(
-                        warrior_proposal=None,
-                        prosecutor_actions=prosecutor_actions,
-                    ),
-                    meta=True,
-                )
-                self.assertEqual(
-                    evolution.champion(
-                        EvolutionSurface.HARNESS_CODE, Role.WARRIOR
-                    ).candidate_id,
-                    champion_2.candidate_id,
-                )
-                self.assertEqual(
-                    _git(harness_repo, "rev-parse", "HEAD").strip(),
-                    head_2,
-                )
-                # The MAP-Elites archive keeps the diverse cell for future
-                # exploration even after the rollback.
-                self.assertEqual(population.diversity_report()["cell_count"], 3)
+                pending = evolution.validated_candidates()
+                self.assertEqual(len(pending), 1)
+                self.assertIs(pending[0].surface, EvolutionSurface.HARNESS_CODE)
+                self.assertEqual(_git(harness_repo, "rev-parse", "HEAD").strip(), base)
+                self.assertEqual(population.diversity_report()["cell_count"], 0)
             finally:
                 dynamic.close()
                 store.close()

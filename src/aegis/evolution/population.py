@@ -16,10 +16,10 @@ import json
 import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from aegis.event_store import EventStore
-from aegis.models import AuditEvent, canonical_json, thaw_json
+from aegis.models import AuditEvent, thaw_json
 
 from .surfaces import EvolutionSurface
 

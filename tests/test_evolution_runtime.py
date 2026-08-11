@@ -7,7 +7,7 @@ from pathlib import Path
 
 from aegis.artifacts import ContentAddressedArtifactStore
 from aegis.config import RoleConfig
-from aegis.curriculum import Constitution, ObjectiveVersion, RoleVersionIdentity
+from aegis.curriculum import Constitution, ObjectiveSuccessCriterion, ObjectiveVersion, RoleVersionIdentity
 from aegis.event_store import EventStore
 from aegis.evolution.registry import EvolutionRegistry
 from aegis.evolution.runtime import (
@@ -55,8 +55,9 @@ class EvolutionRuntimeTests(unittest.TestCase):
             1,
             constitution.constitution_id,
             "improve",
-            ("pass tests",),
+            (ObjectiveSuccessCriterion("quality", 0.5),),
             ("python",),
+            {"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1},
         )
         return RoleVersionIdentity(
             Role.WARRIOR,

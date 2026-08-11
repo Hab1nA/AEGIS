@@ -17,7 +17,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -227,7 +226,7 @@ class SubagentManager:
         self._python = python or sys.executable
         self._limits = limits
         self._max_concurrency = max_concurrency
-        self._running: dict[str, subprocess.Popen[str]] = {}
+        self._running: dict[str, subprocess.Popen[bytes]] = {}
         self._outputs: dict[str, Path] = {}
         self._workspaces: dict[str, Path] = {}
         self._results: dict[str, Mapping[str, Any]] = {}
@@ -309,7 +308,7 @@ class SubagentManager:
     def _finish(
         self, subagent_id: str, exit_code: int, *, timed_out: bool
     ) -> Mapping[str, Any]:
-        process = self._running.pop(subagent_id, None)
+        self._running.pop(subagent_id, None)
         output_path = self._outputs.pop(subagent_id, None)
         workspace = self._workspaces.pop(subagent_id, None)
         payload: dict[str, Any] = {}

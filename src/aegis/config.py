@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -104,6 +105,7 @@ class AutonomyV2Config:
     )
     harness_evolution_enabled: bool = False
     harness_repo_root: str | None = None
+    harness_source_ref: str | None = None
     harness_canary_command: tuple[str, ...] | None = None
     harness_activation_automatic: bool = True
     meta_evolution_enabled: bool = False
@@ -137,6 +139,7 @@ class AutonomyV2Config:
             "evolution_surfaces",
             "harness_evolution_enabled",
             "harness_repo_root",
+            "harness_source_ref",
             "harness_canary_command",
             "harness_activation_automatic",
             "meta_evolution_enabled",
@@ -231,6 +234,12 @@ class AutonomyV2Config:
             or "\x00" in harness_root
         ):
             raise ConfigError("autonomy_v2.harness_repo_root must be null or a trimmed path")
+        harness_source_ref = raw.get("harness_source_ref")
+        if harness_source_ref is not None and (
+            not isinstance(harness_source_ref, str)
+            or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", harness_source_ref) is None
+        ):
+            raise ConfigError("autonomy_v2.harness_source_ref must be a full pinned commit")
         harness_canary = raw.get("harness_canary_command")
         if harness_canary is not None and (
             not isinstance(harness_canary, (list, tuple))
@@ -284,6 +293,10 @@ class AutonomyV2Config:
             raw.get("role_activation_automatic", True),
             "autonomy_v2.role_activation_automatic",
         )
+        if enabled and not automatic:
+            raise ConfigError("autonomy_v2 role activation is always automatic")
+        if enabled and harness_enabled and not harness_auto:
+            raise ConfigError("autonomy_v2 harness activation is always automatic")
         immutable = _bool(
             raw.get("immutable_safety_constitution", True),
             "autonomy_v2.immutable_safety_constitution",
@@ -353,6 +366,7 @@ class AutonomyV2Config:
             evolution_surfaces=tuple(surfaces),
             harness_evolution_enabled=harness_enabled,
             harness_repo_root=harness_root,
+            harness_source_ref=harness_source_ref,
             harness_canary_command=(
                 tuple(harness_canary) if harness_canary is not None else None
             ),
@@ -389,6 +403,7 @@ class AutonomyV2Config:
             "evolution_surfaces": list(self.evolution_surfaces),
             "harness_evolution_enabled": self.harness_evolution_enabled,
             "harness_repo_root": self.harness_repo_root,
+            "harness_source_ref": self.harness_source_ref,
             "harness_canary_command": (
                 list(self.harness_canary_command)
                 if self.harness_canary_command is not None
@@ -590,6 +605,17 @@ class CampaignConfig:
                 raise ConfigError("enabled autonomy_v2 requires acceptance_profile autonomous_evolution_v2")
             if normalized_paths:
                 raise ConfigError("dynamic-only autonomy_v2 must not configure fixed task_pack_paths")
+            if autonomy_v2.harness_evolution_enabled:
+                if backend != "wsl" and not test_mode:
+                    raise ConfigError("production harness evolution requires the WSL backend")
+                if "harness-code" not in autonomy_v2.evolution_surfaces:
+                    raise ConfigError("harness evolution requires the harness-code surface")
+                if autonomy_v2.public_repo_url is None:
+                    raise ConfigError("harness evolution requires a credential-free public_repo_url")
+                if autonomy_v2.harness_source_ref is None:
+                    raise ConfigError("harness evolution requires a pinned harness_source_ref")
+                if autonomy_v2.harness_repo_root is not None and not test_mode:
+                    raise ConfigError("production harness evolution forbids host harness_repo_root")
         elif not normalized_paths:
             raise ConfigError("task_pack_paths must be non-empty unless dynamic autonomy_v2 is enabled")
         return cls(

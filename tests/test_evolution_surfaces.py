@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import unittest
 
+from aegis.evolution.control_core import DEFAULT_CONTROL_CORE_POLICY
 from aegis.evolution.surfaces import (
     EvolutionProposal,
     EvolutionSurface,
     EvolutionSurfaceError,
     validate_evolution_proposal,
     validate_surface_content,
+)
+from aegis.mcp import (
+    McpBinding,
+    McpCandidate,
+    McpPermissionStage,
+    McpRiskLevel,
+    McpServerManifest,
+    McpToolAuthorization,
 )
 from aegis.models import Role
 
@@ -32,6 +41,78 @@ def valid_subject() -> dict[str, object]:
 
 
 class EvolutionSurfacesTests(unittest.TestCase):
+    def test_control_core_surface_is_strict_and_warrior_only(self) -> None:
+        content = DEFAULT_CONTROL_CORE_POLICY.to_mapping()
+        parsed = validate_surface_content(
+            EvolutionSurface.CONTROL_CORE,
+            content,
+            target_role=Role.WARRIOR,
+        )
+        self.assertEqual(parsed, content)
+        proposal = validate_evolution_proposal(
+            {
+                "surface": "control-core",
+                "target_role": "warrior",
+                "content": content,
+            },
+            proposer=Role.WARRIOR,
+        )
+        self.assertIs(proposal.surface, EvolutionSurface.CONTROL_CORE)
+        with self.assertRaisesRegex(EvolutionSurfaceError, "only target the Warrior"):
+            validate_evolution_proposal(
+                {
+                    "surface": "control-core",
+                    "target_role": "judge",
+                    "content": content,
+                },
+                proposer=Role.WARRIOR,
+            )
+
+    def test_mcp_surface_is_a_strict_warrior_candidate(self) -> None:
+        manifest = McpServerManifest.create(
+            name="calculator",
+            endpoint="https://mcp.example.test/rpc",
+            tool_names=("add",),
+            version="1",
+            rationale="math capability",
+        )
+        grant = McpToolAuthorization.create(
+            tool_name="add",
+            input_schema={"type": "object"},
+            schema_summary="Add numbers",
+            risk_level=McpRiskLevel.L0,
+            permission_stage=McpPermissionStage.DISCOVERY,
+        )
+        candidate = McpCandidate.create(
+            manifest=manifest,
+            binding=McpBinding.create(
+                manifest_id=manifest.manifest_id,
+                server_name=manifest.name,
+                authorizations=(grant,),
+            ),
+            proposed_by="warrior",
+            rationale="math capability",
+        )
+        proposal = validate_evolution_proposal(
+            {
+                "surface": "mcp",
+                "target_role": "warrior",
+                "content": candidate.to_mapping(),
+            },
+            proposer=Role.WARRIOR,
+        )
+        self.assertIs(proposal.surface, EvolutionSurface.MCP)
+        self.assertEqual(proposal.content_to_json(), candidate.to_mapping())
+        with self.assertRaises(EvolutionSurfaceError):
+            validate_evolution_proposal(
+                {
+                    "surface": "mcp",
+                    "target_role": "judge",
+                    "content": candidate.to_mapping(),
+                },
+                proposer=Role.WARRIOR,
+            )
+
     def test_workflow_surface_round_trip_and_bounds(self) -> None:
         content = validate_surface_content(
             EvolutionSurface.WORKFLOW, valid_workflow(), target_role=Role.WARRIOR

@@ -17,6 +17,7 @@ from .state_machine import CycleState, CycleStateMachine
 CONSTITUTION_RECORDED_V2 = "constitution_recorded_v2"
 OBJECTIVE_PROVISIONAL_V2 = "objective_provisional_v2"
 OBJECTIVE_PROBATION_STARTED_V2 = "objective_probation_started_v2"
+OBJECTIVE_PROBATION_OBSERVED_V2 = "objective_probation_observed_v2"
 OBJECTIVE_ACTIVATED_V2 = "objective_activated_v2"
 OBJECTIVE_ROLLED_BACK_V2 = "objective_rolled_back_v2"
 CURRICULUM_SNAPSHOT_RECORDED_V2 = "curriculum_snapshot_recorded_v2"
@@ -30,9 +31,11 @@ _EVIDENCE_ACTIONS = frozenset(
         "freeze_submission",
         "record_judge_review",
         "lock_quality",
+        "commit_curriculum_evidence",
         "record_prosecutor_audit",
         "record_independent_reflections",
         "complete_council",
+        "lock_objective_governance",
         "complete_task_forge",
         "complete_task_validation",
         "evaluate_candidates",
@@ -48,6 +51,7 @@ _KNOWN_EVENTS = frozenset(
         CONSTITUTION_RECORDED_V2,
         OBJECTIVE_PROVISIONAL_V2,
         OBJECTIVE_PROBATION_STARTED_V2,
+        OBJECTIVE_PROBATION_OBSERVED_V2,
         OBJECTIVE_ACTIVATED_V2,
         OBJECTIVE_ROLLED_BACK_V2,
         CURRICULUM_SNAPSHOT_RECORDED_V2,
@@ -66,6 +70,29 @@ class ObjectiveStatus(StrEnum):
     ACTIVE = "active"
     SUPERSEDED = "superseded"
     ROLLED_BACK = "rolled_back"
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveProbationObservation:
+    objective_id: str
+    snapshot_id: str
+    cycle_number: int
+    passed: bool
+    evidence_id: str
+
+    def __post_init__(self) -> None:
+        objective_id = _required_text(self.objective_id, "objective_id")
+        snapshot_id = _required_text(self.snapshot_id, "snapshot_id")
+        if not objective_id.startswith(ObjectiveVersion.ID_PREFIX):
+            raise CurriculumRegistryError("objective_id must be a content-addressed objective identity")
+        if not snapshot_id.startswith(CurriculumSnapshot.ID_PREFIX):
+            raise CurriculumRegistryError("snapshot_id must be a content-addressed snapshot identity")
+        if isinstance(self.cycle_number, bool) or not isinstance(self.cycle_number, int) or self.cycle_number <= 0:
+            raise CurriculumRegistryError("cycle_number must be a positive integer")
+        if not isinstance(self.passed, bool):
+            raise CurriculumRegistryError("passed must be a boolean")
+        if _CONTENT_ADDRESS.fullmatch(_required_text(self.evidence_id, "evidence_id")) is None:
+            raise CurriculumRegistryError("evidence_id must be a content address")
 
 
 def _required_text(value: object, name: str) -> str:
@@ -129,6 +156,10 @@ class CycleProjection:
     snapshots: Mapping[str, CurriculumSnapshot] = field(default_factory=dict)
     active_objective_id: str | None = None
     probation_objective_id: str | None = None
+    probation_parent_objective_id: str | None = None
+    probation_effective_cycle: int | None = None
+    probation_required_cycles: int | None = None
+    probation_observations: tuple[ObjectiveProbationObservation, ...] = ()
     current_snapshot_id: str | None = None
     cycle_state: CycleState = CycleState.CREATED
     resume_target: CycleState | None = None
@@ -149,6 +180,15 @@ class CycleProjection:
             return None
         return self.snapshots[self.current_snapshot_id]
 
+    @property
+    def effective_objective_id(self) -> str | None:
+        """Objective to bind to the next snapshot, including a live probation candidate."""
+        if self.probation_objective_id is not None:
+            next_cycle = 1 if self.current_snapshot is None else self.current_snapshot.cycle_number + 1
+            if self.probation_effective_cycle is not None and next_cycle >= self.probation_effective_cycle:
+                return self.probation_objective_id
+        return self.active_objective_id
+
 
 class CurriculumRegistry:
     """CAS-guarded command facade over an append-only curriculum event stream."""
@@ -164,6 +204,11 @@ class CurriculumRegistry:
     @property
     def projection(self) -> CycleProjection:
         return self._projection
+
+    @property
+    def store(self) -> EventStore:
+        """Shared durable store; auxiliary campaign registries use isolated substreams."""
+        return self._store
 
     def refresh(self) -> CycleProjection:
         projection = CycleProjection(campaign_id=self._campaign_id)
@@ -214,11 +259,42 @@ class CurriculumRegistry:
             },
         )
 
-    def start_objective_probation(self, objective_id: str) -> CycleProjection:
+    def start_objective_probation(
+        self,
+        objective_id: str,
+        *,
+        required_cycles: int = 2,
+        effective_cycle: int | None = None,
+    ) -> CycleProjection:
         objective_id = _required_text(objective_id, "objective_id")
         self._require_status(objective_id, ObjectiveStatus.PROVISIONAL)
         if self._projection.probation_objective_id is not None:
             raise CurriculumRegistryError("another objective is already in probation")
+        if (
+            isinstance(required_cycles, bool)
+            or not isinstance(required_cycles, int)
+            or required_cycles <= 0
+        ):
+            raise CurriculumRegistryError("required_cycles must be a positive integer")
+        next_cycle = (
+            1
+            if self._projection.current_snapshot is None
+            else self._projection.current_snapshot.cycle_number + 1
+        )
+        if effective_cycle is None:
+            effective_cycle = next_cycle
+        if (
+            isinstance(effective_cycle, bool)
+            or not isinstance(effective_cycle, int)
+            or effective_cycle < next_cycle
+        ):
+            raise CurriculumRegistryError("effective_cycle cannot precede the next cycle")
+        parent_id = self._projection.objectives[objective_id].parent_objective_id
+        if (
+            self._projection.active_objective_id is not None
+            and parent_id != self._projection.active_objective_id
+        ):
+            raise CurriculumRegistryError("probation candidate must directly follow the active objective")
         return self._append(
             OBJECTIVE_PROBATION_STARTED_V2,
             {
@@ -226,6 +302,44 @@ class CurriculumRegistry:
                 "objective_id": objective_id,
                 "previous_status": ObjectiveStatus.PROVISIONAL.value,
                 "status": ObjectiveStatus.PROBATION.value,
+                "parent_objective_id": parent_id,
+                "effective_cycle": effective_cycle,
+                "required_cycles": required_cycles,
+            },
+        )
+
+    def observe_objective_probation(
+        self,
+        objective_id: str,
+        *,
+        snapshot_id: str,
+        passed: bool,
+        evidence_id: str,
+    ) -> CycleProjection:
+        objective_id = _required_text(objective_id, "objective_id")
+        snapshot_id = _required_text(snapshot_id, "snapshot_id")
+        normalized_evidence_id = _optional_evidence_id(evidence_id)
+        if normalized_evidence_id is None:
+            raise CurriculumRegistryError("evidence_id is required")
+        if not isinstance(passed, bool):
+            raise CurriculumRegistryError("passed must be a boolean")
+        self._require_status(objective_id, ObjectiveStatus.PROBATION)
+        if self._projection.probation_objective_id != objective_id:
+            raise CurriculumRegistryError("objective is not the registered probation candidate")
+        snapshot = self._projection.snapshots.get(snapshot_id)
+        if snapshot is None or snapshot.objective.objective_id != objective_id:
+            raise CurriculumRegistryError("probation observation requires a candidate-bound snapshot")
+        if any(item.snapshot_id == snapshot_id for item in self._projection.probation_observations):
+            raise CurriculumRegistryError("probation snapshot has already been observed")
+        return self._append(
+            OBJECTIVE_PROBATION_OBSERVED_V2,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "objective_id": objective_id,
+                "snapshot_id": snapshot_id,
+                "cycle_number": snapshot.cycle_number,
+                "passed": passed,
+                "evidence_id": normalized_evidence_id,
             },
         )
 
@@ -234,6 +348,12 @@ class CurriculumRegistry:
         self._require_status(objective_id, ObjectiveStatus.PROBATION)
         if self._projection.probation_objective_id != objective_id:
             raise CurriculumRegistryError("objective is not the registered probation candidate")
+        observations = self._projection.probation_observations
+        required = self._projection.probation_required_cycles
+        if self._projection.active_objective_id is not None and (
+            required is None or len(observations) < required or not all(item.passed for item in observations)
+        ):
+            raise CurriculumRegistryError("objective has not completed passing probation observations")
         return self._append(
             OBJECTIVE_ACTIVATED_V2,
             {
@@ -244,6 +364,10 @@ class CurriculumRegistry:
                 "previous_active_objective_id": self._projection.active_objective_id,
             },
         )
+
+    def graduate_objective(self, objective_id: str) -> CycleProjection:
+        """Graduate a candidate after its persisted cross-cycle observations pass."""
+        return self.activate_objective(objective_id)
 
     def rollback_objective(
         self,
@@ -302,8 +426,8 @@ class CurriculumRegistry:
         objective = self._projection.objectives.get(snapshot.objective.objective_id)
         if objective != snapshot.objective:
             raise CurriculumRegistryError("snapshot objective is not registered")
-        if self._projection.active_objective_id != snapshot.objective.objective_id:
-            raise CurriculumRegistryError("snapshot objective is not active")
+        if self._projection.effective_objective_id != snapshot.objective.objective_id:
+            raise CurriculumRegistryError("snapshot objective is not the effective objective")
         previous = self._projection.current_snapshot
         if previous is None:
             if snapshot.cycle_number != 1 or snapshot.parent_snapshot_id is not None:
@@ -434,6 +558,8 @@ class CurriculumRegistry:
             return replace(projection, objectives=objectives, objective_statuses=statuses)
         if event_type == OBJECTIVE_PROBATION_STARTED_V2:
             return self._apply_probation_event(projection, payload, event_type)
+        if event_type == OBJECTIVE_PROBATION_OBSERVED_V2:
+            return self._apply_probation_observation_event(projection, payload, event_type)
         if event_type == OBJECTIVE_ACTIVATED_V2:
             return self._apply_activation_event(projection, payload, event_type)
         if event_type == OBJECTIVE_ROLLED_BACK_V2:
@@ -478,14 +604,37 @@ class CurriculumRegistry:
     ) -> CycleProjection:
         data = _strict_payload(
             payload,
-            {"schema_version", "objective_id", "previous_status", "status"},
+            {
+                "schema_version", "objective_id", "previous_status", "status",
+                "parent_objective_id", "effective_cycle", "required_cycles",
+            },
             event_type,
         )
         objective_id = _required_text(data["objective_id"], "objective_id")
+        parent_id = _optional_text(data["parent_objective_id"], "parent_objective_id")
+        effective_cycle = data["effective_cycle"]
+        required_cycles = data["required_cycles"]
+        if (
+            isinstance(effective_cycle, bool)
+            or not isinstance(effective_cycle, int)
+            or effective_cycle <= 0
+            or isinstance(required_cycles, bool)
+            or not isinstance(required_cycles, int)
+            or required_cycles <= 0
+        ):
+            raise CurriculumRegistryError("probation cycles must be positive integers")
         if projection.probation_objective_id is not None:
             raise CurriculumRegistryError("another objective is already in probation")
         if projection.objective_statuses.get(objective_id) is not ObjectiveStatus.PROVISIONAL:
             raise CurriculumRegistryError("probation objective must be provisional")
+        objective = projection.objectives[objective_id]
+        if objective.parent_objective_id != parent_id:
+            raise CurriculumRegistryError("probation parent does not match objective lineage")
+        if (
+            projection.active_objective_id is not None
+            and parent_id != projection.active_objective_id
+        ):
+            raise CurriculumRegistryError("probation parent is not the active objective")
         if (
             _enum_value(ObjectiveStatus, data["previous_status"], "previous_status")
             is not ObjectiveStatus.PROVISIONAL
@@ -499,6 +648,58 @@ class CurriculumRegistry:
             projection,
             objective_statuses=statuses,
             probation_objective_id=objective_id,
+            probation_parent_objective_id=parent_id,
+            probation_effective_cycle=effective_cycle,
+            probation_required_cycles=required_cycles,
+            probation_observations=(),
+        )
+
+    @staticmethod
+    def _apply_probation_observation_event(
+        projection: CycleProjection, payload: object, event_type: str
+    ) -> CycleProjection:
+        data = _strict_payload(
+            payload,
+            {
+                "schema_version",
+                "objective_id",
+                "snapshot_id",
+                "cycle_number",
+                "passed",
+                "evidence_id",
+            },
+            event_type,
+        )
+        observation = ObjectiveProbationObservation(
+            objective_id=data["objective_id"],
+            snapshot_id=data["snapshot_id"],
+            cycle_number=data["cycle_number"],
+            passed=data["passed"],
+            evidence_id=data["evidence_id"],
+        )
+        if projection.probation_objective_id != observation.objective_id:
+            raise CurriculumRegistryError("observation objective is not in probation")
+        snapshot = projection.snapshots.get(observation.snapshot_id)
+        if (
+            snapshot is None
+            or snapshot.cycle_number != observation.cycle_number
+            or snapshot.objective.objective_id != observation.objective_id
+        ):
+            raise CurriculumRegistryError("probation observation does not match its snapshot")
+        if any(
+            item.snapshot_id == observation.snapshot_id
+            for item in projection.probation_observations
+        ):
+            raise CurriculumRegistryError("probation snapshot has already been observed")
+        if (
+            projection.probation_observations
+            and observation.cycle_number
+            <= projection.probation_observations[-1].cycle_number
+        ):
+            raise CurriculumRegistryError("probation observations must be in cycle order")
+        return replace(
+            projection,
+            probation_observations=(*projection.probation_observations, observation),
         )
 
     @staticmethod
@@ -533,6 +734,12 @@ class CurriculumRegistry:
             is not ObjectiveStatus.ACTIVE
         ):
             raise CurriculumRegistryError("invalid activation status transition")
+        observations = projection.probation_observations
+        required = projection.probation_required_cycles
+        if previous_active_id is not None and (
+            required is None or len(observations) < required or not all(item.passed for item in observations)
+        ):
+            raise CurriculumRegistryError("objective has not completed passing probation observations")
         statuses = dict(projection.objective_statuses)
         statuses[objective_id] = ObjectiveStatus.ACTIVE
         if previous_active_id is not None:
@@ -544,6 +751,10 @@ class CurriculumRegistry:
             objective_statuses=statuses,
             active_objective_id=objective_id,
             probation_objective_id=None,
+            probation_parent_objective_id=None,
+            probation_effective_cycle=None,
+            probation_required_cycles=None,
+            probation_observations=(),
         )
 
     @staticmethod
@@ -606,6 +817,10 @@ class CurriculumRegistry:
             objective_statuses=statuses,
             active_objective_id=target_id,
             probation_objective_id=None,
+            probation_parent_objective_id=None,
+            probation_effective_cycle=None,
+            probation_required_cycles=None,
+            probation_observations=(),
         )
 
     @staticmethod
@@ -630,8 +845,16 @@ class CurriculumRegistry:
             raise CurriculumRegistryError("snapshot constitution is not registered")
         if projection.objectives.get(snapshot.objective.objective_id) != snapshot.objective:
             raise CurriculumRegistryError("snapshot objective is not registered")
-        if projection.active_objective_id != snapshot.objective.objective_id:
-            raise CurriculumRegistryError("snapshot objective is not active")
+        next_cycle = 1 if projection.current_snapshot is None else projection.current_snapshot.cycle_number + 1
+        expected_objective_id = projection.active_objective_id
+        if (
+            projection.probation_objective_id is not None
+            and projection.probation_effective_cycle is not None
+            and next_cycle >= projection.probation_effective_cycle
+        ):
+            expected_objective_id = projection.probation_objective_id
+        if expected_objective_id != snapshot.objective.objective_id:
+            raise CurriculumRegistryError("snapshot objective is not the effective objective")
         previous = projection.current_snapshot
         if previous is None:
             if snapshot.cycle_number != 1 or previous_state is not CycleState.CREATED:

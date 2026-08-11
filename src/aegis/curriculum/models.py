@@ -9,11 +9,18 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, ClassVar, Mapping
 
 from aegis.models import Role, canonical_json
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+OBJECTIVE_CAPABILITIES = (
+    "efficiency",
+    "generalization",
+    "quality",
+    "retention",
+)
 MANDATORY_PROTECTED_CONTROLS = (
     "budget_limits",
     "event_store",
@@ -112,6 +119,63 @@ def _sequence_to_tuple(
 
 
 @dataclass(frozen=True, slots=True)
+class ObjectiveSuccessCriterion:
+    """One evaluator-backed threshold used to decide objective success."""
+
+    metric: str
+    minimum: float
+
+    def __post_init__(self) -> None:
+        metric = _required_text(self.metric, "metric")
+        if metric not in OBJECTIVE_CAPABILITIES:
+            raise ValueError(f"metric must be one of {list(OBJECTIVE_CAPABILITIES)}")
+        if isinstance(self.minimum, bool) or not isinstance(self.minimum, (int, float)):
+            raise TypeError("minimum must be numeric")
+        minimum = float(self.minimum)
+        if not 0 <= minimum <= 1:
+            raise ValueError("minimum must be in [0, 1]")
+        object.__setattr__(self, "minimum", minimum)
+
+    def to_mapping(self) -> Mapping[str, Any]:
+        return {"metric": self.metric, "minimum": self.minimum}
+
+    @classmethod
+    def from_mapping(cls, value: object) -> ObjectiveSuccessCriterion:
+        if not isinstance(value, Mapping) or set(value) != {"metric", "minimum"}:
+            raise ValueError("objective success criterion has missing or unknown fields")
+        return cls(metric=value["metric"], minimum=value["minimum"])
+
+
+def _success_criteria(value: object) -> tuple[ObjectiveSuccessCriterion, ...]:
+    if not isinstance(value, tuple) or not value:
+        raise TypeError("success_criteria must be a non-empty tuple")
+    if any(not isinstance(item, ObjectiveSuccessCriterion) for item in value):
+        raise TypeError("success_criteria must contain ObjectiveSuccessCriterion values")
+    metrics = tuple(item.metric for item in value)
+    if metrics != tuple(sorted(metrics)) or len(set(metrics)) != len(metrics):
+        raise ValueError("success_criteria metrics must be unique and in canonical order")
+    return value
+
+
+def _capability_weights(value: object) -> Mapping[str, float]:
+    if not isinstance(value, Mapping) or set(value) != set(OBJECTIVE_CAPABILITIES):
+        raise ValueError(f"capability_weights must define exactly {list(OBJECTIVE_CAPABILITIES)}")
+    normalized: dict[str, float] = {}
+    for name in OBJECTIVE_CAPABILITIES:
+        raw = value[name]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise TypeError("capability weights must be numeric")
+        weight = float(raw)
+        if weight < 0 or weight == float("inf") or weight != weight:
+            raise ValueError("capability weights must be finite and non-negative")
+        normalized[name] = weight
+    total = sum(normalized.values())
+    if total <= 0:
+        raise ValueError("at least one capability weight must be positive")
+    return MappingProxyType({name: normalized[name] / total for name in OBJECTIVE_CAPABILITIES})
+
+
+@dataclass(frozen=True, slots=True)
 class Constitution:
     """Operator-owned safety boundary that role objectives cannot redefine."""
 
@@ -181,8 +245,9 @@ class ObjectiveVersion:
     version: int
     constitution_id: str
     statement: str
-    success_criteria: tuple[str, ...]
+    success_criteria: tuple[ObjectiveSuccessCriterion, ...]
     capability_tags: tuple[str, ...]
+    capability_weights: Mapping[str, float]
     parent_objective_id: str | None = None
     objective_id: str = field(init=False)
 
@@ -190,10 +255,11 @@ class ObjectiveVersion:
         version = _positive_int(self.version, "version")
         _identity(self.constitution_id, "constitution_id", Constitution.ID_PREFIX)
         _required_text(self.statement, "statement")
-        _text_tuple(self.success_criteria, "success_criteria")
+        _success_criteria(self.success_criteria)
         tags = _text_tuple(self.capability_tags, "capability_tags", allow_empty=True)
         if tags != tuple(sorted(tags)):
             raise ValueError("capability_tags must be in canonical order")
+        object.__setattr__(self, "capability_weights", _capability_weights(self.capability_weights))
         _lineage(version, self.parent_objective_id, "objective", self.ID_PREFIX)
         object.__setattr__(self, "objective_id", _content_id(self.ID_PREFIX, self._payload()))
 
@@ -204,8 +270,9 @@ class ObjectiveVersion:
             "parent_objective_id": self.parent_objective_id,
             "constitution_id": self.constitution_id,
             "statement": self.statement,
-            "success_criteria": list(self.success_criteria),
+            "success_criteria": [item.to_mapping() for item in self.success_criteria],
             "capability_tags": list(self.capability_tags),
+            "capability_weights": dict(self.capability_weights),
         }
 
     def to_mapping(self) -> Mapping[str, Any]:
@@ -224,6 +291,7 @@ class ObjectiveVersion:
                 "statement",
                 "success_criteria",
                 "capability_tags",
+                "capability_weights",
             },
             "objective",
         )
@@ -232,10 +300,14 @@ class ObjectiveVersion:
             parent_objective_id=data["parent_objective_id"],
             constitution_id=data["constitution_id"],
             statement=data["statement"],
-            success_criteria=_sequence_to_tuple(data["success_criteria"], "success_criteria"),
+            success_criteria=tuple(
+                ObjectiveSuccessCriterion.from_mapping(item)
+                for item in data["success_criteria"]
+            ),
             capability_tags=_sequence_to_tuple(
                 data["capability_tags"], "capability_tags", allow_empty=True
             ),
+            capability_weights=data["capability_weights"],
         )
         if data["objective_id"] != item.objective_id:
             raise ValueError("objective_id does not match canonical content")

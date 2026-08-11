@@ -282,9 +282,10 @@ class EvolutionRegistry:
         )
 
     def validated_candidates(self) -> tuple[EvolutionCandidateRecord, ...]:
+        """Validated work in append order, providing a deterministic FIFO queue."""
         return tuple(
             item
-            for item in self.candidates()
+            for item in self._projection.candidates.values()
             if item.state is CandidateState.VALIDATED
         )
 

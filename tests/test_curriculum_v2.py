@@ -14,6 +14,7 @@ from aegis.curriculum import (
     CycleState,
     CycleStateMachine,
     InvalidCycleTransitionError,
+    ObjectiveSuccessCriterion,
     ObjectiveVersion,
     RoleVersionIdentity,
     available_cycle_actions,
@@ -40,8 +41,9 @@ class CurriculumModelTests(unittest.TestCase):
             version=1,
             constitution_id=self.constitution.constitution_id,
             statement="Improve robust software-engineering performance.",
-            success_criteria=("Improve held-out quality without a safety regression.",),
+            success_criteria=(ObjectiveSuccessCriterion("quality", 0.5),),
             capability_tags=("debugging", "testing"),
+            capability_weights={"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1},
         )
         self.roles = {
             role: RoleVersionIdentity(
@@ -117,8 +119,9 @@ class CurriculumModelTests(unittest.TestCase):
             version=1,
             constitution_id=other.constitution_id,
             statement="A separately governed objective.",
-            success_criteria=("Remain separate.",),
+            success_criteria=(ObjectiveSuccessCriterion("quality", 0.5),),
             capability_tags=(),
+            capability_weights={"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1},
         )
         with self.assertRaisesRegex(ValueError, "different constitution"):
             CurriculumSnapshot(
@@ -151,16 +154,18 @@ class CurriculumModelTests(unittest.TestCase):
                 version=2,
                 constitution_id=self.constitution.constitution_id,
                 statement="Second objective version.",
-                success_criteria=("Retain lineage.",),
+                success_criteria=(ObjectiveSuccessCriterion("retention", 0.5),),
                 capability_tags=(),
+                capability_weights={"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1},
             )
         successor = ObjectiveVersion(
             version=2,
             parent_objective_id=self.objective.objective_id,
             constitution_id=self.constitution.constitution_id,
             statement="Second objective version.",
-            success_criteria=("Retain lineage.",),
+            success_criteria=(ObjectiveSuccessCriterion("retention", 0.5),),
             capability_tags=(),
+            capability_weights={"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1},
         )
         self.assertNotEqual(successor.objective_id, self.objective.objective_id)
         self.assertEqual(ObjectiveVersion.from_mapping(successor.to_mapping()), successor)
@@ -188,11 +193,14 @@ class CycleStateMachineTests(unittest.TestCase):
             "freeze_submission",
             "record_judge_review",
             "lock_quality",
+            "commit_curriculum_evidence",
             "record_prosecutor_audit",
             "record_independent_reflections",
             "complete_council",
+            "lock_objective_governance",
             "complete_task_forge",
             "complete_task_validation",
+            "evaluate_candidates",
             "lock_attribution",
             "qualify_role_candidates",
             "commit_activation_set",

@@ -11,6 +11,8 @@ from pathlib import Path
 from aegis.cycle_ports import _sealed_tasks
 from aegis.dynamic_tasks import DynamicTaskRegistry, GenesisSeeder, TaskForge
 from aegis.evolution.arm_evaluation import (
+    ArmEvaluationError,
+    EvaluationTier,
     build_cohort_workspace,
     evaluate_frozen_workspace,
     freeze_workspace_bytes,
@@ -92,6 +94,90 @@ class ArmEvaluationTests(unittest.TestCase):
         self.assertEqual(evaluation.quality, 0.0)
         self.assertEqual(evaluation.total_tasks, len(self.tasks))
         self.assertTrue(evaluation.integrity_passed)
+
+    def test_public_hidden_weighting_artifacts_and_tier_groups(self) -> None:
+        sandbox = FakeSandboxBackend()
+        workspace = build_cohort_workspace(self.dynamic, self.tasks)
+        sandbox.prepare("arm-weighted")
+        stage_cohort_workspace(sandbox, "arm-weighted", workspace)
+        frozen_digest, frozen = freeze_workspace_bytes(sandbox, "arm-weighted")
+        calls = 0
+
+        def sealed_evaluator(
+            sandbox_id: str, payload: bytes, timeout: float
+        ) -> SealedEvaluationResult:
+            nonlocal calls
+            del sandbox_id, payload, timeout
+            calls += 1
+            # The evaluator runs public then hidden for every task.
+            return SealedEvaluationResult(1 if calls % 2 else 0, 1)
+
+        sandbox.sealed_evaluator = sealed_evaluator
+        tasks = tuple(
+            {**task, "tier": "fresh-holdout" if index == 0 else task["tier"]}
+            for index, task in enumerate(self.tasks)
+        )
+        evaluation = evaluate_frozen_workspace(
+            self.dynamic,
+            sandbox,
+            frozen,
+            frozen_digest,
+            tasks,
+            namespace="arm-weighted",
+        )
+
+        self.assertEqual(calls, 2 * len(tasks))
+        self.assertEqual(evaluation.quality, 0.25)
+        self.assertEqual(evaluation.fresh_quality, 0.25)
+        self.assertEqual(evaluation.regression_quality, 0.25)
+        self.assertEqual(evaluation.fresh.task_count, 1)
+        self.assertEqual(
+            evaluation.regression.task_count,
+            len(tasks) - 1,
+        )
+        for task, result in zip(tasks, evaluation.task_results, strict=True):
+            self.assertEqual(result.artifact_id, task["artifact_id"])
+            self.assertEqual(result.public_score, 1.0)
+            self.assertEqual(result.hidden_score, 0.0)
+            expected_tier = (
+                EvaluationTier.FRESH
+                if task["tier"] == "fresh-holdout"
+                else EvaluationTier.REGRESSION
+            )
+            self.assertIs(result.tier, expected_tier)
+            self.assertTrue(result.integrity_passed)
+            self.assertEqual(len(set(result.suite_sandbox_ids)), 2)
+            self.assertTrue(result.suite_sandbox_ids[0].endswith("-public"))
+            self.assertTrue(result.suite_sandbox_ids[1].endswith("-hidden"))
+            self.assertRegex(result.staging_digest, r"^[0-9a-f]{64}$")
+            self.assertFalse(result.passed_task)
+
+    def test_evaluator_exception_is_not_reported_as_an_ordinary_test_failure(self) -> None:
+        sandbox = FakeSandboxBackend()
+        workspace = build_cohort_workspace(self.dynamic, self.tasks)
+        sandbox.prepare("arm-error")
+        stage_cohort_workspace(sandbox, "arm-error", workspace)
+        frozen_digest, frozen = freeze_workspace_bytes(sandbox, "arm-error")
+
+        def sealed_evaluator(
+            sandbox_id: str, payload: bytes, timeout: float
+        ) -> SealedEvaluationResult:
+            del sandbox_id, payload, timeout
+            raise RuntimeError("runner transport failed")
+
+        sandbox.sealed_evaluator = sealed_evaluator
+        with self.assertRaisesRegex(
+            ArmEvaluationError,
+            "public sealed evaluation failed",
+        ):
+            evaluate_frozen_workspace(
+                self.dynamic,
+                sandbox,
+                frozen,
+                frozen_digest,
+                self.tasks,
+                namespace="arm-error",
+            )
 
     def test_workspace_edit_improves_score(self) -> None:
         sandbox = FakeSandboxBackend()

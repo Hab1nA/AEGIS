@@ -21,6 +21,7 @@ from aegis.environments.models import (
     DependencyKind,
     EnvironmentRecipe,
 )
+from aegis.mcp import McpCandidate, McpEvolutionError
 from aegis.models import Role
 from aegis.plugins.abi import (
     ActionSpec,
@@ -34,6 +35,8 @@ from aegis.plugins.abi import (
     WorkspaceMode,
     validate_plugin_manifest,
 )
+
+from .control_core import ControlCorePolicy, ControlCorePolicyError
 
 SURFACE_SCHEMA_VERSION = 2
 
@@ -56,6 +59,8 @@ class EvolutionSurface(StrEnum):
     PLUGIN = "plugin"
     ENVIRONMENT = "environment"
     HARNESS_CODE = "harness-code"
+    MCP = "mcp"
+    CONTROL_CORE = "control-core"
 
 
 """Harness code root policy for the Warrior code-evolution surface.
@@ -398,6 +403,28 @@ def validate_environment_content(value: object) -> EnvironmentRecipe:
     return recipe
 
 
+def validate_mcp_content(value: object) -> McpCandidate:
+    """Validate a self-contained MCP candidate without granting execution."""
+    if not isinstance(value, Mapping):
+        raise EvolutionSurfaceError("mcp content must be an object")
+    try:
+        return McpCandidate.from_mapping(value)
+    except (McpEvolutionError, TypeError, ValueError) as exc:
+        raise EvolutionSurfaceError(f"mcp candidate is invalid: {exc}") from exc
+
+
+def validate_control_core_content(value: object) -> Mapping[str, Any]:
+    """Validate the narrow, in-WSL candidateized control policy.
+
+    This surface cannot name or mutate the host safety envelope, Windows,
+    credentials, network boundaries, or the root WSL supervisor.
+    """
+    try:
+        return ControlCorePolicy.from_mapping(value).to_mapping()
+    except (ControlCorePolicyError, TypeError, ValueError) as exc:
+        raise EvolutionSurfaceError(f"control-core policy is invalid: {exc}") from exc
+
+
 def _environment_recipe_from_mapping(value: Mapping[str, Any]) -> EnvironmentRecipe:
     dependencies = tuple(
         DependencyArtifact(
@@ -568,7 +595,7 @@ def validate_surface_content(
     *,
     target_role: Role,
     meta_evolution_enabled: bool = False,
-) -> Mapping[str, Any] | PluginManifest | EnvironmentRecipe:
+) -> Mapping[str, Any] | PluginManifest | EnvironmentRecipe | McpCandidate:
     if surface is EvolutionSurface.WORKFLOW:
         return validate_workflow_content(value)
     if surface is EvolutionSurface.SUBJECT:
@@ -581,6 +608,10 @@ def validate_surface_content(
         return validate_harness_code_content(
             value, meta_evolution_enabled=meta_evolution_enabled
         )
+    if surface is EvolutionSurface.MCP:
+        return validate_mcp_content(value)
+    if surface is EvolutionSurface.CONTROL_CORE:
+        return validate_control_core_content(value)
     raise AssertionError("unreachable")
 
 
@@ -606,13 +637,15 @@ def _role_from_text(value: object, name: str) -> Role:
 class EvolutionProposal:
     surface: EvolutionSurface
     target_role: Role
-    content: Mapping[str, Any] | PluginManifest | EnvironmentRecipe
+    content: Mapping[str, Any] | PluginManifest | EnvironmentRecipe | McpCandidate
 
     def content_to_json(self) -> Mapping[str, Any]:
         if isinstance(self.content, PluginManifest):
             return self.content.to_dict()
         if isinstance(self.content, EnvironmentRecipe):
             return self.content.to_dict()
+        if isinstance(self.content, McpCandidate):
+            return self.content.to_mapping()
         return dict(self.content)
 
 
@@ -639,6 +672,10 @@ def validate_evolution_proposal(
         raise EvolutionSurfaceError("subject proposals may only target the Warrior")
     if surface is EvolutionSurface.HARNESS_CODE and target_role is not Role.WARRIOR:
         raise EvolutionSurfaceError("harness_code proposals may only target the Warrior")
+    if surface is EvolutionSurface.MCP and target_role is not Role.WARRIOR:
+        raise EvolutionSurfaceError("mcp proposals may only target the Warrior")
+    if surface is EvolutionSurface.CONTROL_CORE and target_role is not Role.WARRIOR:
+        raise EvolutionSurfaceError("control-core proposals may only target the Warrior")
     if surface is EvolutionSurface.WORKFLOW and target_role is not proposer:
         raise EvolutionSurfaceError(
             "workflow proposals through evolution.request may only target the proposer"
@@ -703,6 +740,8 @@ __all__ = [
     "content_digest",
     "validate_harness_code_content",
     "validate_harness_path",
+    "validate_control_core_content",
+    "validate_mcp_content",
     "validate_environment_content",
     "validate_evolution_proposal",
     "validate_plugin_content",

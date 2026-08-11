@@ -1,4 +1,4 @@
-"""Deterministic public-suite quality evaluation for paired evolution arms."""
+"""Deterministic public/hidden sealed evaluation for evolution arms."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import io
 import tarfile
 import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
@@ -17,6 +16,15 @@ from aegis.sandbox import SandboxBackend
 from aegis.sandbox.types import SealedEvaluationResult
 from aegis.taskpacks.manifest import TaskPack
 from aegis.taskpacks.runtime import _sealed_cases_archive
+
+from .control_core import DEFAULT_CONTROL_CORE_POLICY, ControlCorePolicy
+from .sealed_evaluation import (
+    ArmEvaluation,
+    EvaluationTier,
+    SealedSuiteResult,
+    TaskArmResult,
+    TierEvaluation,
+)
 
 MAX_WORKSPACE_BYTES = 32 * 1024 * 1024
 MAX_TASK_OVERLAY_BYTES = 8 * 1024 * 1024
@@ -31,42 +39,6 @@ _EXCLUDED_NAMES = frozenset(
 
 class ArmEvaluationError(RuntimeError):
     """Raised when an arm cannot be staged or evaluated safely."""
-
-
-@dataclass(frozen=True, slots=True)
-class TaskArmResult:
-    task_id: str
-    artifact_id: str
-    passed: int
-    total: int
-    timed_out: bool
-    safety_violations: tuple[str, ...]
-    changed_paths: tuple[str, ...]
-
-    @property
-    def passed_task(self) -> bool:
-        return (
-            self.total > 0
-            and self.passed == self.total
-            and not self.timed_out
-            and not self.safety_violations
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ArmEvaluation:
-    workspace_digest: str
-    quality: float
-    passed_tasks: int
-    total_tasks: int
-    task_results: tuple[TaskArmResult, ...]
-    safety_violations: tuple[str, ...]
-
-    @property
-    def integrity_passed(self) -> bool:
-        return not self.safety_violations and all(
-            item.total > 0 for item in self.task_results
-        )
 
 
 class _TaskPackContext:
@@ -192,7 +164,11 @@ def freeze_workspace_bytes(
 
 
 def _overlay_workspace_task_files(
-    workspace_bytes: bytes, task_id: str
+    workspace_bytes: bytes,
+    task_id: str,
+    *,
+    max_bytes: int = MAX_TASK_OVERLAY_BYTES,
+    max_files: int = MAX_TASK_OVERLAY_FILES,
 ) -> tuple[dict[str, bytes], tuple[str, ...]]:
     """Extract the model's files for one task from the frozen workspace."""
     prefix = PurePosixPath("tasks") / task_id
@@ -225,7 +201,7 @@ def _overlay_workspace_task_files(
                 raise ArmEvaluationError("workspace file cannot be read")
             payload = source.read()
             total += len(payload)
-            if total > MAX_TASK_OVERLAY_BYTES or len(entries) >= MAX_TASK_OVERLAY_FILES:
+            if total > max_bytes or len(entries) >= max_files:
                 raise ArmEvaluationError("task overlay exceeds its byte or file limit")
             entries[relative.as_posix()] = payload
     return entries, ()
@@ -264,68 +240,144 @@ def _evaluate_one_task(
     *,
     pack: TaskPack,
     task_id: str,
+    artifact_id: str,
+    tier: EvaluationTier,
     workspace_bytes: bytes,
     timeout_seconds: float,
     namespace: str,
+    policy: ControlCorePolicy,
 ) -> TaskArmResult:
-    overlay, _skipped = _overlay_workspace_task_files(workspace_bytes, task_id)
+    overlay, _skipped = _overlay_workspace_task_files(
+        workspace_bytes,
+        task_id,
+        max_bytes=policy.task_sandbox.max_task_overlay_bytes,
+        max_files=policy.task_sandbox.max_task_overlay_files,
+    )
+    entries = _baseline_entries(pack)
+    entries.update(overlay)
+    staged = _tar_bytes(entries)
+    staged_digest = hashlib.sha256(staged).hexdigest()
+    baseline_hashes = _tar_file_hashes(staged)
+    task_namespace = hashlib.sha256(
+        f"{task_id}\0{artifact_id}".encode()
+    ).hexdigest()[:20]
+    suite_results: dict[str, SealedSuiteResult] = {}
+    suite_sandbox_ids: list[str] = []
+    changed: set[str] = set()
     safety: list[str] = []
-    changed_paths: tuple[str, ...] = ()
-    passed = total = 0
-    timed_out = False
-    judge_id = f"judge-{namespace}-" + hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:20]
-    try:
-        sandbox.prepare(judge_id)
-        entries = _baseline_entries(pack)
-        entries.update(overlay)
-        staged = _tar_bytes(entries)
-        staged_digest = hashlib.sha256(staged).hexdigest()
-        receipt = sandbox.stage_archive(
-            judge_id, base64.b64encode(staged).decode("ascii"), staged_digest
-        )
-        if receipt.digest != staged_digest or receipt.size_bytes != len(staged):
-            raise ArmEvaluationError("judge staging receipt failed verification")
-        sealed_archive = _sealed_cases_archive(pack.public_path)
-        sealed_digest = hashlib.sha256(sealed_archive).hexdigest()
-        result: SealedEvaluationResult = sandbox.evaluate_sealed(
-            judge_id,
-            base64.b64encode(sealed_archive).decode("ascii"),
-            sealed_digest,
-            timeout_seconds,
-        )
-        passed, total = result.passed, result.total
-        timed_out = result.timed_out
-        safety.extend(f"public: {item}" for item in result.safety_violations)
-        if timed_out:
-            safety.append("public test execution timed out")
-        frozen = sandbox.freeze(judge_id)
-        with tempfile.TemporaryDirectory(prefix="aegis-arm-post-") as directory:
-            destination = Path(directory) / "post.tar"
-            sandbox.export(judge_id, destination)
-            post = destination.read_bytes()
-        if frozen.size_bytes <= 0:
-            safety.append("judge export was unexpectedly empty")
-        baseline_hashes = _tar_file_hashes(staged)
-        observed_hashes = _tar_file_hashes(post)
-        changed_paths = tuple(
-            sorted(
+    for suite_name, suite_path in (
+        ("public", pack.public_path),
+        ("hidden", pack.hidden_path),
+    ):
+        judge_id = f"judge-{namespace}-{task_namespace}-{suite_name}"
+        suite_sandbox_ids.append(judge_id)
+        prepared = False
+        try:
+            sandbox.prepare(judge_id)
+            prepared = True
+            receipt = sandbox.stage_archive(
+                judge_id, base64.b64encode(staged).decode("ascii"), staged_digest
+            )
+            if receipt.digest != staged_digest or receipt.size_bytes != len(staged):
+                raise ArmEvaluationError("judge staging receipt failed verification")
+            sealed_archive = _sealed_cases_archive(suite_path)
+            sealed_digest = hashlib.sha256(sealed_archive).hexdigest()
+            try:
+                result: SealedEvaluationResult = sandbox.evaluate_sealed(
+                    judge_id,
+                    base64.b64encode(sealed_archive).decode("ascii"),
+                    sealed_digest,
+                    timeout_seconds,
+                )
+            except Exception as exc:
+                raise ArmEvaluationError(
+                    f"{suite_name} sealed evaluation failed for {task_id}"
+                ) from exc
+            violations = tuple(
+                f"{suite_name}: {item}" for item in result.safety_violations
+            )
+            suite_results[suite_name] = SealedSuiteResult(
+                result.passed,
+                result.total,
+                result.timed_out,
+                violations,
+            )
+            safety.extend(violations)
+            if result.timed_out:
+                safety.append(f"{suite_name} test execution timed out")
+            frozen = sandbox.freeze(judge_id)
+            with tempfile.TemporaryDirectory(prefix="aegis-arm-post-") as directory:
+                destination = Path(directory) / "post.tar"
+                exported = sandbox.export(judge_id, destination)
+                post = destination.read_bytes()
+            if (
+                frozen.size_bytes <= 0
+                or frozen.digest != exported.digest
+                or hashlib.sha256(post).hexdigest() != frozen.digest
+            ):
+                safety.append(f"{suite_name}: judge export digest mismatch")
+            observed_hashes = _tar_file_hashes(post)
+            changed.update(
                 path
                 for path in baseline_hashes.keys() | observed_hashes.keys()
                 if baseline_hashes.get(path) != observed_hashes.get(path)
             )
-        )
-        if changed_paths:
-            safety.append("staged submission or tests changed during evaluation")
-    finally:
-        sandbox.destroy(judge_id)
+        finally:
+            if prepared:
+                sandbox.destroy(judge_id)
+    public = suite_results.get("public")
+    hidden = suite_results.get("hidden")
+    changed_paths = tuple(sorted(changed))
+    if changed_paths:
+        safety.append("staged submission or tests changed during evaluation")
+    if public is None or hidden is None:
+        raise ArmEvaluationError(f"sealed evaluation produced no evidence for {task_id}")
     return TaskArmResult(
         task_id=task_id,
-        artifact_id="",
-        passed=passed,
-        total=total,
-        timed_out=timed_out,
-        safety_violations=tuple(safety),
+        artifact_id=artifact_id,
+        tier=tier,
+        public=public,
+        hidden=hidden,
+        suite_sandbox_ids=(suite_sandbox_ids[0], suite_sandbox_ids[1]),
+        staging_digest=staged_digest,
         changed_paths=changed_paths,
+        integrity_violations=tuple(safety),
+    )
+
+
+def _evaluation_tier(value: object) -> EvaluationTier:
+    if value == "fresh-holdout":
+        return EvaluationTier.FRESH
+    if value == "hall-of-fame":
+        return EvaluationTier.REGRESSION
+    raise ArmEvaluationError(f"unsupported cohort tier: {value!r}")
+
+
+def _task_score(result: TaskArmResult, policy: ControlCorePolicy) -> float:
+    if not result.integrity_passed:
+        return 0.0
+    return (
+        policy.sealed_evaluator.public_weight * result.public_score
+        + policy.sealed_evaluator.hidden_weight * result.hidden_score
+    )
+
+
+def _tier_evaluation(
+    tier: EvaluationTier,
+    results: Sequence[TaskArmResult],
+    policy: ControlCorePolicy,
+) -> TierEvaluation:
+    selected = tuple(item for item in results if item.tier is tier)
+    quality = (
+        round(sum(_task_score(item, policy) for item in selected) / len(selected), 12)
+        if selected
+        else None
+    )
+    return TierEvaluation(
+        tier,
+        quality,
+        len(selected),
+        tuple(item.artifact_id for item in selected),
     )
 
 
@@ -338,13 +390,15 @@ def evaluate_frozen_workspace(
     *,
     timeout_seconds: float = 120.0,
     namespace: str = "arm",
+    policy: ControlCorePolicy = DEFAULT_CONTROL_CORE_POLICY,
 ) -> ArmEvaluation:
-    """Deterministically score one arm on the sealed public suites."""
+    """Score one frozen arm using sealed public and hidden task suites."""
+    timeout_seconds = min(timeout_seconds, policy.sealed_evaluator.timeout_seconds)
     if not 0 < timeout_seconds <= 3600:
         raise ArmEvaluationError("timeout_seconds must be in (0, 3600]")
     if hashlib.sha256(workspace_bytes).hexdigest() != workspace_digest:
         raise ArmEvaluationError("workspace digest does not match its bytes")
-    if len(workspace_bytes) > MAX_WORKSPACE_BYTES:
+    if len(workspace_bytes) > policy.task_sandbox.max_workspace_bytes:
         raise ArmEvaluationError("workspace exceeds the byte limit")
     context = _TaskPackContext(registry, tasks)
     try:
@@ -356,9 +410,12 @@ def evaluate_frozen_workspace(
                     sandbox,
                     pack=pack,
                     task_id=task["task_id"],
+                    artifact_id=task["artifact_id"],
+                    tier=_evaluation_tier(task.get("tier")),
                     workspace_bytes=workspace_bytes,
                     timeout_seconds=timeout_seconds,
                     namespace=namespace,
+                    policy=policy,
                 )
             )
     finally:
@@ -368,7 +425,11 @@ def evaluate_frozen_workspace(
     safety: list[str] = []
     for item in results:
         safety.extend(item.safety_violations)
-    quality = passed_tasks / total_tasks if total_tasks else 0.0
+    quality = (
+        sum(_task_score(item, policy) for item in results) / total_tasks
+        if total_tasks
+        else 0.0
+    )
     return ArmEvaluation(
         workspace_digest=workspace_digest,
         quality=round(quality, 12),
@@ -376,14 +437,19 @@ def evaluate_frozen_workspace(
         total_tasks=total_tasks,
         task_results=tuple(results),
         safety_violations=tuple(dict.fromkeys(safety)),
+        fresh=_tier_evaluation(EvaluationTier.FRESH, results, policy),
+        regression=_tier_evaluation(EvaluationTier.REGRESSION, results, policy),
     )
 
 
 __all__ = [
     "ArmEvaluation",
     "ArmEvaluationError",
+    "EvaluationTier",
     "MAX_WORKSPACE_BYTES",
     "TaskArmResult",
+    "SealedSuiteResult",
+    "TierEvaluation",
     "build_cohort_workspace",
     "evaluate_frozen_workspace",
     "freeze_workspace_bytes",

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
 from aegis.artifacts import ArtifactRef, ContentAddressedArtifactStore
 from aegis.curriculum import CurriculumRegistry, CurriculumSnapshot, CycleState
 from aegis.dynamic_tasks import DynamicTaskCohort
+from aegis.failure_taxonomy import classify_completed_cycle, classify_exception
 from aegis.models import Role
 
 
@@ -78,10 +80,29 @@ class CouncilCyclePort(Protocol):
         self,
         snapshot: CurriculumSnapshot,
         reflections: tuple[ArtifactRef, ...],
+        submission: ArtifactRef,
+        judge_review: ArtifactRef,
+        prosecutor_audit: ArtifactRef,
+    ) -> Mapping[str, Any]: ...
+
+    def govern_objective(
+        self,
+        snapshot: CurriculumSnapshot,
+        cohort: DynamicTaskCohort,
+        submission: ArtifactRef,
+        council: ArtifactRef,
+        quality_lock: ArtifactRef,
     ) -> Mapping[str, Any]: ...
 
 
 class EvolutionCyclePort(Protocol):
+    def commit_curriculum_evidence(
+        self,
+        snapshot: CurriculumSnapshot,
+        cohort: DynamicTaskCohort,
+        quality_lock: ArtifactRef,
+    ) -> Mapping[str, Any]: ...
+
     def validate_forged_tasks(
         self, snapshot: CurriculumSnapshot, forged_tasks: ArtifactRef
     ) -> Mapping[str, Any]: ...
@@ -91,7 +112,9 @@ class EvolutionCyclePort(Protocol):
         snapshot: CurriculumSnapshot,
         cohort: DynamicTaskCohort,
         submission: ArtifactRef,
+        judge_review: ArtifactRef,
         prosecutor_audit: ArtifactRef,
+        council: ArtifactRef,
         quality_lock: ArtifactRef,
         task_validation: ArtifactRef,
     ) -> Mapping[str, Any]: ...
@@ -107,7 +130,10 @@ class EvolutionCyclePort(Protocol):
     ) -> Mapping[str, Any]: ...
 
     def qualify_role_candidates(
-        self, snapshot: CurriculumSnapshot, attribution: ArtifactRef
+        self,
+        snapshot: CurriculumSnapshot,
+        candidate_evaluation: ArtifactRef,
+        attribution: ArtifactRef,
     ) -> Mapping[str, Any]: ...
 
     def commit_activation_set(
@@ -132,8 +158,10 @@ class CycleRunResult:
     submission: ArtifactRef
     judge_review: ArtifactRef
     quality_lock: ArtifactRef
+    curriculum_evidence: ArtifactRef
     prosecutor_audit: ArtifactRef
     council: ArtifactRef
+    objective_governance: ArtifactRef
     forged_tasks: ArtifactRef
     task_validation: ArtifactRef
     candidate_evaluation: ArtifactRef
@@ -230,6 +258,7 @@ class EvolutionCycleController:
         self._registry.transition_cycle("lock_snapshot")
         self._registry.transition_cycle("lock_cohort", evidence_id=cohort.cohort_id)
 
+        current_stage = "submission"
         try:
             submission = self._record(
                 "submission", self._ports.warrior.solve(snapshot, cohort)
@@ -249,6 +278,17 @@ class EvolutionCycleController:
                 self._ports.quality.lock_quality(snapshot, cohort, submission, judge_review),
             )
             self._registry.transition_cycle("lock_quality", evidence_id=quality_lock.artifact_id)
+
+            curriculum_evidence = self._record(
+                "curriculum-evidence",
+                self._ports.evolution.commit_curriculum_evidence(
+                    snapshot, cohort, quality_lock
+                ),
+            )
+            self._registry.transition_cycle(
+                "commit_curriculum_evidence",
+                evidence_id=curriculum_evidence.artifact_id,
+            )
 
             prosecutor_audit = self._record(
                 "prosecutor-audit",
@@ -283,9 +323,27 @@ class EvolutionCycleController:
             )
 
             council = self._record(
-                "council", self._ports.council.deliberate(snapshot, reflections)
+                "council",
+                self._ports.council.deliberate(
+                    snapshot,
+                    reflections,
+                    submission,
+                    judge_review,
+                    prosecutor_audit,
+                ),
             )
             self._registry.transition_cycle("complete_council", evidence_id=council.artifact_id)
+
+            objective_governance = self._record(
+                "objective-governance",
+                self._ports.council.govern_objective(
+                    snapshot, cohort, submission, council, quality_lock
+                ),
+            )
+            self._registry.transition_cycle(
+                "lock_objective_governance",
+                evidence_id=objective_governance.artifact_id,
+            )
 
             forged_tasks = self._record(
                 "task-forge",
@@ -316,7 +374,9 @@ class EvolutionCycleController:
                     snapshot,
                     cohort,
                     submission,
+                    judge_review,
                     prosecutor_audit,
+                    council,
                     quality_lock,
                     task_validation,
                 ),
@@ -340,12 +400,15 @@ class EvolutionCycleController:
 
             qualification = self._record(
                 "qualification",
-                self._ports.evolution.qualify_role_candidates(snapshot, attribution),
+                self._ports.evolution.qualify_role_candidates(
+                    snapshot, candidate_evaluation, attribution
+                ),
             )
             self._registry.transition_cycle(
                 "qualify_role_candidates", evidence_id=qualification.artifact_id
             )
 
+            current_stage = "activation"
             activation = self._record(
                 "activation",
                 self._ports.evolution.commit_activation_set(snapshot, qualification),
@@ -354,6 +417,12 @@ class EvolutionCycleController:
                 "commit_activation_set", evidence_id=activation.artifact_id
             )
 
+            current_stage = "summary"
+            outcome_class = classify_completed_cycle(
+                self._artifact_mapping(candidate_evaluation),
+                self._artifact_mapping(qualification),
+                self._artifact_mapping(activation),
+            )
             summary = self._record(
                 "cycle-summary",
                 {
@@ -362,21 +431,35 @@ class EvolutionCycleController:
                     "submission": submission.artifact_id,
                     "judge_review": judge_review.artifact_id,
                     "quality_lock": quality_lock.artifact_id,
+                    "curriculum_evidence": curriculum_evidence.artifact_id,
                     "prosecutor_audit": prosecutor_audit.artifact_id,
                     "council": council.artifact_id,
+                    "objective_governance": objective_governance.artifact_id,
                     "forged_tasks": forged_tasks.artifact_id,
                     "task_validation": task_validation.artifact_id,
                     "candidate_evaluation": candidate_evaluation.artifact_id,
                     "attribution": attribution.artifact_id,
                     "qualification": qualification.artifact_id,
                     "activation": activation.artifact_id,
+                    "outcome_class": outcome_class.value,
                 },
             )
             self._registry.transition_cycle("complete", evidence_id=summary.artifact_id)
-        except Exception:
+        except Exception as exc:
             state = self._registry.projection.cycle_state
             if not state.terminal and state not in {CycleState.STOPPING, CycleState.PAUSED}:
-                self._registry.transition_cycle("fail", reason="v2 cycle stage failed")
+                failure = self._record(
+                    "cycle-failure",
+                    {
+                        "outcome_class": classify_exception(current_stage).value,
+                        "stage": current_stage,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                self._registry.transition_cycle(
+                    "fail",
+                    reason=f"v2 cycle stage failed: {failure.artifact_id}",
+                )
             raise
 
         return CycleRunResult(
@@ -385,8 +468,10 @@ class EvolutionCycleController:
             submission,
             judge_review,
             quality_lock,
+            curriculum_evidence,
             prosecutor_audit,
             council,
+            objective_governance,
             forged_tasks,
             task_validation,
             candidate_evaluation,
@@ -401,3 +486,12 @@ class EvolutionCycleController:
             raise CycleRuntimeError(f"{kind} port returned non-object evidence")
         _validate_evidence(evidence, path=kind)
         return self._artifacts.put_json(kind, evidence)
+
+    def _artifact_mapping(self, ref: ArtifactRef) -> Mapping[str, Any]:
+        try:
+            value = json.loads(self._artifacts.get(ref).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CycleRuntimeError("recorded cycle evidence is not strict JSON") from exc
+        if not isinstance(value, Mapping):
+            raise CycleRuntimeError("recorded cycle evidence is not an object")
+        return value

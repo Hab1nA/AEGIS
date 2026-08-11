@@ -17,6 +17,7 @@ from typing import Mapping
 NETWORK_MARKER = "enforced=podman-network-none-v1\n"
 QUOTA_MARKER = "enforced=workspace-size-limit-v1\n"
 WORKSPACE_BYTES = 67_108_864
+HARNESS_VOLUME_BYTES = 8 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,8 @@ class BootstrapSpec:
     pids_limit: int = 256
     tmpfs_size: str = "256m"
     max_workspace_bytes: int = WORKSPACE_BYTES
+    campaigns_root: str = "/var/lib/aegis/campaigns"
+    max_harness_bytes: int = HARNESS_VOLUME_BYTES
 
     def validate(self) -> None:
         if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", self.sandbox_user):
@@ -42,6 +45,17 @@ class BootstrapSpec:
             raise ValueError("invalid pids limit")
         if self.max_workspace_bytes != WORKSPACE_BYTES:
             raise ValueError(f"max_workspace_bytes must be exactly {WORKSPACE_BYTES}")
+        campaigns = PurePosixPath(self.campaigns_root)
+        if (
+            not campaigns.is_absolute()
+            or campaigns == PurePosixPath("/")
+            or campaigns.parts[:3] != ("/", "var", "lib")
+            or ".." in campaigns.parts
+            or campaigns.as_posix().startswith("/mnt/")
+        ):
+            raise ValueError("campaigns_root must be a safe /var/lib path")
+        if self.max_harness_bytes != HARNESS_VOLUME_BYTES:
+            raise ValueError(f"max_harness_bytes must be exactly {HARNESS_VOLUME_BYTES}")
         for value in (self.memory, self.cpus, self.tmpfs_size):
             if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?[A-Za-z]*", value):
                 raise ValueError("invalid resource limit")
@@ -92,6 +106,12 @@ def render_files(spec: BootstrapSpec) -> dict[str, str]:
             "ExecStart=/usr/local/libexec/aegis-workspace-setup\n"
             "RemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"
         ),
+        "/etc/systemd/system/aegis-evolution-prepare.service": (
+            "[Unit]\nDescription=Mount the bounded AEGIS harness volume\n"
+            "After=local-fs.target\nBefore=aegis-sandbox-agent.service\n\n[Service]\n"
+            "Type=oneshot\nExecStart=/usr/local/libexec/aegis-evolution-volume-setup\n"
+            "RemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"
+        ),
         "/usr/local/libexec/aegis-workspace-setup": (
             "#!/usr/bin/python3\n"
             "import os, pathlib, pwd, grp, subprocess\n"
@@ -122,8 +142,43 @@ def render_files(spec: BootstrapSpec) -> dict[str, str]:
             "tmp=MARKER.with_suffix('.tmp'); tmp.write_text('enforced=workspace-size-limit-v1\\n')\n"
             "os.chmod(tmp, 0o644); os.replace(tmp, MARKER)\n"
         ),
+        "/usr/local/libexec/aegis-evolution-volume-setup": (
+            "#!/usr/bin/python3\n"
+            "import os, pathlib, pwd, grp, subprocess\n"
+            f"ROOT=pathlib.Path({spec.campaigns_root!r})\n"
+            "IMAGE=pathlib.Path('/var/lib/aegis/harness.ext4')\n"
+            f"SIZE={spec.max_harness_bytes}\nUSER={spec.sandbox_user!r}\n"
+            "def run(*argv): subprocess.run(argv, check=True)\n"
+            "IMAGE.parent.mkdir(mode=0o711, parents=True, exist_ok=True)\n"
+            "os.chown(IMAGE.parent, 0, 0); os.chmod(IMAGE.parent, 0o711)\n"
+            "if IMAGE.exists():\n"
+            "    if not IMAGE.is_file() or IMAGE.stat().st_size != SIZE: raise SystemExit('invalid harness backing image')\n"
+            "else:\n"
+            "    fd=os.open(IMAGE, os.O_CREAT|os.O_EXCL|os.O_WRONLY, 0o600)\n"
+            "    try: os.ftruncate(fd, SIZE)\n"
+            "    finally: os.close(fd)\n"
+            "    run('/usr/sbin/mkfs.ext4', '-q', '-F', str(IMAGE))\n"
+            "ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)\n"
+            "if not os.path.ismount(ROOT): run('/usr/bin/mount', '-t', 'ext4', '-o', 'loop,nosuid,nodev', str(IMAGE), str(ROOT))\n"
+            "mounts=pathlib.Path('/proc/self/mountinfo').read_text().splitlines()\n"
+            "row=next((line for line in mounts if line.split()[4] == str(ROOT)), None)\n"
+            "if row is None or ' - ext4 /dev/loop' not in row: raise SystemExit('harness volume is not a loopback ext4 mount')\n"
+            "stats=os.statvfs(ROOT); capacity=stats.f_blocks*stats.f_frsize\n"
+            "if capacity <= 0 or capacity > SIZE: raise SystemExit('harness volume capacity is not bounded')\n"
+            "uid=pwd.getpwnam(USER).pw_uid; gid=grp.getgrnam(USER).gr_gid\n"
+            "os.chown(ROOT, uid, gid); os.chmod(ROOT, 0o700)\n"
+        ),
         "/usr/local/bin/aegis-sandbox-agent": (
             "#!/usr/bin/python3\nfrom aegis.sandbox.agent import main\nraise SystemExit(main())\n"
+        ),
+        "/usr/local/bin/aegis-harness-agent": (
+            "#!/usr/bin/python3\nfrom aegis.evolution.wsl_harness_agent import main\nraise SystemExit(main())\n"
+        ),
+        "/usr/local/bin/aegis-supervisor-agent": (
+            "#!/usr/bin/python3\nfrom aegis.evolution.wsl_supervisor_agent import main\nraise SystemExit(main())\n"
+        ),
+        "/usr/local/bin/aegis-evolution-doctor": (
+            "#!/usr/bin/python3\nfrom aegis.evolution.wsl_deployment_agent import main\nraise SystemExit(main())\n"
         ),
     }
 
@@ -168,6 +223,27 @@ def validate_rendered(files: Mapping[str, str], spec: BootstrapSpec) -> None:
         raise ValueError("workspace setup helper must make quota marker world-readable (0o644)")
     if "/etc/aegis-sandbox/workspace-quota.policy" in files:
         raise ValueError("quota marker must be created only after runtime mount verification")
+    evolution_service = files["/etc/systemd/system/aegis-evolution-prepare.service"]
+    if "ExecStart=/usr/local/libexec/aegis-evolution-volume-setup" not in evolution_service:
+        raise ValueError("evolution service does not invoke the harness volume helper")
+    evolution_helper = files["/usr/local/libexec/aegis-evolution-volume-setup"]
+    for invariant in (
+        "harness.ext4",
+        f"SIZE={HARNESS_VOLUME_BYTES}",
+        "mkfs.ext4",
+        "loop,nosuid,nodev",
+        "harness volume is not a loopback ext4 mount",
+        "harness volume capacity is not bounded",
+    ):
+        if invariant not in evolution_helper:
+            raise ValueError(f"evolution volume helper lacks {invariant}")
+    for agent in (
+        "/usr/local/bin/aegis-harness-agent",
+        "/usr/local/bin/aegis-supervisor-agent",
+        "/usr/local/bin/aegis-evolution-doctor",
+    ):
+        if agent not in files:
+            raise ValueError(f"bootstrap omits fixed agent {agent}")
 
 
 def installation_plan(spec: BootstrapSpec) -> dict[str, object]:
@@ -191,7 +267,9 @@ def installation_plan(spec: BootstrapSpec) -> dict[str, object]:
             "Place the aegis Python package in the distribution's system Python environment",
             "Enable aegis-sandbox-prepare.service, terminate the distribution, then restart it",
             "The prepare service provisions and verifies a dedicated 64 MiB loopback ext4 filesystem, then atomically publishes the quota marker",
+            "Enable aegis-evolution-prepare.service to provision and verify the dedicated 8 GiB loopback ext4 harness volume",
             "Run aegis.sandbox.agent doctor and require every check to pass",
+            "Run aegis.evolution.wsl_deployment_agent doctor and require every check to pass",
         ],
     }
 

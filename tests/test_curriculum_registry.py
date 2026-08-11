@@ -13,6 +13,7 @@ from aegis.curriculum import (
     CurriculumSnapshot,
     CycleState,
     ObjectiveStatus,
+    ObjectiveSuccessCriterion,
     ObjectiveVersion,
     RoleVersionIdentity,
 )
@@ -37,8 +38,9 @@ class CurriculumRegistryTests(unittest.TestCase):
             version=1,
             constitution_id=self.constitution.constitution_id,
             statement="Improve robust software-engineering performance.",
-            success_criteria=("Improve held-out quality without a safety regression.",),
+            success_criteria=(ObjectiveSuccessCriterion("quality", 0.5),),
             capability_tags=("debugging", "testing"),
+            capability_weights={"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1},
         )
 
     def tearDown(self) -> None:
@@ -64,11 +66,18 @@ class CurriculumRegistryTests(unittest.TestCase):
             prosecutor=identities[Role.PROSECUTOR],
         )
 
-    def snapshot(self, objective: ObjectiveVersion | None = None) -> CurriculumSnapshot:
+    def snapshot(
+        self,
+        objective: ObjectiveVersion | None = None,
+        *,
+        cycle_number: int = 1,
+        parent_snapshot_id: str | None = None,
+    ) -> CurriculumSnapshot:
         selected = objective or self.objective
         return CurriculumSnapshot(
             campaign_id=self.campaign_id,
-            cycle_number=1,
+            cycle_number=cycle_number,
+            parent_snapshot_id=parent_snapshot_id,
             constitution=self.constitution,
             objective=selected,
             active_roles=self.active_roles(selected),
@@ -119,21 +128,46 @@ class CurriculumRegistryTests(unittest.TestCase):
     def test_objective_probation_activation_and_active_rollback_are_durable(self) -> None:
         registry = CurriculumRegistry(self.store, self.campaign_id)
         self.activate_genesis(registry)
+        first = self.snapshot()
+        registry.record_snapshot(first)
+        while registry.projection.cycle_state is not CycleState.COMPLETED:
+            registry.transition_cycle("advance")
         successor = ObjectiveVersion(
             version=2,
             parent_objective_id=self.objective.objective_id,
             constitution_id=self.constitution.constitution_id,
             statement="Improve debugging performance on unseen repositories.",
-            success_criteria=("Pass probation and external probes.",),
+            success_criteria=(ObjectiveSuccessCriterion("quality", 0.5),),
             capability_tags=("debugging", "testing"),
+            capability_weights={"quality": 2, "generalization": 1, "retention": 1, "efficiency": 1},
         )
         registry.provision_objective(successor)
         self.assertIs(
             registry.projection.objective_statuses[successor.objective_id],
             ObjectiveStatus.PROVISIONAL,
         )
-        registry.start_objective_probation(successor.objective_id)
-        registry.activate_objective(successor.objective_id)
+        registry.start_objective_probation(successor.objective_id, required_cycles=2)
+        second = self.snapshot(successor, cycle_number=2, parent_snapshot_id=first.snapshot_id)
+        registry.record_snapshot(second)
+        while registry.projection.cycle_state is not CycleState.COMPLETED:
+            registry.transition_cycle("advance")
+        registry.observe_objective_probation(
+            successor.objective_id,
+            snapshot_id=second.snapshot_id,
+            passed=True,
+            evidence_id="probation-sha256:" + "a" * 64,
+        )
+        third = self.snapshot(successor, cycle_number=3, parent_snapshot_id=second.snapshot_id)
+        registry.record_snapshot(third)
+        while registry.projection.cycle_state is not CycleState.COMPLETED:
+            registry.transition_cycle("advance")
+        registry.observe_objective_probation(
+            successor.objective_id,
+            snapshot_id=third.snapshot_id,
+            passed=True,
+            evidence_id="probation-sha256:" + "b" * 64,
+        )
+        registry.graduate_objective(successor.objective_id)
         self.assertIs(
             registry.projection.objective_statuses[self.objective.objective_id],
             ObjectiveStatus.SUPERSEDED,
@@ -164,8 +198,9 @@ class CurriculumRegistryTests(unittest.TestCase):
             parent_objective_id=self.objective.objective_id,
             constitution_id=self.constitution.constitution_id,
             statement="A candidate that does not survive probation.",
-            success_criteria=("Pass all gates.",),
+            success_criteria=(ObjectiveSuccessCriterion("quality", 0.5),),
             capability_tags=(),
+            capability_weights={"quality": 2, "generalization": 1, "retention": 1, "efficiency": 1},
         )
         registry.provision_objective(candidate)
         registry.start_objective_probation(candidate.objective_id)
@@ -215,7 +250,7 @@ class CurriculumRegistryTests(unittest.TestCase):
             self.campaign_id,
             "objective_provisional_v2",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "objective": self.objective.to_mapping(),
                 "status": "active",
             },

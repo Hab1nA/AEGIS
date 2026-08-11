@@ -24,7 +24,6 @@ import base64
 import hashlib
 import os
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -37,16 +36,14 @@ from aegis.models import canonical_json
 from aegis.publishing.models import GitFileChange
 
 from .surfaces import (
-    EvolutionSurfaceError,
     HARNESS_ALLOWED_ROOTS,
     HARNESS_FORBIDDEN_FILES,
     HARNESS_FORBIDDEN_ROOTS,
     HARNESS_SECRET_PATH_PARTS,
     HARNESS_SECRET_SUFFIXES,
-    META_ALLOWED_ROOTS,
-    META_FORBIDDEN_FILES,
     MAX_HARNESS_CHANGES,
     MAX_HARNESS_FILE_BYTES,
+    META_ALLOWED_ROOTS,
 )
 
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")

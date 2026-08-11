@@ -27,7 +27,10 @@ from aegis.dynamic_tasks import (
     TaskForge,
 )
 from aegis.event_store import EventStore
+from aegis.evolution.harness_backend import HarnessBackend, WslHarnessBackend
 from aegis.evolution.registry import EvolutionRegistry
+from aegis.evolution.wsl_supervisor import CycleLaunchReceipt, WslSupervisor
+from aegis.execution_lock import CampaignExecutionLock
 from aegis.gateway.client import GatewayConfig, ModelGateway
 from aegis.gateway.types import GatewayRequest, Message
 from aegis.knowledge import KnowledgeStore
@@ -240,7 +243,11 @@ def _run_v2_cycle_cli(
             )
         source_commit = None
         if autonomy is not None and autonomy.public_repo_url is not None:
-            source_commit = _git_head(Path(__file__).resolve().parents[2])
+            source_commit = (
+                _git_head(Path(__file__).resolve().parents[2])
+                if config.test_mode
+                else autonomy.harness_source_ref
+            )
         harness_repo = None
         if (
             autonomy is not None
@@ -253,10 +260,20 @@ def _run_v2_cycle_cli(
                 Path(autonomy.harness_repo_root),
                 meta_evolution_enabled=autonomy.meta_evolution_enabled,
             )
+        harness_backend: HarnessBackend | None = None
+        harness_boot_receipt: CycleLaunchReceipt | None = None
+        if (
+            not config.test_mode
+            and autonomy is not None
+            and autonomy.harness_evolution_enabled
+        ):
+            harness_backend, harness_boot_receipt = _prepare_wsl_harness_runtime(
+                config, dynamic
+            )
         from aegis.mcp import McpBridge
 
         mcp_bridge = McpBridge()
-        harness_role_paths = {"warrior": ("warrior",)}
+        harness_role_paths: dict[str, tuple[str, ...]] = {"warrior": ("warrior",)}
         if harness_repo is not None:
             from aegis.evolution.surfaces import HARNESS_ALLOWED_ROOTS
 
@@ -314,6 +331,7 @@ def _run_v2_cycle_cli(
             ),
             campaign_config=config,
             harness_repo=harness_repo,
+            harness_backend=harness_backend,
             harness_canary_command=(
                 autonomy.harness_canary_command
                 if autonomy is not None
@@ -339,7 +357,7 @@ def _run_v2_cycle_cli(
             ),
         )
         if hasattr(result, "status"):
-            return {
+            repaired_response = {
                 "campaign_id": config.campaign_id,
                 "repaired": True,
                 "incident_id": result.incident_id,
@@ -347,7 +365,12 @@ def _run_v2_cycle_cli(
                 "status": result.status.value,
                 "completed_steps": [item.value for item in result.completed_steps],
             }
-        return {
+            if harness_boot_receipt is not None:
+                repaired_response["harness_boot_receipt"] = (
+                    harness_boot_receipt.to_mapping()
+                )
+            return repaired_response
+        response = {
             "campaign_id": config.campaign_id,
             "state": curriculum.projection.cycle_state.value,
             "snapshot_id": result.snapshot_id,
@@ -369,10 +392,79 @@ def _run_v2_cycle_cli(
                 )
             },
         }
+        if harness_boot_receipt is not None:
+            response["harness_boot_receipt"] = harness_boot_receipt.to_mapping()
+        return response
     finally:
         dynamic.close()
         knowledge.close()
         store.close()
+
+
+def _prepare_wsl_harness_runtime(
+    config: CampaignConfig,
+    dynamic: DynamicTaskRegistry,
+) -> tuple[HarnessBackend, CycleLaunchReceipt]:
+    """Initialize and boot the active WSL champion before a production cycle."""
+
+    autonomy = config.autonomy_v2
+    if autonomy is None or not autonomy.harness_evolution_enabled:
+        raise RuntimeError("production WSL harness runtime is not enabled")
+    if autonomy.public_repo_url is None or autonomy.harness_source_ref is None:
+        raise RuntimeError("production harness requires a public URL and pinned source ref")
+    from aegis.evolution.wsl_deployment import WslEvolutionDeployment
+
+    deployment = WslEvolutionDeployment()
+    deployment_report = deployment.doctor()
+    if not deployment_report.passed:
+        raise RuntimeError(
+            "WSL evolution deployment doctor failed: "
+            + "; ".join(
+                f"{check.name}: {check.detail}"
+                for check in deployment_report.checks
+                if not check.passed
+            )
+        )
+    generation = _next_v2_generation(dynamic)
+    backend = WslHarnessBackend()
+    backend.ensure_campaign(
+        config.campaign_id,
+        autonomy.public_repo_url,
+        autonomy.harness_source_ref,
+        f"ensure-{autonomy.harness_source_ref[:24]}",
+    )
+    status = backend.status(
+        config.campaign_id,
+        f"status-{generation}-{os.urandom(8).hex()}",
+    )
+    champion = status.champion_commit
+    if champion is None:
+        raise RuntimeError("WSL harness status omitted the active champion")
+    supervisor = WslSupervisor()
+    receipt = supervisor.launch_cycle(
+        config.campaign_id,
+        champion,
+        f"cycle-{generation}-launch-{champion[:16]}",
+        {
+            "action": "evolution_cycle",
+            "campaign_id": config.campaign_id,
+            "generation": generation,
+        },
+    )
+    if receipt.status != "completed":
+        target = receipt.last_known_good
+        if target is not None and target != receipt.executed_commit:
+            backend.rollback(
+                config.campaign_id,
+                receipt.executed_commit,
+                target,
+                f"cycle-{generation}-boot-rollback-{receipt.executed_commit[:12]}",
+            )
+        raise RuntimeError(
+            "active WSL champion failed to boot: "
+            f"status={receipt.status}, failure_kind={receipt.failure_kind}"
+        )
+    return backend, receipt
 
 
 def _campaign_events(campaign_id: str) -> list[Any]:
@@ -520,26 +612,44 @@ def _run_autonomy_preflight(campaign_id: str) -> dict[str, Any]:
             f"evolution_surfaces={list(autonomy.evolution_surfaces)}",
         )
         harness_enabled_surface = "harness-code" in autonomy.evolution_surfaces
-        harness_configured = (
+        harness_repo_root = autonomy.harness_repo_root
+        harness_configured = False
+        if (
             harness_enabled_surface
             and autonomy.harness_evolution_enabled
-            and autonomy.harness_repo_root is not None
-        )
-        if harness_configured:
+            and config.test_mode
+            and harness_repo_root is not None
+        ):
             from aegis.evolution.harness import HarnessRepo
 
             try:
-                HarnessRepo(Path(autonomy.harness_repo_root))
+                HarnessRepo(Path(harness_repo_root))
             except Exception as exc:
                 harness_configured = False
                 harness_detail = (
                     f"harness repo root is not a usable Git repository: {exc}"
                 )
             else:
-                harness_detail = "harness repository configured"
+                harness_detail = "test-only local harness repository configured"
+        elif harness_enabled_surface and autonomy.harness_evolution_enabled:
+            harness_configured = (
+                not config.test_mode
+                and config.sandbox_backend == "wsl"
+                and harness_repo_root is None
+                and autonomy.public_repo_url is not None
+                and autonomy.harness_source_ref is not None
+            )
+            harness_detail = (
+                "production WSL harness backend has a public pinned source"
+                if harness_configured
+                else (
+                    "production harness requires WSL, no host path, a public URL, "
+                    "and a pinned source ref"
+                )
+            )
         else:
             harness_detail = (
-                "harness_code surface requires harness_evolution_enabled and harness_repo_root"
+                "harness-code surface requires harness_evolution_enabled"
                 if harness_enabled_surface
                 else "harness surface is not configured"
             )
@@ -548,6 +658,26 @@ def _run_autonomy_preflight(campaign_id: str) -> dict[str, Any]:
             not harness_enabled_surface or harness_configured,
             harness_detail,
         )
+        if harness_enabled_surface and not config.test_mode:
+            try:
+                from aegis.evolution.wsl_deployment import WslEvolutionDeployment
+
+                evolution_doctor = WslEvolutionDeployment().doctor()
+            except Exception as exc:
+                _check(
+                    "harness_wsl_deployment",
+                    False,
+                    f"evolution deployment doctor raised: {exc}",
+                )
+            else:
+                _check(
+                    "harness_wsl_deployment",
+                    evolution_doctor.passed,
+                    "; ".join(
+                        f"{item.name}: {'ok' if item.passed else item.detail}"
+                        for item in evolution_doctor.checks
+                    ),
+                )
         meta_ok = not autonomy.meta_evolution_enabled or (
             harness_enabled_surface and harness_configured
         )
@@ -863,17 +993,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 store.close()
             _print({"campaign_id": config.campaign_id, "config": str(target)})
         elif args.command == "doctor":
-            doctor_report = WslSandboxBackend().doctor()
+            sandbox_report = WslSandboxBackend().doctor()
+            from aegis.evolution.wsl_deployment import WslEvolutionDeployment
+
+            evolution_report = WslEvolutionDeployment().doctor()
+            doctor_checks = (
+                *sandbox_report.checks,
+                *evolution_report.checks,
+            )
+            passed = bool(doctor_checks) and all(check.passed for check in doctor_checks)
             _print(
                 {
-                    "passed": doctor_report.passed,
+                    "passed": passed,
                     "checks": [
                         {"name": c.name, "passed": c.passed, "detail": c.detail}
-                        for c in doctor_report.checks
+                        for c in doctor_checks
                     ],
                 }
             )
-            return 0 if doctor_report.passed else 2
+            return 0 if passed else 2
         elif args.command == "status":
             _print(_v2_status(args.campaign_id))
         elif args.command == "report":
@@ -931,21 +1069,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print(preflight_report)
             return 0 if preflight_report["passed"] else 2
         elif args.command == "evolution-cycle":
-            plan = _evolution_cycle(args)
-            if args.run:
-                _print(
-                    {
-                        "plan": plan,
-                        "cycle": _run_v2_cycle_cli(
-                            _load(args.campaign_id),
-                            _data_dir(),
-                            repair=args.repair,
-                            no_candidate_eval=args.no_candidate_eval,
-                        ),
-                    }
-                )
-            else:
-                _print(plan)
+            with CampaignExecutionLock(
+                _data_dir() / "events.sqlite3", args.campaign_id
+            ):
+                plan = _evolution_cycle(args)
+                if args.run:
+                    _print(
+                        {
+                            "plan": plan,
+                            "cycle": _run_v2_cycle_cli(
+                                _load(args.campaign_id),
+                                _data_dir(),
+                                repair=args.repair,
+                                no_candidate_eval=args.no_candidate_eval,
+                            ),
+                        }
+                    )
+                else:
+                    _print(plan)
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"error: {exc}", file=__import__("sys").stderr)
         return 2

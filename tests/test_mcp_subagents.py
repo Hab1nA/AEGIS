@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from unittest.mock import patch
 
 from aegis.agent_runtime import ACTION_SCHEMA, Action, ToolDispatcher
 from aegis.mcp import (
+    McpBinding,
     McpBridge,
     McpBridgeError,
+    McpCandidate,
+    McpPermissionStage,
+    McpRiskLevel,
     McpServerManifest,
+    McpToolAuthorization,
 )
 from aegis.models import Role
 from aegis.sandbox.fake import FakeSandboxBackend
@@ -81,6 +83,67 @@ class _McpServerFixture:
 
 
 class McpBridgeTests(unittest.TestCase):
+    def test_candidate_overlay_pins_schema_and_records_treatment_receipt(self) -> None:
+        fixture = _McpServerFixture()
+        try:
+            manifest = McpServerManifest.create(
+                name="candidate",
+                endpoint=fixture.endpoint,
+                tool_names=("echo", "add"),
+                version="2.0",
+                rationale="paired candidate",
+            )
+            grants = tuple(
+                McpToolAuthorization.create(
+                    tool_name=name,
+                    input_schema={"type": "object"},
+                    schema_summary=f"test {name}",
+                    risk_level=McpRiskLevel.L1,
+                    permission_stage=McpPermissionStage.OBSERVATION,
+                )
+                for name in ("echo", "add")
+            )
+            candidate = McpCandidate.create(
+                manifest=manifest,
+                binding=McpBinding.create(
+                    manifest_id=manifest.manifest_id,
+                    server_name=manifest.name,
+                    authorizations=grants,
+                ),
+                proposed_by="warrior",
+                rationale="paired candidate",
+            )
+            champion = McpBridge()
+            overlay = champion.with_candidate(candidate)
+            self.assertEqual(champion.names(), ())
+            self.assertEqual(overlay.call("candidate", "echo", {"x": 1})["output"], {"x": 1})
+            self.assertTrue(overlay.candidate_was_used(candidate.binding.binding_id))
+            self.assertEqual(overlay.receipts()[0].binding_id, candidate.binding.binding_id)
+
+            drifted = McpCandidate.create(
+                manifest=manifest,
+                binding=McpBinding.create(
+                    manifest_id=manifest.manifest_id,
+                    server_name=manifest.name,
+                    authorizations=(
+                        McpToolAuthorization.create(
+                            tool_name="echo",
+                            input_schema={"type": "object", "required": ["x"]},
+                            schema_summary="drifted",
+                            risk_level=McpRiskLevel.L1,
+                            permission_stage=McpPermissionStage.OBSERVATION,
+                        ),
+                        grants[1],
+                    ),
+                ),
+                proposed_by="warrior",
+                rationale="schema drift check",
+            )
+            with self.assertRaisesRegex(McpBridgeError, "schemas drifted"):
+                champion.with_candidate(drifted)
+        finally:
+            fixture.close()
+
     def test_deploy_and_call_through_real_http(self) -> None:
         fixture = _McpServerFixture()
         try:

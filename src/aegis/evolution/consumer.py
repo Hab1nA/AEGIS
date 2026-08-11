@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from aegis.artifacts import ContentAddressedArtifactStore
-from aegis.mcp import McpBridgeError, McpServerManifest
 from aegis.models import Role
 
 from .harness import HarnessEvolutionError, RollbackOrder
@@ -443,28 +442,9 @@ def consume_rollback_orders(submission: Mapping[str, Any]) -> tuple[RollbackOrde
     return tuple(orders)
 
 
-def consume_mcp_deployments(
-    submission: Mapping[str, Any],
-) -> tuple[McpServerManifest, ...]:
-    """Extract staged MCP server manifests from one cycle's submission."""
-    nested = submission.get("submission")
-    if isinstance(nested, Mapping):
-        submission = nested
-    manifests: list[McpServerManifest] = []
-    for raw in submission.get("mcp_deployments", []):
-        if not isinstance(raw, Mapping) or not isinstance(raw.get("manifest"), Mapping):
-            continue
-        try:
-            manifests.append(McpServerManifest.from_mapping(raw["manifest"]))
-        except McpBridgeError:
-            continue
-    return tuple(manifests)
-
-
 __all__ = [
     "ConsumedCandidate",
     "EvolutionConsumerError",
-    "consume_mcp_deployments",
     "consume_rollback_orders",
     "consume_cycle_proposals",
 ]

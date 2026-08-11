@@ -212,9 +212,8 @@ class AttributionV2Tests(unittest.TestCase):
         self.assertEqual(report.disposition, AttributionDisposition.CONFOUNDED)
         self.assertIn("cohort changes", report.reason)
 
-    def test_usage_safety_and_integrity_are_non_compensable(self) -> None:
+    def test_safety_and_integrity_are_non_compensable(self) -> None:
         failures = (
-            ("usage_verified", False, AttributionDisposition.UNVERIFIED_USAGE),
             ("safety_passed", False, AttributionDisposition.SAFETY_REJECTED),
             ("integrity_passed", False, AttributionDisposition.INTEGRITY_REJECTED),
         )
@@ -232,6 +231,23 @@ class AttributionV2Tests(unittest.TestCase):
                     self.assertFalse(report.qualified)
                     self.assertEqual(report.disposition, expected)
                     self.assertEqual(report.qualification_path, QualificationPath.NONE)
+
+    def test_unverified_usage_blocks_efficiency_but_not_quality(self) -> None:
+        quality = qualify_attribution(
+            (pair(baseline_changes={"usage_verified": False}),)
+        )
+        efficiency = qualify_attribution(
+            (
+                pair(
+                    baseline_quality=0.70,
+                    candidate_quality=0.695,
+                    candidate_cost=80,
+                    candidate_changes={"usage_verified": False},
+                ),
+            )
+        )
+        self.assertEqual(quality.qualification_path, QualificationPath.QUALITY_IMPROVEMENT)
+        self.assertEqual(efficiency.disposition, AttributionDisposition.UNVERIFIED_USAGE)
 
     def test_quality_improvement_with_cost_cap_qualifies(self) -> None:
         report = qualify_attribution(
@@ -280,7 +296,8 @@ class AttributionV2Tests(unittest.TestCase):
         )
 
         self.assertEqual(ordinary.disposition, AttributionDisposition.NOT_QUALIFIED)
-        self.assertEqual(zero_baseline.disposition, AttributionDisposition.INVALID_DESIGN)
+        self.assertEqual(zero_baseline.disposition, AttributionDisposition.QUALIFIED)
+        self.assertEqual(zero_baseline.qualification_path, QualificationPath.QUALITY_IMPROVEMENT)
 
     def test_reordering_replays_same_report_and_duplicates_are_rejected(self) -> None:
         first = pair(task_id="a", seed=1)

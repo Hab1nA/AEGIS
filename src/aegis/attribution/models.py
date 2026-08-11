@@ -91,6 +91,7 @@ class EvaluationArm:
     safety_passed: bool
     integrity_passed: bool
     runtime_variant: str | None = None
+    mcp_binding_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("cycle_id", "objective_id", "task_id", "model_id", "environment_id"):
@@ -105,6 +106,12 @@ class EvaluationArm:
             raise TypeError("plugin_ids must contain strings")
         for plugin_id in self.plugin_ids:
             _text(plugin_id, "plugin_id")
+        if tuple(sorted(set(self.mcp_binding_ids))) != self.mcp_binding_ids:
+            raise ValueError("mcp_binding_ids must be sorted and unique")
+        if any(not isinstance(item, str) for item in self.mcp_binding_ids):
+            raise TypeError("mcp_binding_ids must contain strings")
+        for binding_id in self.mcp_binding_ids:
+            _text(binding_id, "mcp_binding_id")
         if tuple(sorted(self.role_generations)) != self.role_generations:
             raise ValueError("role_generations must be sorted by role")
         roles = tuple(item.role for item in self.role_generations)
@@ -139,9 +146,15 @@ class EvaluationArm:
             "safety_passed",
             "integrity_passed",
             "runtime_variant",
+            "mcp_binding_ids",
         }
         if set(value) != expected:
-            if not (set(value) == expected - {"runtime_variant"}):
+            compatible = (
+                expected - {"runtime_variant"},
+                expected - {"mcp_binding_ids"},
+                expected - {"runtime_variant", "mcp_binding_ids"},
+            )
+            if set(value) not in compatible:
                 raise ValueError("evaluation arm has missing or unknown fields")
         plugins = value["plugin_ids"]
         roles = value["role_generations"]
@@ -152,6 +165,11 @@ class EvaluationArm:
         runtime_variant = value.get("runtime_variant")
         if runtime_variant is not None and not isinstance(runtime_variant, str):
             raise TypeError("runtime_variant must be text or null")
+        mcp_bindings = value.get("mcp_binding_ids", [])
+        if not isinstance(mcp_bindings, list) or not all(
+            isinstance(item, str) for item in mcp_bindings
+        ):
+            raise TypeError("mcp_binding_ids must be an array of strings")
         return cls(
             cycle_id=value["cycle_id"],
             objective_id=value["objective_id"],
@@ -167,6 +185,7 @@ class EvaluationArm:
             safety_passed=value["safety_passed"],
             integrity_passed=value["integrity_passed"],
             runtime_variant=runtime_variant,
+            mcp_binding_ids=tuple(mcp_bindings),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -185,6 +204,7 @@ class EvaluationArm:
             "safety_passed": self.safety_passed,
             "integrity_passed": self.integrity_passed,
             "runtime_variant": self.runtime_variant,
+            "mcp_binding_ids": list(self.mcp_binding_ids),
         }
 
     def generation_for(self, role: str) -> RoleGeneration | None:
@@ -265,6 +285,7 @@ class PairedObservation:
             "model_id",
             "environment_id",
             "plugin_ids",
+            "mcp_binding_ids",
         )
         changed = [name for name in fields if getattr(left, name) != getattr(right, name)]
         left_roles = {
@@ -287,7 +308,8 @@ class PairedObservation:
         """Return the causal coordinates that differ between the two arms.
 
         A valid single-surface intervention changes exactly one coordinate
-        (``plugin_ids`` for a plugin candidate, ``runtime_variant`` for an
+        (``plugin_ids`` for a plugin candidate, ``mcp_binding_ids`` for MCP,
+        ``runtime_variant`` for an
         environment candidate, or none for advisory workflow/subject
         candidates whose effect is carried by the role generation identity).
         """
@@ -364,11 +386,13 @@ class AttributionReport:
         if _REPORT_ID.fullmatch(self.report_id) is None:
             raise ValueError("report_id must be an attribution report content id")
         _text(self.reason, "reason", maximum=1024)
-        if not self.observation_ids or tuple(sorted(set(self.observation_ids))) != self.observation_ids:
-            raise ValueError("observation_ids must be non-empty, sorted, and unique")
+        if tuple(sorted(set(self.observation_ids))) != self.observation_ids:
+            raise ValueError("observation_ids must be sorted and unique")
         if any(_OBSERVATION_ID.fullmatch(item) is None for item in self.observation_ids):
             raise ValueError("report contains an invalid observation id")
         if self.disposition is AttributionDisposition.QUALIFIED:
+            if not self.observation_ids:
+                raise ValueError("qualified reports require paired observations")
             if self.qualification_path is QualificationPath.NONE:
                 raise ValueError("qualified reports require a qualification path")
         elif self.qualification_path is not QualificationPath.NONE:

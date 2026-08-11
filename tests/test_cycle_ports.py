@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import shutil
+import tarfile
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -16,7 +18,7 @@ from aegis.artifacts import ContentAddressedArtifactStore
 from aegis.cli import main
 from aegis.config import RoleConfig
 from aegis.curriculum import CurriculumRegistry, CycleState
-from aegis.cycle_ports import run_v2_cycle
+from aegis.cycle_ports import ModelCyclePorts, run_v2_cycle
 from aegis.dynamic_tasks import (
     DynamicTaskOrigin,
     DynamicTaskRegistry,
@@ -29,6 +31,18 @@ from aegis.environments.models import BuildReceipt, SourceResolution
 from aegis.event_store import EventStore
 from aegis.evolution.surfaces import EvolutionSurface
 from aegis.gateway.types import GatewayResponse, TokenUsage
+from aegis.mcp import (
+    McpBinding,
+    McpBridge,
+    McpCandidate,
+    McpCandidateStatus,
+    McpPermissionStage,
+    McpRegistry,
+    McpRiskLevel,
+    McpServerManifest,
+    McpToolAuthorization,
+    McpToolCatalogEntry,
+)
 from aegis.models import Role
 from aegis.research.types import Provenance, ResearchArtifact, SearchHit
 from aegis.roles import RoleRegistry
@@ -55,13 +69,72 @@ class AnchorRunner:
 
 class FakeGateway:
     def __init__(self, actions: list[dict[str, object]]) -> None:
-        self.actions = list(actions)
+        self.actions = _materialize_legacy_forge_actions(actions)
         self.requests = []
 
     def complete(self, request, *, cancel=None):
         self.requests.append(request)
         action = self.actions.pop(0)
+        WritingFakeSandboxBackend.materialize_latest(action)
         return GatewayResponse(json.dumps(action), TokenUsage(5, 3, verified=True), "fake")
+
+
+class WritingFakeSandboxBackend(FakeSandboxBackend):
+    """Fake backend that implements the runtime's workspace.write command."""
+
+    _latest: WritingFakeSandboxBackend | None = None
+    _latest_prepared_id: str | None = None
+    _materialized_count: int = 0
+    _pending_task_files: dict[str, bytes] = {}
+
+    def prepare(self, sandbox_id: str, *, image: str | None = None):
+        prepared = super().prepare(sandbox_id, image=image)
+        type(self)._latest = self
+        self._latest_prepared_id = sandbox_id
+        return prepared
+
+    @classmethod
+    def materialize_latest(cls, action: dict[str, object]) -> None:
+        """Persist a scripted write before the runtime returns its tool receipt."""
+
+        backend = cls._latest
+        arguments = action.get("arguments")
+        if (
+            backend is None
+            or action.get("action") != "workspace.write"
+            or not isinstance(arguments, dict)
+            or not isinstance(arguments.get("path"), str)
+            or not isinstance(arguments.get("content_base64"), str)
+        ):
+            return
+        sandbox_id = backend._latest_prepared_id
+        if sandbox_id is None or sandbox_id not in backend.prepared:
+            return
+        content = base64.b64decode(arguments["content_base64"], validate=True)
+        backend._files.setdefault(sandbox_id, {})[arguments["path"]] = content
+        backend._pending_task_files[arguments["path"]] = content
+        backend._materialized_count += 1
+
+    def freeze(self, sandbox_id: str):
+        if self._pending_task_files:
+            self._files.setdefault(sandbox_id, {}).update(self._pending_task_files)
+            self._pending_task_files.clear()
+        return super().freeze(sandbox_id)
+
+    def exec(self, sandbox_id: str, command: CommandSpec) -> CommandResult:
+        argv = command.argv
+        if (
+            len(argv) == 5
+            and argv[0] == "python3"
+            and argv[1] == "-c"
+            and "base64" in argv[2]
+        ):
+            self._require_runnable(sandbox_id)
+            payload = base64.b64decode(argv[4], validate=True)
+            self.commands.append((sandbox_id, command))
+            self._files.setdefault(sandbox_id, {})[argv[3]] = payload
+            return CommandResult(0, str(len(payload)), "", 0.0)
+        return super().exec(sandbox_id, command)
 
 
 class FakeResearch:
@@ -101,6 +174,115 @@ def forge_archive(root: Path, *, task_id: str = "dynamic-next") -> bytes:
     return canonical_taskpack_archive(TaskPack.load(copied))
 
 
+def task_authoring_actions(archive: bytes, task_id: str) -> list[dict[str, object]]:
+    """Translate a test fixture pack into the actions a real Judge would take."""
+
+    actions: list[dict[str, object]] = []
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as source:
+        for member in source.getmembers():
+            if not member.isfile():
+                continue
+            extracted = source.extractfile(member)
+            assert extracted is not None
+            actions.append(
+                {
+                    "action": "workspace.write",
+                    "arguments": {
+                        "path": f"drafts/{task_id}/{member.name}",
+                        "content_base64": base64.b64encode(extracted.read()).decode("ascii"),
+                    },
+                }
+            )
+    actions.append(submit("forged", {"draft_paths": [f"drafts/{task_id}"]}))
+    return actions
+
+
+def paired_candidate_actions(path: str, solution: bytes) -> list[dict[str, object]]:
+    """Two seeds: baseline submit, candidate write+submit, repeated exactly."""
+
+    def write(content: bytes) -> dict[str, object]:
+        return {
+        "action": "workspace.write",
+        "arguments": {
+            "path": path,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+        },
+    }
+    solved = submit("solved", {"task_ids": [], "results": []})
+    baseline = solution.replace(b"FIXED", b"BASELINE")
+    return [
+        write(baseline),
+        solved,
+        write(solution),
+        solved,
+        write(baseline),
+        solved,
+        write(solution),
+        solved,
+    ]
+
+
+def _fixture_archive(task_id: str) -> bytes:
+    with tempfile.TemporaryDirectory() as directory:
+        return forge_archive(Path(directory), task_id=task_id)
+
+
+def seed_fresh_candidate_probe(
+    dynamic: DynamicTaskRegistry, runner: AnchorRunner, root: Path
+) -> None:
+    """Give candidate tests a delayed Fresh cohort; anchors provide regression."""
+
+    TaskForge(dynamic).forge_archive(
+        forge_archive(root, task_id="candidate-fresh-probe"),
+        runner,
+        creator_generation=1,
+        source_spec_id="test:preseed-fresh",
+        source_evidence_ids=("test:preseed-fresh",),
+        holdout_delay=1,
+    )
+
+
+def run_candidate_cycle(**kwargs):
+    """Keep the preseeded Fresh task available until candidate evaluation."""
+
+    with patch.object(
+        ModelCyclePorts,
+        "commit_curriculum_evidence",
+        return_value={"transitions": [], "deferred_for_candidate_test": True},
+    ):
+        return run_v2_cycle(**kwargs)
+
+
+def _materialize_legacy_forge_actions(
+    actions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Keep hand-written scenarios concise while exercising workspace authoring."""
+
+    materialized: list[dict[str, object]] = []
+    for action in actions:
+        arguments = action.get("arguments")
+        if not isinstance(arguments, dict) or arguments.get("summary") != "forged":
+            materialized.append(action)
+            continue
+        payload = arguments.get("payload")
+        if not isinstance(payload, dict):
+            materialized.append(action)
+            continue
+        proposals = payload.get("proposals")
+        proposal = proposals[0] if isinstance(proposals, list) and proposals else {}
+        task_id = proposal.get("task_id") if isinstance(proposal, dict) else None
+        if not isinstance(task_id, str):
+            task_id = "dynamic-next"
+        archive: bytes | None = None
+        archives = payload.get("archives")
+        if isinstance(archives, list) and archives and isinstance(archives[0], dict):
+            encoded = archives[0].get("archive_base64")
+            if isinstance(encoded, str):
+                archive = base64.b64decode(encoded, validate=True)
+        materialized.extend(task_authoring_actions(archive or _fixture_archive(task_id), task_id))
+    return materialized
+
+
 def gateway_actions(
     archive: bytes, *, propose_candidate: bool = True
 ) -> list[dict[str, object]]:
@@ -127,7 +309,7 @@ def gateway_actions(
         submit("reflect-warrior", {"claims": ["keep workspace autonomy"]}),
         submit("reflect-judge", {"claims": ["forge harder tasks"]}),
         submit("reflect-prosecutor", {"claims": ["watch token drift"]}),
-        submit("council", {"proposal": "test the next hypothesis", "agenda": ["x"]}),
+        submit("council", {"proposal": None, "agenda": ["x"]}),
         submit(
             "forged",
             {
@@ -160,6 +342,247 @@ def role_configs() -> dict[str, RoleConfig]:
 
 
 class CyclePortsTests(unittest.TestCase):
+    def test_mcp_candidate_requires_two_sealed_cycles_before_activation(self) -> None:
+        WritingFakeSandboxBackend._pending_task_files.clear()
+        WritingFakeSandboxBackend._latest = None
+        WritingFakeSandboxBackend._latest_prepared_id = None
+        class RecordingExecutor:
+            def __init__(self) -> None:
+                self.sandbox: FakeSandboxBackend | None = None
+
+            def __call__(self, sandbox_id: str, spec: CommandSpec) -> CommandResult:
+                argv = spec.argv
+                if len(argv) == 5 and argv[:2] == ("python3", "-c") and "base64" in argv[2]:
+                    assert self.sandbox is not None
+                    self.sandbox._files.setdefault(sandbox_id, {})[argv[3]] = base64.b64decode(
+                        argv[4], validate=True
+                    )
+                    return CommandResult(0, "written", "", 0.0)
+                return CommandResult(0, "", "", 0.0)
+
+        recorder = RecordingExecutor()
+
+        def sealed_evaluator(
+            sandbox_id: str, payload: bytes, timeout: float
+        ) -> SealedEvaluationResult:
+            del payload, timeout
+            files = sandbox._files.get(sandbox_id, {})
+            fixed = any(isinstance(value, bytes) and b"FIXED" in value for value in files.values())
+            return SealedEvaluationResult(1 if fixed else 0, 1)
+
+        schema = {"type": "object"}
+        manifest = McpServerManifest.create(
+            name="calculator",
+            endpoint="https://mcp.example.test/rpc",
+            tool_names=("echo",),
+            version="1.0",
+            rationale="candidate capability",
+        )
+        grant = McpToolAuthorization.create(
+            tool_name="echo",
+            input_schema=schema,
+            schema_summary="Echo a bounded value",
+            risk_level=McpRiskLevel.L1,
+            permission_stage=McpPermissionStage.OBSERVATION,
+        )
+        mcp_candidate = McpCandidate.create(
+            manifest=manifest,
+            binding=McpBinding.create(
+                manifest_id=manifest.manifest_id,
+                server_name=manifest.name,
+                authorizations=(grant,),
+            ),
+            proposed_by="warrior",
+            rationale="candidate capability",
+        )
+        fixed_solution = b"def solve(value):\n    return value  # FIXED\n"
+        baseline_solution = fixed_solution.replace(b"FIXED", b"BASELINE")
+        path = "tasks/candidate-fresh-probe/solution.py"
+
+        def write(content: bytes) -> dict[str, object]:
+            return {
+                "action": "workspace.write",
+                "arguments": {
+                    "path": path,
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                },
+            }
+
+        def paired_actions() -> list[dict[str, object]]:
+            rows: list[dict[str, object]] = []
+            for _seed in (0, 1):
+                rows.extend(
+                    [
+                        write(baseline_solution),
+                        {"action": "sandbox.exec", "arguments": {"argv": ["true"]}},
+                        submit("baseline", {"results": []}),
+                        {
+                            "action": "aegis.mcp_call",
+                            "arguments": {
+                                "server": "calculator",
+                                "tool": "echo",
+                                "arguments": {"value": 1},
+                            },
+                        },
+                        write(fixed_solution),
+                        submit("candidate", {"results": []}),
+                    ]
+                )
+            return rows
+
+        def cycle_actions(*, propose: bool) -> list[dict[str, object]]:
+            prefix: list[dict[str, object]] = []
+            if propose:
+                prefix.append(
+                    {
+                        "action": "aegis.deploy_mcp",
+                        "arguments": {
+                            "name": "calculator",
+                            "endpoint": manifest.endpoint,
+                            "version": manifest.version,
+                            "rationale": manifest.rationale,
+                            "tool_authorizations": [
+                                {
+                                    "tool_name": "echo",
+                                    "input_schema": schema,
+                                    "schema_summary": "Echo a bounded value",
+                                    "risk_level": "L1",
+                                    "permission_stage": "observation",
+                                }
+                            ],
+                        },
+                    }
+                )
+            return [
+                *prefix,
+                submit("solved", {"results": []}),
+                submit(
+                    "reviewed",
+                    {
+                        "quality_score": 0.5,
+                        "mcp_decisions": [
+                            {
+                                "candidate_id": mcp_candidate.candidate_id,
+                                "decision": "approve",
+                                "rationale": "bounded read capability",
+                            }
+                        ],
+                    },
+                ),
+                submit(
+                    "audited",
+                    {
+                        "usage_verified": True,
+                        "safety_passed": True,
+                        "integrity_passed": True,
+                        "curriculum": [],
+                        "mcp_decisions": [
+                            {
+                                "candidate_id": mcp_candidate.candidate_id,
+                                "decision": "approve",
+                                "rationale": "no veto",
+                            }
+                        ],
+                    },
+                ),
+                submit("reflect-warrior", {"claims": []}),
+                submit("reflect-judge", {"claims": []}),
+                submit("reflect-prosecutor", {"claims": []}),
+                submit("council", {"proposal": None, "agenda": []}),
+                submit("forged", {"proposals": [], "archives": []}),
+                *paired_actions(),
+            ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = EventStore(root / "events.sqlite3")
+            dynamic = DynamicTaskRegistry(root / "tasks.sqlite3")
+            runner = AnchorRunner()
+            GenesisSeeder(dynamic, TaskForge(dynamic)).seed(runner)
+            seed_fresh_candidate_probe(dynamic, runner, root)
+            curriculum = CurriculumRegistry(store, "cli")
+            roles = RoleRegistry(store, "cli")
+            from aegis.evolution.registry import EvolutionRegistry
+
+            evolution = EvolutionRegistry(store, "cli")
+            artifacts = ContentAddressedArtifactStore(root / "artifacts")
+            sandbox = WritingFakeSandboxBackend(executor=recorder, sealed_evaluator=sealed_evaluator)
+            recorder.sandbox = sandbox
+            bridge = McpBridge()
+            common = dict(
+                sandbox=sandbox,
+                research=FakeResearch(),
+                knowledge=None,
+                skills=None,
+                pdf_extractor=None,
+                role_configs=role_configs(),
+                limits=RuntimeLimits(max_steps=20),
+                artifacts=artifacts,
+                dynamic=dynamic,
+                forge=TaskForge(dynamic),
+                runner=runner,
+                curriculum=curriculum,
+                roles=roles,
+                data_dir=root,
+                campaign_id="cli",
+                evolution=evolution,
+                event_store=store,
+                mcp_bridge=bridge,
+            )
+            catalog = (McpToolCatalogEntry("echo", schema, "Echo a bounded value"),)
+            try:
+                with (
+                    patch(
+                        "aegis.mcp.bridge.socket.getaddrinfo",
+                        return_value=[
+                            (2, 1, 6, "", ("93.184.216.34", 443))
+                        ],
+                    ),
+                    patch("aegis.mcp.bridge.McpClient.list_tool_catalog", return_value=catalog),
+                    patch("aegis.mcp.bridge.McpClient.call_tool", return_value={"value": 1}),
+                ):
+                    first = run_candidate_cycle(
+                        gateway=FakeGateway(cycle_actions(propose=True)), **common
+                    )
+                    self.assertEqual(roles.projection.current_active_set.for_role(Role.WARRIOR).version, 1)
+                    first_eval = json.loads(artifacts.get(first.candidate_evaluation).decode("utf-8"))
+                    self.assertIn("qualification_pending", first_eval, first_eval)
+                    first_qualification = json.loads(
+                        artifacts.get(first.qualification).decode("utf-8")
+                    )
+                    self.assertIn("mcp_probation", first_qualification)
+                    self.assertTrue(first_qualification["mcp_probation"]["ready"] is False)
+                    self.assertEqual(bridge.names(), ())
+
+                    second = run_candidate_cycle(
+                        gateway=FakeGateway(cycle_actions(propose=False)), **common
+                    )
+                    self.assertEqual(roles.projection.current_active_set.for_role(Role.WARRIOR).version, 2)
+                    self.assertEqual(bridge.names(), ("calculator",))
+                    champion = evolution.champion(EvolutionSurface.MCP, Role.WARRIOR)
+                    self.assertIsNotNone(champion)
+                    active_identity = roles.projection.current_active_set.for_role(
+                        Role.WARRIOR
+                    )
+                    role_manifest = json.loads(
+                        (
+                            artifacts.root
+                            / "role-manifest"
+                            / active_identity.artifact_id.rsplit(":", 1)[1]
+                        ).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        role_manifest["mcp_artifact_ids"],
+                        [champion.artifact_id],
+                    )
+                    runtime_state = McpRegistry(store, "cli")
+                    record = runtime_state.projection.candidates[mcp_candidate.candidate_id]
+                    self.assertIs(record.status, McpCandidateStatus.ACTIVE)
+                    self.assertNotEqual(second.activation.artifact_id, "")
+            finally:
+                dynamic.close()
+                store.close()
+
     def test_full_model_driven_cycle_forges_and_registers_dynamic_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -175,7 +598,7 @@ class CyclePortsTests(unittest.TestCase):
             try:
                 result = run_v2_cycle(
                     gateway=gateway,
-                    sandbox=FakeSandboxBackend(),
+                    sandbox=WritingFakeSandboxBackend(),
                     research=FakeResearch(),
                     knowledge=None,
                     skills=None,
@@ -203,7 +626,7 @@ class CyclePortsTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(dynamic_records), 1)
                 self.assertIs(dynamic_records[0].status, DynamicTaskStatus.QUARANTINED)
-                self.assertEqual(dynamic_records[0].creator_generation, 2)
+                self.assertEqual(dynamic_records[0].creator_generation, 1)
                 active = roles.projection.current_active_set
                 self.assertIsNotNone(active)
                 assert active is not None
@@ -233,7 +656,7 @@ class CyclePortsTests(unittest.TestCase):
             first = FakeGateway(gateway_actions(archive, propose_candidate=True))
             second = FakeGateway(gateway_actions(archive, propose_candidate=False))
             common = dict(
-                sandbox=FakeSandboxBackend(),
+                sandbox=WritingFakeSandboxBackend(),
                 research=FakeResearch(),
                 knowledge=None,
                 skills=None,
@@ -265,15 +688,17 @@ class CyclePortsTests(unittest.TestCase):
                 ledger = root / "attribution_arms.jsonl"
                 self.assertEqual(len(ledger.read_text(encoding="utf-8").splitlines()), 2)
                 attribution = json.loads(artifacts.get(result2.attribution).decode("utf-8"))
-                self.assertEqual(attribution["report"]["disposition"], "confounded")
+                self.assertEqual(
+                    attribution["report"]["disposition"], "invalid-design"
+                )
+                self.assertEqual(attribution["report"]["observation_ids"], [])
                 self.assertTrue(result2.snapshot_id != result1.snapshot_id)
             finally:
                 dynamic.close()
                 store.close()
 
-    def test_forge_tolerates_empty_archives_object_from_model(self) -> None:
-        """A real model can serialize an empty archive set as {} instead of [];
-        the forge port must treat an empty mapping as declarative-only."""
+    def test_task_authoring_ignores_legacy_empty_archives_and_uses_workspace(self) -> None:
+        """Task registration is driven by the frozen Judge workspace, not archives."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = EventStore(root / "events.sqlite3")
@@ -297,7 +722,7 @@ class CyclePortsTests(unittest.TestCase):
                 submit("reflect-warrior", {"claims": []}),
                 submit("reflect-judge", {"claims": []}),
                 submit("reflect-prosecutor", {"claims": []}),
-                submit("council", {"proposal": "test the hypothesis", "agenda": []}),
+                submit("council", {"proposal": None, "agenda": []}),
                 submit(
                     "forged",
                     {
@@ -316,7 +741,7 @@ class CyclePortsTests(unittest.TestCase):
             ]
             gateway = FakeGateway(actions)
             common = dict(
-                sandbox=FakeSandboxBackend(),
+                sandbox=WritingFakeSandboxBackend(),
                 research=FakeResearch(),
                 knowledge=None,
                 skills=None,
@@ -343,7 +768,8 @@ class CyclePortsTests(unittest.TestCase):
                     for record in dynamic.records()
                     if record.origin is DynamicTaskOrigin.DYNAMIC
                 ]
-                self.assertEqual(dynamic_records, [])
+                self.assertEqual(len(dynamic_records), 1)
+                self.assertIs(dynamic_records[0].status, DynamicTaskStatus.QUARANTINED)
             finally:
                 dynamic.close()
                 store.close()
@@ -445,7 +871,7 @@ class CyclePortsTests(unittest.TestCase):
             submit("reflect-warrior", {"claims": []}),
             submit("reflect-judge", {"claims": []}),
             submit("reflect-prosecutor", {"claims": []}),
-            submit("council", {"proposal": "test the hypothesis", "agenda": []}),
+            submit("council", {"proposal": None, "agenda": []}),
             submit(
                 "forged",
                 {
@@ -461,14 +887,9 @@ class CyclePortsTests(unittest.TestCase):
                     "archives": [],
                 },
             ),
-            {
-                "action": "workspace.write",
-                "arguments": {
-                    "path": "tasks/python-deep-merge/solution.py",
-                    "content_base64": base64.b64encode(fixed_solution).decode("ascii"),
-                },
-            },
-            submit("solved", {"task_ids": [], "results": []}),
+            *paired_candidate_actions(
+                "tasks/candidate-fresh-probe/solution.py", fixed_solution
+            ),
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -476,13 +897,14 @@ class CyclePortsTests(unittest.TestCase):
             dynamic = DynamicTaskRegistry(root / "tasks.sqlite3")
             runner = AnchorRunner()
             GenesisSeeder(dynamic, TaskForge(dynamic)).seed(runner)
+            seed_fresh_candidate_probe(dynamic, runner, root)
             curriculum = CurriculumRegistry(store, "cli")
             roles = RoleRegistry(store, "cli")
             from aegis.evolution.registry import EvolutionRegistry
 
             evolution = EvolutionRegistry(store, "cli")
             artifacts = ContentAddressedArtifactStore(root / "artifacts")
-            sandbox = FakeSandboxBackend(
+            sandbox = WritingFakeSandboxBackend(
                 executor=recorder,
                 sealed_evaluator=sealed_evaluator,
             )
@@ -508,7 +930,7 @@ class CyclePortsTests(unittest.TestCase):
                 environment_builder=FakeEnvironmentBuilder(),
             )
             try:
-                result = run_v2_cycle(gateway=gateway, **common)
+                result = run_candidate_cycle(gateway=gateway, **common)
                 self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
                 active = roles.projection.current_active_set
                 self.assertIsNotNone(active)
@@ -642,7 +1064,7 @@ class CyclePortsTests(unittest.TestCase):
             submit("reflect-warrior", {"claims": []}),
             submit("reflect-judge", {"claims": []}),
             submit("reflect-prosecutor", {"claims": []}),
-            submit("council", {"proposal": "test the hypothesis", "agenda": []}),
+            submit("council", {"proposal": None, "agenda": []}),
             submit(
                 "forged",
                 {
@@ -658,14 +1080,9 @@ class CyclePortsTests(unittest.TestCase):
                     "archives": [],
                 },
             ),
-            {
-                "action": "workspace.write",
-                "arguments": {
-                    "path": "tasks/python-clamp-range/solution.py",
-                    "content_base64": base64.b64encode(fixed_solution).decode("ascii"),
-                },
-            },
-            submit("solved", {"task_ids": [], "results": []}),
+            *paired_candidate_actions(
+                "tasks/candidate-fresh-probe/solution.py", fixed_solution
+            ),
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -673,13 +1090,14 @@ class CyclePortsTests(unittest.TestCase):
             dynamic = DynamicTaskRegistry(root / "tasks.sqlite3")
             runner = AnchorRunner()
             GenesisSeeder(dynamic, TaskForge(dynamic)).seed(runner)
+            seed_fresh_candidate_probe(dynamic, runner, root)
             curriculum = CurriculumRegistry(store, "cli")
             roles = RoleRegistry(store, "cli")
             from aegis.evolution.registry import EvolutionRegistry
 
             evolution = EvolutionRegistry(store, "cli")
             artifacts = ContentAddressedArtifactStore(root / "artifacts")
-            sandbox = FakeSandboxBackend(
+            sandbox = WritingFakeSandboxBackend(
                 executor=recorder,
                 sealed_evaluator=sealed_evaluator,
             )
@@ -704,7 +1122,7 @@ class CyclePortsTests(unittest.TestCase):
                 evolution=evolution,
             )
             try:
-                result = run_v2_cycle(gateway=gateway, **common)
+                result = run_candidate_cycle(gateway=gateway, **common)
                 self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
                 active = roles.projection.current_active_set
                 self.assertIsNotNone(active)
@@ -717,6 +1135,20 @@ class CyclePortsTests(unittest.TestCase):
                 assert champion is not None
                 self.assertEqual(champion.surface.value, "plugin")
                 self.assertNotEqual(result.qualification.artifact_id, "")
+                candidate_evidence = json.loads(
+                    artifacts.get(result.candidate_evaluation).decode("utf-8")
+                )
+                self.assertEqual(
+                    [row["seed"] for row in candidate_evidence["arms"]["pairs"]],
+                    [0, 1],
+                )
+                self.assertEqual(
+                    candidate_evidence["candidate_gate"]["disposition"], "qualified"
+                )
+                self.assertEqual(
+                    [request.seed for request in gateway.requests][-8:],
+                    [0, 0, 0, 0, 1, 1, 1, 1],
+                )
 
                 second_gateway = FakeGateway(gateway_actions(b"", propose_candidate=False))
                 result2 = run_v2_cycle(gateway=second_gateway, **common)
@@ -849,7 +1281,7 @@ class CyclePortsTests(unittest.TestCase):
             submit("reflect-warrior", {"claims": []}),
             submit("reflect-judge", {"claims": []}),
             submit("reflect-prosecutor", {"claims": []}),
-            submit("council", {"proposal": "test the hypothesis", "agenda": []}),
+            submit("council", {"proposal": None, "agenda": []}),
             submit(
                 "forged",
                 {
@@ -865,14 +1297,9 @@ class CyclePortsTests(unittest.TestCase):
                     "archives": [],
                 },
             ),
-            {
-                "action": "workspace.write",
-                "arguments": {
-                    "path": "tasks/python-clamp-range/solution.py",
-                    "content_base64": base64.b64encode(fixed_solution).decode("ascii"),
-                },
-            },
-            submit("solved", {"task_ids": [], "results": []}),
+            *paired_candidate_actions(
+                "tasks/candidate-fresh-probe/solution.py", fixed_solution
+            ),
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -880,13 +1307,14 @@ class CyclePortsTests(unittest.TestCase):
             dynamic = DynamicTaskRegistry(root / "tasks.sqlite3")
             runner = AnchorRunner()
             GenesisSeeder(dynamic, TaskForge(dynamic)).seed(runner)
+            seed_fresh_candidate_probe(dynamic, runner, root)
             curriculum = CurriculumRegistry(store, "cli")
             roles = RoleRegistry(store, "cli")
             from aegis.evolution.registry import EvolutionRegistry
 
             evolution = EvolutionRegistry(store, "cli")
             artifacts = ContentAddressedArtifactStore(root / "artifacts")
-            sandbox = FakeSandboxBackend(
+            sandbox = WritingFakeSandboxBackend(
                 executor=recorder,
                 sealed_evaluator=sealed_evaluator,
             )
@@ -913,7 +1341,7 @@ class CyclePortsTests(unittest.TestCase):
                 source_commit="0" * 40,
             )
             try:
-                result = run_v2_cycle(gateway=gateway, **common)
+                result = run_candidate_cycle(gateway=gateway, **common)
                 self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
                 active = roles.projection.current_active_set
                 self.assertIsNotNone(active)
@@ -971,6 +1399,10 @@ class CyclePortsTests(unittest.TestCase):
             with (
                 redirect_stdout(output),
                 patch("aegis.cli.ModelGateway", return_value=gateway),
+                patch(
+                    "aegis.cli.FakeSandboxBackend",
+                    return_value=WritingFakeSandboxBackend(),
+                ),
                 patch("aegis.cli.SandboxTaskPackRunner", return_value=AnchorRunner()),
             ):
                 self.assertEqual(main([*argv, "evolution-cycle", "cli", "--run"]), 0)

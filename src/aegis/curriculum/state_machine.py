@@ -14,9 +14,11 @@ class CycleState(StrEnum):
     SUBMISSION_FROZEN = "submission_frozen"
     JUDGE_REVIEWED = "judge_reviewed"
     QUALITY_LOCKED = "quality_locked"
+    CURRICULUM_EVIDENCE_COMMITTED = "curriculum_evidence_committed"
     PROSECUTOR_AUDITED = "prosecutor_audited"
     INDEPENDENT_REFLECTIONS_RECORDED = "independent_reflections_recorded"
     COUNCIL_COMPLETED = "council_completed"
+    OBJECTIVE_GOVERNANCE_LOCKED = "objective_governance_locked"
     NEXT_TASKS_FORGED = "next_tasks_forged"
     TASKS_VALIDATED = "tasks_validated"
     CANDIDATES_EVALUATED = "candidates_evaluated"
@@ -49,9 +51,11 @@ _ORDER = (
     CycleState.SUBMISSION_FROZEN,
     CycleState.JUDGE_REVIEWED,
     CycleState.QUALITY_LOCKED,
+    CycleState.CURRICULUM_EVIDENCE_COMMITTED,
     CycleState.PROSECUTOR_AUDITED,
     CycleState.INDEPENDENT_REFLECTIONS_RECORDED,
     CycleState.COUNCIL_COMPLETED,
+    CycleState.OBJECTIVE_GOVERNANCE_LOCKED,
     CycleState.NEXT_TASKS_FORGED,
     CycleState.TASKS_VALIDATED,
     CycleState.CANDIDATES_EVALUATED,
@@ -69,7 +73,14 @@ _NAMED_FORWARD: dict[tuple[CycleState, str], CycleState] = {
     (CycleState.SOLUTIONS_COLLECTED, "freeze_submission"): CycleState.SUBMISSION_FROZEN,
     (CycleState.SUBMISSION_FROZEN, "record_judge_review"): CycleState.JUDGE_REVIEWED,
     (CycleState.JUDGE_REVIEWED, "lock_quality"): CycleState.QUALITY_LOCKED,
-    (CycleState.QUALITY_LOCKED, "record_prosecutor_audit"): CycleState.PROSECUTOR_AUDITED,
+    (
+        CycleState.QUALITY_LOCKED,
+        "commit_curriculum_evidence",
+    ): CycleState.CURRICULUM_EVIDENCE_COMMITTED,
+    (
+        CycleState.CURRICULUM_EVIDENCE_COMMITTED,
+        "record_prosecutor_audit",
+    ): CycleState.PROSECUTOR_AUDITED,
     (
         CycleState.PROSECUTOR_AUDITED,
         "record_independent_reflections",
@@ -78,7 +89,14 @@ _NAMED_FORWARD: dict[tuple[CycleState, str], CycleState] = {
         CycleState.INDEPENDENT_REFLECTIONS_RECORDED,
         "complete_council",
     ): CycleState.COUNCIL_COMPLETED,
-    (CycleState.COUNCIL_COMPLETED, "complete_task_forge"): CycleState.NEXT_TASKS_FORGED,
+    (
+        CycleState.COUNCIL_COMPLETED,
+        "lock_objective_governance",
+    ): CycleState.OBJECTIVE_GOVERNANCE_LOCKED,
+    (
+        CycleState.OBJECTIVE_GOVERNANCE_LOCKED,
+        "complete_task_forge",
+    ): CycleState.NEXT_TASKS_FORGED,
     (CycleState.NEXT_TASKS_FORGED, "complete_task_validation"): CycleState.TASKS_VALIDATED,
     (CycleState.TASKS_VALIDATED, "evaluate_candidates"): CycleState.CANDIDATES_EVALUATED,
     (CycleState.CANDIDATES_EVALUATED, "lock_attribution"): CycleState.ATTRIBUTION_LOCKED,

@@ -13,6 +13,7 @@ from aegis.curriculum import (
     CurriculumRegistry,
     CurriculumSnapshot,
     CycleState,
+    ObjectiveSuccessCriterion,
     ObjectiveVersion,
     RoleVersionIdentity,
 )
@@ -51,6 +52,14 @@ class Ports:
         self.order.append("quality")
         return {"score": 0.8, "locked": True}
 
+    def commit_curriculum_evidence(self, snapshot, cohort, quality_lock):
+        self.order.append("curriculum-evidence")
+        return {
+            "cohort": cohort.cohort_id,
+            "quality_lock": quality_lock.artifact_id,
+            "committed": True,
+        }
+
     def audit(self, snapshot, submission, judge_review, quality_lock):
         self.order.append("prosecutor")
         return {"usage_verified": True, "curriculum": ["test a new hypothesis"]}
@@ -59,9 +68,19 @@ class Ports:
         self.order.append(f"reflect:{role.value}")
         return {"role": role.value, "claims": []}
 
-    def deliberate(self, snapshot, reflections):
+    def deliberate(
+        self, snapshot, reflections, submission, judge_review, prosecutor_audit
+    ):
         self.order.append("council")
         return {"proposal": "next experiment", "reflections": [item.artifact_id for item in reflections]}
+
+    def govern_objective(self, snapshot, cohort, submission, council, quality_lock):
+        self.order.append("objective-governance")
+        return {
+            "admitted": False,
+            "reason": "insufficient history",
+            "council": council.artifact_id,
+        }
 
     def forge_next_tasks(self, snapshot, submission, judge_review, quality_lock, prosecutor_audit, council):
         self.order.append("forge")
@@ -76,7 +95,9 @@ class Ports:
         snapshot,
         cohort,
         submission,
+        judge_review,
         prosecutor_audit,
+        council,
         quality_lock,
         task_validation,
     ):
@@ -95,7 +116,8 @@ class Ports:
         self.order.append("attribution")
         return {"qualified_coordinates": ["warrior"]}
 
-    def qualify_role_candidates(self, snapshot, attribution):
+    def qualify_role_candidates(self, snapshot, candidate_evaluation, attribution):
+        del candidate_evaluation
         self.order.append("qualify")
         return {"qualified": ["warrior-v2"]}
 
@@ -112,8 +134,9 @@ def setup_runtime(root: Path):
         1,
         constitution.constitution_id,
         "Improve dynamic software engineering capability.",
-        ("Improve delayed holdout quality.",),
+        (ObjectiveSuccessCriterion("quality", 0.5),),
         ("python",),
+        {"quality": 1, "generalization": 1, "retention": 1, "efficiency": 1},
     )
     identities = {
         role: RoleVersionIdentity(
@@ -175,15 +198,17 @@ def test_full_cycle_locks_quality_before_audit_and_council_before_next_tasks() -
                 "warrior",
                 "judge",
                 "quality",
+                "curriculum-evidence",
                 "prosecutor",
                 "reflect:warrior",
                 "reflect:judge",
                 "reflect:prosecutor",
                 "council",
-                    "forge",
-                    "validate",
-                    "candidate-eval",
-                    "attribution",
+                "objective-governance",
+                "forge",
+                "validate",
+                "candidate-eval",
+                "attribution",
                 "qualify",
                 "activate",
             ]
