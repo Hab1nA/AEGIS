@@ -200,7 +200,7 @@ from aegis.runtime_ledger import (
 from aegis.runtime_policy import RuntimePolicyRegistry, RuntimeStageBoundary
 from aegis.sandbox.backend import SandboxBackend
 from aegis.subagents import SubagentLimits, SubagentManager
-from aegis.taskpacks.manifest import TaskPack
+from aegis.taskpacks.manifest import TaskPack, compute_tree_hash
 from aegis.taskpacks.validation import TaskPackRunner, validate_taskpack
 
 _FORBIDDEN_KEYS = frozenset(
@@ -411,6 +411,49 @@ def _extract_frozen_workspace(payload: bytes, destination: Path) -> None:
             archive.extractall(destination, filter="data")
     except (tarfile.TarError, OSError) as exc:
         raise ValueError("task-authoring workspace is not a valid archive") from exc
+
+
+def _repair_taskpack_content_hash(root: Path) -> bool:
+    """Recompute the derived content hash a model cannot reliably predict.
+
+    The tree hash is integrity metadata over everything except manifest.json
+    itself; the model writes the tree, so the control plane derives the hash
+    instead of trusting a model-provided value.  The manifest must already be
+    structurally complete (all non-hash fields correct) for this to apply.
+    """
+
+    manifest_path = root / "manifest.json"
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    required = {
+        "task_id",
+        "version",
+        "language",
+        "public_dir",
+        "hidden_dir",
+        "reference_dir",
+        "defect_dir",
+        "mutant_dirs",
+    }
+    if set(raw) != required | {"content_hash"}:
+        return False
+    try:
+        digest = compute_tree_hash(root, exclude=frozenset({"manifest.json"}))
+    except (ValueError, OSError):
+        return False
+    raw["content_hash"] = digest
+    try:
+        manifest_path.write_text(
+            json.dumps(raw, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        return False
+    return True
 
 
 def _draft_taskpack_roots(root: Path) -> tuple[Path, ...]:
@@ -2017,8 +2060,10 @@ class ModelCyclePorts:
                     "can inspect, then submit a JSON summary listing the written draft paths.  "
                     "You MUST materialize every file in the sandbox workspace using the "
                     "workspace.write action with path and base64 content; a description of the "
-                    "files in the JSON response is not acceptable. Do not embed archives or "
-                    "source files in the JSON response."
+                    "files in the JSON response is not acceptable. Write manifest.json exactly "
+                    "per the provided manifest_schema (the control plane recomputes "
+                    "content_hash), and lay out files per the provided layout. Do not embed "
+                    "archives or source files in the JSON response."
                 ),
                 context={
                     "snapshot": _truncate(snapshot.to_mapping()),
@@ -2032,6 +2077,27 @@ class ModelCyclePorts:
                     "taskpack_contract": {
                         "language": "python",
                         "root": "drafts/<task_id>",
+                        "layout": [
+                            "manifest.json",
+                            "prompt.md",
+                            "public/cases.json",
+                            "public/test_solution.py",
+                            "hidden/cases.json",
+                            "reference/solution.py",
+                            "defect/solution.py",
+                            "mutants/<name>/solution.py",
+                        ],
+                        "manifest_schema": {
+                            "task_id": "python-<slug>",
+                            "version": 1,
+                            "language": "python",
+                            "public_dir": "public",
+                            "hidden_dir": "hidden",
+                            "reference_dir": "reference",
+                            "defect_dir": "defect",
+                            "mutant_dirs": ["mutants/<name>"],
+                            "content_hash": "<sha256 hex computed over every file except manifest.json>",
+                        },
                         "required": [
                             "manifest.json",
                             "prompt.md",
@@ -2083,6 +2149,7 @@ class ModelCyclePorts:
                 return [], ["no drafts/<task_id>/manifest.json was written"]
             for draft_root in roots[:_MAX_PROPOSALS]:
                 try:
+                    _repair_taskpack_content_hash(draft_root)
                     pack = TaskPack.load(draft_root)
                     report = validate_taskpack(pack, self._runner)
                     item = {
@@ -2239,6 +2306,7 @@ class ModelCyclePorts:
                 }
             for draft_root in draft_roots[:_MAX_PROPOSALS]:
                 try:
+                    _repair_taskpack_content_hash(draft_root)
                     pack = TaskPack.load(draft_root)
                     record = self._forge.forge(
                         pack,
@@ -2272,7 +2340,14 @@ class ModelCyclePorts:
                 for item in rejected
                 for reason in cast(Sequence[object], item.get("reasons", ()))
             )
-            raise ValueError(f"Judge produced no valid executable task-pack: {reasons[:4096]}")
+            return {
+                "valid": True,
+                "registered": [],
+                "rejected": rejected,
+                "declarative_only": False,
+                "no_tasks_authored": True,
+                "authoring_reasons": reasons[:4096],
+            }
         return {
             "valid": True,
             "registered": registered,

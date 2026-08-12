@@ -18,7 +18,11 @@ from aegis.artifacts import ContentAddressedArtifactStore
 from aegis.cli import main
 from aegis.config import RoleConfig
 from aegis.curriculum import CurriculumRegistry, CycleState
-from aegis.cycle_ports import ModelCyclePorts, run_v2_cycle
+from aegis.cycle_ports import (
+    ModelCyclePorts,
+    _repair_taskpack_content_hash,
+    run_v2_cycle,
+)
 from aegis.dynamic_tasks import (
     DynamicTaskOrigin,
     DynamicTaskRegistry,
@@ -342,6 +346,31 @@ def role_configs() -> dict[str, RoleConfig]:
 
 
 class CyclePortsTests(unittest.TestCase):
+    def test_taskpack_content_hash_is_recomputed_by_control_plane(self) -> None:
+        """A structurally complete manifest with a wrong hash is repaired."""
+        source = Path("taskpacks/python/01_clamp_range")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = root / "pack"
+            shutil.copytree(source, pack)
+            manifest = pack / "manifest.json"
+            raw = json.loads(manifest.read_text(encoding="utf-8"))
+            raw["content_hash"] = "0" * 64
+            manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+            self.assertTrue(_repair_taskpack_content_hash(pack))
+            from aegis.taskpacks.manifest import TaskPack
+
+            restored = TaskPack.load(pack)
+            self.assertNotEqual(restored.manifest.content_hash, "0" * 64)
+
+            incomplete = root / "incomplete"
+            incomplete.mkdir()
+            (incomplete / "manifest.json").write_text(
+                '{"task_id":"x","language":"python"}', encoding="utf-8"
+            )
+            self.assertFalse(_repair_taskpack_content_hash(incomplete))
+
     def test_mcp_candidate_requires_two_sealed_cycles_before_activation(self) -> None:
         WritingFakeSandboxBackend._pending_task_files.clear()
         WritingFakeSandboxBackend._latest = None
