@@ -22,7 +22,7 @@ import threading
 from contextvars import ContextVar
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence, cast
 
 from aegis.activation import (
@@ -200,6 +200,7 @@ from aegis.runtime_ledger import (
 from aegis.runtime_policy import RuntimePolicyRegistry, RuntimeStageBoundary
 from aegis.sandbox.backend import SandboxBackend
 from aegis.subagents import SubagentLimits, SubagentManager
+from aegis.taskpacks.builtin import builtin_python_root
 from aegis.taskpacks.manifest import TaskPack, compute_tree_hash
 from aegis.taskpacks.validation import TaskPackRunner, validate_taskpack
 
@@ -465,6 +466,41 @@ def _draft_taskpack_roots(root: Path) -> tuple[Path, ...]:
         for path in sorted(drafts.glob("*/manifest.json"), key=lambda item: item.as_posix())
         if path.is_file() and not path.is_symlink()
     )
+
+
+def _task_authoring_seed_workspace() -> bytes:
+    """Package one complete built-in task pack as a read-only authoring template.
+
+    The Judge is asked to copy this exact structure into ``drafts/<task_id>/``;
+    placing the template under ``templates/`` keeps it out of the draft
+    discovery roots so an unmodified template is never registered as a task.
+    """
+
+    sample = builtin_python_root() / "01_clamp_range"
+    if not sample.is_dir():
+        raise ValueError("built-in task-authoring template is missing")
+    entries: dict[str, bytes] = {}
+    for path in sorted(sample.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(sample).as_posix()
+        if any(
+            part in {"__pycache__", ".pytest_cache", ".git", ".aegis"}
+            for part in PurePosixPath(relative).parts
+        ):
+            continue
+        entries[f"templates/example-task/{relative}"] = path.read_bytes()
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for name in sorted(entries):
+            payload = entries[name]
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            info.mode = 0o644
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            archive.addfile(info, io.BytesIO(payload))
+    return output.getvalue()
 
 
 def _arm_evaluation_mapping(evaluation: Any) -> Mapping[str, Any]:
@@ -2065,8 +2101,11 @@ class ModelCyclePorts:
                     "workspace.write action with path and base64 content; a description of the "
                     "files in the JSON response is not acceptable. Write manifest.json exactly "
                     "per the provided manifest_schema (the control plane recomputes "
-                    "content_hash), and lay out files per the provided layout. Do not embed "
-                    "archives or source files in the JSON response."
+                    "content_hash), and lay out files per the provided layout. The workspace "
+                    "contains a complete working template under templates/example-task/; read "
+                    "it with workspace.read, then copy and adapt that exact structure to "
+                    "drafts/<task_id>/ with workspace.write. Do not embed archives or source "
+                    "files in the JSON response."
                 ),
                 context={
                     "snapshot": _truncate(snapshot.to_mapping()),
@@ -2115,6 +2154,7 @@ class ModelCyclePorts:
                 freeze_workspace=True,
                 extra_actions=frozenset({"workspace.write"}),
                 freeze_max_bytes=128 * 1024 * 1024,
+                stage_workspace=_task_authoring_seed_workspace(),
             )
             drafts, repair_feedback = self._inspect_authored_tasks(evidence)
             if any(bool(item.get("valid")) for item in drafts):
