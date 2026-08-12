@@ -116,7 +116,7 @@ class GatewayConfig:
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    max_attempts: int = 3
+    max_attempts: int = 6
     base_delay_seconds: float = 0.5
     max_delay_seconds: float = 4.0
 
@@ -289,6 +289,11 @@ class ModelGateway:
                 last_error = exc
                 if attempt + 1 >= self._retry.max_attempts:
                     raise GatewayError("model relay unavailable after retries") from exc
+            except GatewayTruncationError as exc:
+                self._finish_attempt(lifecycle, None, exc)
+                last_error = exc
+                if attempt + 1 >= self._retry.max_attempts:
+                    raise
             except Exception as exc:
                 self._finish_attempt(lifecycle, None, exc)
                 raise

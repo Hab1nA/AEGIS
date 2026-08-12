@@ -242,7 +242,11 @@ class GatewayTests(unittest.TestCase):
         )
 
         with self.assertRaises(GatewayTruncationError) as raised:
-            ModelGateway(config, transport=transport).complete(request)
+            ModelGateway(
+                config,
+                transport=transport,
+                retry=RetryPolicy(max_attempts=1),
+            ).complete(request)
 
         self.assertIsNotNone(raised.exception.usage)
         self.assertEqual(raised.exception.usage.output_tokens, 200)
@@ -264,7 +268,11 @@ class GatewayTests(unittest.TestCase):
         )
 
         with self.assertRaises(GatewayTruncationError):
-            ModelGateway(config, transport=transport).complete(request)
+            ModelGateway(
+                config,
+                transport=transport,
+                retry=RetryPolicy(max_attempts=1),
+            ).complete(request)
 
     def test_explicit_responses_protocol_does_not_fallback(self) -> None:
         config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="responses")

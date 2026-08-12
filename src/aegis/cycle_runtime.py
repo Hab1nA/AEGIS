@@ -300,6 +300,7 @@ class EvolutionCycleController:
                 "record_prosecutor_audit", evidence_id=prosecutor_audit.artifact_id
             )
 
+            current_stage = "reflection"
             reflections = tuple(
                 self._record(
                     "reflection",
@@ -322,6 +323,7 @@ class EvolutionCycleController:
                 "record_independent_reflections", evidence_id=reflection_index.artifact_id
             )
 
+            current_stage = "council"
             council = self._record(
                 "council",
                 self._ports.council.deliberate(
@@ -334,6 +336,7 @@ class EvolutionCycleController:
             )
             self._registry.transition_cycle("complete_council", evidence_id=council.artifact_id)
 
+            current_stage = "objective-governance"
             objective_governance = self._record(
                 "objective-governance",
                 self._ports.council.govern_objective(
@@ -345,6 +348,7 @@ class EvolutionCycleController:
                 evidence_id=objective_governance.artifact_id,
             )
 
+            current_stage = "task-forge"
             forged_tasks = self._record(
                 "task-forge",
                 self._ports.judge.forge_next_tasks(
@@ -360,6 +364,7 @@ class EvolutionCycleController:
                 "complete_task_forge", evidence_id=forged_tasks.artifact_id
             )
 
+            current_stage = "task-validation"
             task_validation = self._record(
                 "task-validation",
                 self._ports.evolution.validate_forged_tasks(snapshot, forged_tasks),
@@ -368,6 +373,7 @@ class EvolutionCycleController:
                 "complete_task_validation", evidence_id=task_validation.artifact_id
             )
 
+            current_stage = "candidate-evaluation"
             candidate_evaluation = self._record(
                 "candidate-evaluation",
                 self._ports.evolution.evaluate_candidates(
@@ -385,6 +391,7 @@ class EvolutionCycleController:
                 "evaluate_candidates", evidence_id=candidate_evaluation.artifact_id
             )
 
+            current_stage = "attribution"
             attribution = self._record(
                 "attribution",
                 self._ports.evolution.lock_attribution(
@@ -398,6 +405,7 @@ class EvolutionCycleController:
             )
             self._registry.transition_cycle("lock_attribution", evidence_id=attribution.artifact_id)
 
+            current_stage = "qualification"
             qualification = self._record(
                 "qualification",
                 self._ports.evolution.qualify_role_candidates(
@@ -454,6 +462,7 @@ class EvolutionCycleController:
                         "outcome_class": classify_exception(current_stage).value,
                         "stage": current_stage,
                         "error_type": type(exc).__name__,
+                        "error_message": str(exc)[:2000],
                     },
                 )
                 self._registry.transition_cycle(

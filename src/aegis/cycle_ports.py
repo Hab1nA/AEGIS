@@ -404,9 +404,9 @@ def _extract_frozen_workspace(payload: bytes, destination: Path) -> None:
     try:
         with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
             members = archive.getmembers()
-            if not members or len(members) > 1024:
+            if len(members) > 4096:
                 raise ValueError("task-authoring workspace has an invalid file count")
-            if sum(max(0, item.size) for item in members) > 32 * 1024 * 1024:
+            if sum(max(0, item.size) for item in members) > 128 * 1024 * 1024:
                 raise ValueError("task-authoring workspace exceeds the expanded size limit")
             archive.extractall(destination, filter="data")
     except (tarfile.TarError, OSError) as exc:
@@ -895,6 +895,7 @@ class ModelCyclePorts:
         accounting_stage: str | None = None,
         paired_design_id: str | None = None,
         required_action_groups: tuple[frozenset[str], ...] = (),
+        freeze_max_bytes: int | None = None,
     ) -> Mapping[str, Any]:
         with self._sandbox_lock:
             self._sandbox_sequence += 1
@@ -1041,7 +1042,13 @@ class ModelCyclePorts:
                 evidence["workspace_digest"] = workspace_digest
                 evidence["workspace_staged"] = True
             if freeze_workspace:
-                digest, payload = freeze_workspace_bytes(self._sandbox, sandbox_id)
+                digest, payload = freeze_workspace_bytes(
+                    self._sandbox,
+                    sandbox_id,
+                    max_bytes=freeze_max_bytes
+                    if freeze_max_bytes is not None
+                    else 32 * 1024 * 1024,
+                )
                 ref = self._artifacts.put_bytes("arm-workspace", payload)
                 workspace_digest = digest
                 evidence["workspace_digest"] = digest
@@ -1203,7 +1210,11 @@ class ModelCyclePorts:
                 "the public tests under tasks/<task_id>/tests/public, then submit one JSON payload "
                 "binding per-task artifact_id, solution summary, and public-test results.  Partial "
                 "or imperfect solutions are acceptable and required to advance the cycle; never "
-                "exceed the step budget without submitting."
+                "exceed the step budget without submitting.  If you identify a concrete, minimal, "
+                "safe improvement to the harness cycle code that would help future runs, call "
+                "aegis.propose_harness_change with base_commit and checkpoint_ref from the "
+                "snapshot harness source and a bounded changes array; a proposal is candidate-only "
+                "and never writes the host directly."
             ),
             context={
                 "snapshot": _truncate(snapshot_context),
@@ -1443,12 +1454,15 @@ class ModelCyclePorts:
             amendment = self._parse_objective_amendment(snapshot, repaired_payload)
 
         proposal_id = amendment.proposal_id
+        proposal_summary = (
+            amendment.rationale.strip() or "objective amendment proposed"
+        )
         proposal_message = CouncilMessage(
             cycle_id,
             Role.PROSECUTOR,
             CouncilMessageType.PROPOSAL,
             (),
-            amendment.rationale,
+            proposal_summary,
             proposal_id=proposal_id,
             proposal_kind=CouncilProposalKind.OBJECTIVE_AMENDMENT,
         )
@@ -1467,7 +1481,7 @@ class ModelCyclePorts:
                     "messages": [item.to_mapping() for item in transcript.messages],
                 },
             )
-            summary = str(evidence.get("summary", "")).strip()
+            summary = str(evidence.get("summary", "")).strip() or "critique recorded"
             critique = CouncilMessage(
                 cycle_id,
                 role,
@@ -1495,12 +1509,15 @@ class ModelCyclePorts:
             decision = SupportDecision(
                 str(vote_evidence.get("submission", {}).get("decision", "abstain"))
             )
+            vote_summary = (
+                str(vote_evidence.get("summary", "")).strip() or "vote recorded"
+            )
             vote = CouncilMessage(
                 cycle_id,
                 role,
                 CouncilMessageType.SUPPORT,
                 (),
-                str(vote_evidence.get("summary", "vote recorded")).strip(),
+                vote_summary,
                 proposal_id=proposal_id,
                 support=decision,
             )
@@ -1998,7 +2015,10 @@ class ModelCyclePorts:
                     "separate public and hidden pytest suites, a passing reference solution, "
                     "a known-defect solution and at least one mutant.  Run the public checks you "
                     "can inspect, then submit a JSON summary listing the written draft paths.  "
-                    "Do not embed archives or source files in the JSON response."
+                    "You MUST materialize every file in the sandbox workspace using the "
+                    "workspace.write action with path and base64 content; a description of the "
+                    "files in the JSON response is not acceptable. Do not embed archives or "
+                    "source files in the JSON response."
                 ),
                 context={
                     "snapshot": _truncate(snapshot.to_mapping()),
@@ -2025,6 +2045,7 @@ class ModelCyclePorts:
                 },
                 freeze_workspace=True,
                 extra_actions=frozenset({"workspace.write"}),
+                freeze_max_bytes=128 * 1024 * 1024,
             )
             drafts, repair_feedback = self._inspect_authored_tasks(evidence)
             if any(bool(item.get("valid")) for item in drafts):
@@ -2209,7 +2230,13 @@ class ModelCyclePorts:
             _extract_frozen_workspace(payload, root)
             draft_roots = _draft_taskpack_roots(root)
             if not draft_roots:
-                raise ValueError("Judge task authoring produced no task-pack drafts")
+                return {
+                    "valid": True,
+                    "registered": [],
+                    "rejected": [],
+                    "declarative_only": False,
+                    "no_tasks_authored": True,
+                }
             for draft_root in draft_roots[:_MAX_PROPOSALS]:
                 try:
                     pack = TaskPack.load(draft_root)

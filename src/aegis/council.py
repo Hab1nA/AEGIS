@@ -409,7 +409,14 @@ class CouncilOutcome:
             raise CouncilProtocolError("messages must be a tuple of CouncilMessage values")
         if any(item.cycle_id != self.cycle_id for item in self.messages):
             raise CouncilProtocolError("council outcome contains a message from another cycle")
-        transcript = CouncilTranscript(self.cycle_id)
+        transcript = CouncilTranscript(
+            self.cycle_id,
+            max_messages=len(self.messages) + 1,
+            max_tokens=sum(
+                item.token_usage for item in self.messages
+            )
+            + 1,
+        )
         for message in self.messages:
             transcript.append(message)
         if self.amendment is not None and not isinstance(self.amendment, ObjectiveAmendment):
