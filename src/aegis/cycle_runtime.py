@@ -119,6 +119,12 @@ class EvolutionCyclePort(Protocol):
         task_validation: ArtifactRef,
     ) -> Mapping[str, Any]: ...
 
+    def commit_holdout_evidence(
+        self,
+        snapshot: CurriculumSnapshot,
+        cohort: DynamicTaskCohort,
+    ) -> Mapping[str, Any]: ...
+
     def lock_attribution(
         self,
         snapshot: CurriculumSnapshot,
@@ -389,6 +395,12 @@ class EvolutionCycleController:
             )
             self._registry.transition_cycle(
                 "evaluate_candidates", evidence_id=candidate_evaluation.artifact_id
+            )
+
+            current_stage = "holdout-commit"
+            self._record(
+                "holdout-commit",
+                self._ports.evolution.commit_holdout_evidence(snapshot, cohort),
             )
 
             current_stage = "attribution"

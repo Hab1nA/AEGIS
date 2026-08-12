@@ -253,6 +253,10 @@ def run_candidate_cycle(**kwargs):
         ModelCyclePorts,
         "commit_curriculum_evidence",
         return_value={"transitions": [], "deferred_for_candidate_test": True},
+    ), patch.object(
+        ModelCyclePorts,
+        "commit_holdout_evidence",
+        return_value={"transitions": [], "deferred_for_candidate_test": True},
     ):
         return run_v2_cycle(**kwargs)
 

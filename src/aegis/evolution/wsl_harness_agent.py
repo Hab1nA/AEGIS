@@ -42,7 +42,7 @@ _SECRET_NAME = re.compile(
 )
 _SECRET_CONTENT = re.compile(
     rb"(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|"
-    rb"AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[opsu]_[A-Za-z0-9]{24,})"
+    rb"AKIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9]{40,}|gh[opsu]_[A-Za-z0-9]{24,})"
 )
 _MAX_FILE_BYTES = 4 * 1024 * 1024
 _MAX_TOTAL_BYTES = 128 * 1024 * 1024

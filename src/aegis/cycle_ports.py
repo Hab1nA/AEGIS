@@ -2298,6 +2298,61 @@ class ModelCyclePorts:
                     "validation": _taskpack_validation_mapping(report),
                 },
             )
+            transitions.append(
+                {
+                    "artifact_id": member.artifact_id,
+                    "status": current.status.value,
+                    "validation_reasons": list(report.reasons),
+                    "validation_evidence_id": validation_ref.artifact_id,
+                    "replayed": False,
+                }
+            )
+        return {
+            "snapshot_id": snapshot.snapshot_id,
+            "quality_evidence_id": quality_lock.artifact_id,
+            "transitions": transitions,
+        }
+
+    def commit_holdout_evidence(
+        self,
+        snapshot: CurriculumSnapshot,
+        cohort: DynamicTaskCohort,
+    ) -> Mapping[str, Any]:
+        """Promote Fresh tasks only after the sealed candidate evaluation ran.
+
+        Fresh holdout tasks must remain quarantined for the whole cycle so the
+        candidate gate can use them as the sealed evaluation cohort; promoting
+        them earlier would leave every later cycle without Fresh evidence.
+        """
+
+        transitions: list[Mapping[str, Any]] = []
+        for member in cohort.members:
+            if member.tier is not CohortTier.FRESH_HOLDOUT:
+                continue
+            current = self._dynamic.record(member.artifact_id)
+            if current.status is not DynamicTaskStatus.QUARANTINED:
+                transitions.append(
+                    {
+                        "artifact_id": member.artifact_id,
+                        "status": current.status.value,
+                        "replayed": True,
+                    }
+                )
+                continue
+            archive = self._dynamic.archive(member.artifact_id)
+            with tempfile.TemporaryDirectory(prefix="aegis-holdout-commit-") as directory:
+                root = Path(directory).resolve(strict=True)
+                self._forge._extract_untrusted_archive(archive, root)
+                pack = TaskPack.load(root)
+                report = validate_taskpack(pack, self._runner)
+            validation_ref = self._artifacts.put_json(
+                "holdout-validation",
+                {
+                    "artifact_id": member.artifact_id,
+                    "snapshot_id": snapshot.snapshot_id,
+                    "validation": _taskpack_validation_mapping(report),
+                },
+            )
             held = self._dynamic.record_holdout(
                 member.artifact_id,
                 evaluated_generation=cohort.target_generation,
@@ -2313,14 +2368,11 @@ class ModelCyclePorts:
                 {
                     "artifact_id": member.artifact_id,
                     "status": held.status.value,
-                    "validation_reasons": list(report.reasons),
-                    "validation_evidence_id": validation_ref.artifact_id,
                     "replayed": False,
                 }
             )
         return {
             "snapshot_id": snapshot.snapshot_id,
-            "quality_evidence_id": quality_lock.artifact_id,
             "transitions": transitions,
         }
 

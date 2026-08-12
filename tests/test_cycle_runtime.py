@@ -104,6 +104,10 @@ class Ports:
         self.order.append("candidate-eval")
         return {"enabled": True, "candidate": None, "report": None}
 
+    def commit_holdout_evidence(self, snapshot, cohort):
+        self.order.append("holdout-commit")
+        return {"snapshot_id": snapshot.snapshot_id, "transitions": []}
+
     def lock_attribution(
         self,
         snapshot,
@@ -206,9 +210,10 @@ def test_full_cycle_locks_quality_before_audit_and_council_before_next_tasks() -
                 "council",
                 "objective-governance",
                 "forge",
-                "validate",
-                "candidate-eval",
-                "attribution",
+                    "validate",
+                    "candidate-eval",
+                    "holdout-commit",
+                    "attribution",
                 "qualify",
                 "activate",
             ]
