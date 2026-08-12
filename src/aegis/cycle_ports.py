@@ -939,6 +939,7 @@ class ModelCyclePorts:
         paired_design_id: str | None = None,
         required_action_groups: tuple[frozenset[str], ...] = (),
         freeze_max_bytes: int | None = None,
+        restrict_actions: frozenset[str] | None = None,
     ) -> Mapping[str, Any]:
         with self._sandbox_lock:
             self._sandbox_sequence += 1
@@ -988,6 +989,7 @@ class ModelCyclePorts:
             "subagent_manager": self._subagent_manager,
             "meta_evolution_enabled": self._meta_evolution_enabled,
             "runtime_policy_adjuster": self._adjust_runtime_policy,
+            "allowed_actions_override": restrict_actions,
         }
         broker_tuple = self._broker_for_binding(role, binding, sandbox_id)
         if broker_tuple is not None:
@@ -1377,6 +1379,7 @@ class ModelCyclePorts:
                 "Prepare an independent, role-scoped reflection for the council: what worked, "
                 "what should change, and which next hypothesis deserves a test."
             ),
+            restrict_actions=frozenset({"submit", "strategy.propose"}),
             context={
                 "snapshot": _truncate(snapshot.to_mapping()),
                 "submission": _brief(self._artifacts, submission),

@@ -564,6 +564,7 @@ class ToolDispatcher:
         pdf_extractor: PDFExtractor | None = None,
         disabled_actions: frozenset[str] = frozenset(),
         extra_actions: frozenset[str] = frozenset(),
+        allowed_actions_override: frozenset[str] | None = None,
         role_generation_id: str | None = None,
         plugin_manifests: tuple[PluginManifest, ...] = (),
         tool_broker: ToolBroker | None = None,
@@ -588,12 +589,23 @@ class ToolDispatcher:
             raise ValueError("disabled_actions must be a frozenset of known actions")
         if not isinstance(extra_actions, frozenset) or not extra_actions <= known_actions:
             raise ValueError("extra_actions must be a frozenset of known actions")
+        if allowed_actions_override is not None and (
+            not isinstance(allowed_actions_override, frozenset)
+            or not allowed_actions_override <= known_actions
+        ):
+            raise ValueError("allowed_actions_override must be a frozenset of known actions")
+        if (
+            allowed_actions_override is not None
+            and "submit" not in allowed_actions_override
+        ):
+            raise ValueError("allowed_actions_override must keep submit enabled")
         if disabled_actions & extra_actions:
             raise ValueError("an action cannot be both disabled and explicitly enabled")
         if "submit" in disabled_actions:
             raise ValueError("submit cannot be disabled")
         self._disabled_actions = disabled_actions
         self._extra_actions = extra_actions
+        self._allowed_actions_override = allowed_actions_override
         self._role_generation_id = role_generation_id
         self._tool_broker = tool_broker
         self._mcp_bridge = mcp_bridge
@@ -664,9 +676,12 @@ class ToolDispatcher:
         return result
 
     def allowed_actions(self, role: Role) -> frozenset[str]:
-        return (
+        base = (
             (_PERMISSIONS[role] | self._extra_actions) - self._disabled_actions
         ) | frozenset(self._plugin_actions[role])
+        if self._allowed_actions_override is not None:
+            return base & self._allowed_actions_override
+        return base
 
     def plugin_action_schemas(self, role: Role) -> Mapping[str, Mapping[str, Any]]:
         return {

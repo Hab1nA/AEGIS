@@ -4,7 +4,7 @@
   "max_rounds": 500,
   "total_tokens": 50000000,
   "max_requests": 20000,
-  "wall_time_seconds": 28800,
+  "wall_time_seconds": 86400,
   "max_agent_steps": 20,
   "research_enabled": true,
   "offline_research": false,
@@ -16,17 +16,20 @@
     "warrior": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.55,
-      "max_output_tokens": 32768
+      "max_output_tokens": 16384,
+      "reasoning_effort": "low"
     },
     "judge": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
-      "max_output_tokens": 32768
+      "max_output_tokens": 16384,
+      "reasoning_effort": "low"
     },
     "prosecutor": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
-      "max_output_tokens": 32768
+      "max_output_tokens": 16384,
+      "reasoning_effort": "low"
     }
   },
   "autonomy_v2": {
