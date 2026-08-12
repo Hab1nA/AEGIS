@@ -2300,7 +2300,7 @@ class ModelCyclePorts:
             )
             held = self._dynamic.record_holdout(
                 member.artifact_id,
-                evaluated_generation=snapshot.cycle_number,
+                evaluated_generation=cohort.target_generation,
                 accepted=report.valid,
                 evidence_id=validation_ref.artifact_id,
                 expected_revision=current.revision,
