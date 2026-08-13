@@ -1,4 +1,4 @@
-"""OpenAI-compatible gateway that always forces JSON-formatted model output."""
+"""OpenAI-compatible gateway that always forces json_object output."""
 
 from __future__ import annotations
 
@@ -36,7 +36,6 @@ class GatewayConfig:
     timeout_seconds: float = 900.0
     allow_insecure_loopback: bool = False
     protocol: Literal["auto", "responses", "chat"] = "auto"
-    structured_format: Literal["auto", "json_schema", "json_object"] = "auto"
 
     def __post_init__(self) -> None:
         parsed = urllib.parse.urlsplit(self.base_url)
@@ -61,16 +60,13 @@ class GatewayConfig:
             raise ValueError("timeout_seconds must be positive")
         if self.protocol not in {"auto", "responses", "chat"}:
             raise ValueError("protocol must be 'auto', 'responses', or 'chat'")
-        if self.structured_format not in {"auto", "json_schema", "json_object"}:
-            raise ValueError("structured_format must be 'auto', 'json_schema', or 'json_object'")
 
     def __repr__(self) -> str:
         return (
             f"GatewayConfig(base_url={self.base_url!r}, api_key='<redacted>', "
             f"timeout_seconds={self.timeout_seconds!r}, "
             f"allow_insecure_loopback={self.allow_insecure_loopback!r}, "
-            f"protocol={self.protocol!r}, "
-            f"structured_format={self.structured_format!r})"
+            f"protocol={self.protocol!r})"
         )
 
     @classmethod
@@ -100,17 +96,12 @@ class GatewayConfig:
         if protocol not in {"auto", "responses", "chat"}:
             raise ValueError("AEGIS_OPENAI_PROTOCOL must be auto, responses, or chat")
         checked_protocol = cast(Literal["auto", "responses", "chat"], protocol)
-        structured_format = source.get("AEGIS_OPENAI_STRUCTURED_FORMAT", "auto").strip().lower()
-        if structured_format not in {"auto", "json_schema", "json_object"}:
-            raise ValueError("AEGIS_OPENAI_STRUCTURED_FORMAT must be auto, json_schema, or json_object")
-        checked_format = cast(Literal["auto", "json_schema", "json_object"], structured_format)
         return cls(
             base_url,
             api_key,
             timeout,
             raw_insecure == "true",
             checked_protocol,
-            checked_format,
         )
 
 
@@ -125,7 +116,7 @@ class RetryPolicy:
             raise ValueError("invalid retry policy")
 
 
-_GatewayMode = Literal["responses", "chat_json_schema", "chat_json_object"]
+_GatewayMode = Literal["responses", "chat_json_object"]
 _ENDPOINT_CAPABILITY_STATUSES = frozenset({400, 404, 405, 415, 422, 501})
 _FORMAT_CAPABILITY_STATUSES = frozenset({400, 415, 422})
 
@@ -146,25 +137,24 @@ class ModelGateway:
         self._sleep = sleeper
         self._attempt_observer = attempt_observer
         self._capability_lock = RLock()
-        self._preferred_modes: dict[bool, _GatewayMode] = {}
+        self._preferred_mode: _GatewayMode | None = None
 
     def complete(self, request: GatewayRequest, *, cancel: CancelToken | None = None) -> GatewayResponse:
         token = cancel or CancelToken()
-        structured = request.output_schema is not None
         # Capability discovery mutates per-instance state. Serializing it also
         # prevents concurrent first calls from repeating expensive probes. An
         # RLock avoids deadlock if an observer performs a diagnostic re-entry.
         with self._capability_lock:
-            preferred = self._preferred_modes.get(structured)
+            preferred = self._preferred_mode
             if preferred is not None:
                 try:
                     return self._call_mode(preferred, request, token)
                 except GatewayHTTPError as exc:
                     if not self._is_capability_failure(preferred, exc):
                         raise
-                    self._preferred_modes.pop(structured, None)
+                    self._preferred_mode = None
 
-            modes = list(self._candidate_modes(structured))
+            modes = list(self._candidate_modes())
             if preferred is not None:
                 # The cached mode just failed. Reprobe every alternative before
                 # retrying it once at the end in case the rejection was transient.
@@ -176,31 +166,22 @@ class ModelGateway:
                     if index + 1 >= len(modes) or not self._is_capability_failure(mode, exc):
                         raise
                     continue
-                self._preferred_modes[structured] = mode
+                self._preferred_mode = mode
                 return response
         raise GatewayError("model request failed without a gateway mode")
 
-    def _candidate_modes(self, structured: bool) -> tuple[_GatewayMode, ...]:
+    def _candidate_modes(self) -> tuple[_GatewayMode, ...]:
         if self._config.protocol == "responses":
             return ("responses",)
-        chat_structured: tuple[_GatewayMode, ...] = (
-            ("chat_json_object", "chat_json_schema")
-            if self._config.structured_format == "json_object"
-            else ("chat_json_schema", "chat_json_object")
-        )
         if self._config.protocol == "chat":
-            return chat_structured if structured else ("chat_json_object",)
-        if structured:
-            return ("responses", *chat_structured)
-        # Even schema-less requests are JSON-constrained: json_schema is only
-        # possible when a schema exists, so the fallback is json_object.
+            return ("chat_json_object",)
         return ("responses", "chat_json_object")
 
     @staticmethod
     def _is_capability_failure(mode: _GatewayMode, error: GatewayHTTPError) -> bool:
         statuses = (
             _FORMAT_CAPABILITY_STATUSES
-            if mode in {"chat_json_schema", "chat_json_object"}
+            if mode == "chat_json_object"
             else _ENDPOINT_CAPABILITY_STATUSES
         )
         return error.status in statuses
@@ -212,18 +193,8 @@ class ModelGateway:
         token: CancelToken,
     ) -> GatewayResponse:
         if mode == "responses":
-            return self._call_with_retry(
-                "responses",
-                request,
-                token,
-                responses_json_object=(
-                    self._config.structured_format == "json_object"
-                    or request.output_schema is None
-                ),
-            )
-        if mode == "chat_json_schema":
-            return self._call_with_retry("chat", request, token)
-        return self._call_with_retry("chat", request, token, chat_json_object=True)
+            return self._call_with_retry("responses", request, token)
+        return self._call_with_retry("chat", request, token)
 
     def bind_attempt_observer(self, observer: GatewayAttemptObserver) -> None:
         """Bind accounting exactly once before the gateway is used.
@@ -246,9 +217,6 @@ class ModelGateway:
         protocol: str,
         request: GatewayRequest,
         cancel: CancelToken,
-        *,
-        chat_json_object: bool = False,
-        responses_json_object: bool = False,
     ) -> GatewayResponse:
         last_error: BaseException | None = None
         for attempt in range(self._retry.max_attempts):
@@ -266,8 +234,6 @@ class ModelGateway:
                     protocol,
                     request,
                     cancel,
-                    chat_json_object=chat_json_object,
-                    responses_json_object=responses_json_object,
                 )
             except GatewayHTTPError as exc:
                 self._finish_attempt(lifecycle, None, exc)
@@ -311,18 +277,13 @@ class ModelGateway:
         protocol: str,
         request: GatewayRequest,
         cancel: CancelToken,
-        *,
-        chat_json_object: bool = False,
-        responses_json_object: bool = False,
     ) -> GatewayResponse:
         if protocol == "responses":
             path = "/responses"
-            payload = self._responses_payload(
-                request, json_object=responses_json_object
-            )
+            payload = self._responses_payload(request)
         else:
             path = "/chat/completions"
-            payload = self._chat_payload(request, json_object=chat_json_object)
+            payload = self._chat_payload(request)
         response = self._transport.post(
             f"{self._config.base_url}{path}",
             headers={
@@ -432,9 +393,7 @@ class ModelGateway:
         self._attempt_observer.after_attempt(attempt, result)
 
     @staticmethod
-    def _responses_payload(
-        request: GatewayRequest, *, json_object: bool = False
-    ) -> dict[str, object]:
+    def _responses_payload(request: GatewayRequest) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": request.model,
             "input": [{"role": m.role, "content": m.content} for m in request.messages],
@@ -443,19 +402,7 @@ class ModelGateway:
         }
         if request.tools:
             payload["tools"] = list(request.tools)
-        if not json_object and request.output_schema:
-            payload["text"] = {
-                "format": {
-                    "type": "json_schema",
-                    "name": "role_output",
-                    "strict": True,
-                    "schema": request.output_schema,
-                }
-            }
-        else:
-            # Plain output is never allowed: without a schema, json_object is
-            # the only JSON-constrained format available.
-            payload["text"] = {"format": {"type": "json_object"}}
+        payload["text"] = {"format": {"type": "json_object"}}
         if request.seed is not None:
             payload["seed"] = request.seed
         if request.reasoning_effort is not None:
@@ -463,11 +410,7 @@ class ModelGateway:
         return payload
 
     @staticmethod
-    def _chat_payload(
-        request: GatewayRequest,
-        *,
-        json_object: bool = False,
-    ) -> dict[str, object]:
+    def _chat_payload(request: GatewayRequest) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": request.model,
             "messages": [{"role": m.role, "content": m.content} for m in request.messages],
@@ -476,13 +419,7 @@ class ModelGateway:
         }
         if request.tools:
             payload["tools"] = list(request.tools)
-        if not json_object and request.output_schema:
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {"name": "role_output", "strict": True, "schema": request.output_schema},
-            }
-        else:
-            payload["response_format"] = {"type": "json_object"}
+        payload["response_format"] = {"type": "json_object"}
         if request.seed is not None:
             payload["seed"] = request.seed
         if request.reasoning_effort is not None:
