@@ -4141,11 +4141,17 @@ def genesis_constitution() -> Constitution:
     )
 
 
-def genesis_objective(constitution: Constitution) -> ObjectiveVersion:
+def genesis_objective(
+    constitution: Constitution, *, statement: str | None = None
+) -> ObjectiveVersion:
     return ObjectiveVersion(
         1,
         constitution.constitution_id,
-        "Improve the Warrior's dynamic software engineering capability through adversarial tasks.",
+        (
+            statement.strip()
+            if statement is not None
+            else "Improve the Warrior's dynamic software engineering capability through adversarial tasks."
+        ),
         (ObjectiveSuccessCriterion("quality", 0.5),),
         ("python",),
         {
@@ -4417,7 +4423,12 @@ def run_v2_cycle(
     population: PopulationArchive | None = None,
 ) -> Any:
     constitution = genesis_constitution()
-    genesis = genesis_objective(constitution)
+    objective_statement = (
+        getattr(campaign_config, "objective", None)
+        if campaign_config is not None
+        else None
+    )
+    genesis = genesis_objective(constitution, statement=objective_statement)
     identities = genesis_identities(constitution)
     ensure_curriculum_genesis(curriculum, constitution=constitution, objective=genesis)
     effective_objective_id = curriculum.projection.effective_objective_id

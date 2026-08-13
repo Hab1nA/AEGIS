@@ -492,6 +492,7 @@ class CampaignConfig:
     sandbox_backend: str = "wsl"
     acceptance_profile: str | None = None
     autonomy_v2: AutonomyV2Config | None = None
+    objective: str | None = None
 
     _FIELDS = frozenset(
         {
@@ -510,6 +511,7 @@ class CampaignConfig:
             "sandbox_backend",
             "acceptance_profile",
             "autonomy_v2",
+            "objective",
         }
     )
     _REQUIRED = frozenset(
@@ -624,6 +626,9 @@ class CampaignConfig:
                     raise ConfigError("production harness evolution forbids host harness_repo_root")
         elif not normalized_paths:
             raise ConfigError("task_pack_paths must be non-empty unless dynamic autonomy_v2 is enabled")
+        objective = raw.get("objective")
+        if objective is not None and (not isinstance(objective, str) or not objective.strip()):
+            raise ConfigError("objective must be a non-empty string or null")
         return cls(
             campaign_id,
             _positive_int(raw["max_rounds"], "max_rounds"),
@@ -640,6 +645,7 @@ class CampaignConfig:
             backend,
             acceptance_profile,
             autonomy_v2,
+            objective,
         )
 
     @classmethod
@@ -669,6 +675,8 @@ class CampaignConfig:
             "sandbox_backend": self.sandbox_backend,
             "acceptance_profile": self.acceptance_profile,
         }
+        if self.objective is not None:
+            payload["objective"] = self.objective
         if self.autonomy_v2 is not None:
             payload["autonomy_v2"] = self.autonomy_v2.to_dict()
         return payload

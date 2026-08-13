@@ -129,6 +129,43 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.autonomy_v2.dynamic_only)
         self.assertEqual(CampaignConfig.from_mapping(config.to_dict()), config)
 
+    def test_campaign_objective_is_optional_and_round_trips(self):
+        roles = {
+            "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},
+            "judge": {"model": "j", "budget_share": 0.225, "max_output_tokens": 4096},
+            "prosecutor": {"model": "p", "budget_share": 0.225, "max_output_tokens": 4096},
+        }
+        config = CampaignConfig.from_mapping(
+            valid_config(
+                acceptance_profile="autonomous_evolution_v2",
+                roles=roles,
+                task_pack_paths=[],
+                autonomy_v2={"public_repo_url": "https://github.com/example/aegis-roles.git"},
+                objective="Enhance Python data-processing utility design.",
+            )
+        )
+        self.assertEqual(config.objective, "Enhance Python data-processing utility design.")
+        self.assertEqual(CampaignConfig.from_mapping(config.to_dict()), config)
+        default = CampaignConfig.from_mapping(
+            valid_config(
+                acceptance_profile="autonomous_evolution_v2",
+                roles=roles,
+                task_pack_paths=[],
+                autonomy_v2={"public_repo_url": "https://github.com/example/aegis-roles.git"},
+            )
+        )
+        self.assertIsNone(default.objective)
+        with self.assertRaisesRegex(ConfigError, "objective"):
+            CampaignConfig.from_mapping(
+                valid_config(
+                    acceptance_profile="autonomous_evolution_v2",
+                    roles=roles,
+                    task_pack_paths=[],
+                    autonomy_v2={"public_repo_url": "https://github.com/example/aegis-roles.git"},
+                    objective="   ",
+                )
+            )
+
     def test_dynamic_v2_cannot_relax_the_safety_constitution(self):
         roles = {
             "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},
