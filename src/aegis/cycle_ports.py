@@ -711,6 +711,7 @@ class ModelCyclePorts:
         self._default_image = default_image
         self._evaluate_candidates_enabled = evaluate_candidates_enabled
         self._candidate_max_extra_steps = candidate_max_extra_steps
+        self._shadow_max_steps = max(candidate_max_extra_steps, self._limits.max_steps)
         if isinstance(candidate_max_extra_steps, bool) or not isinstance(
             candidate_max_extra_steps, int
         ) or not 1 <= candidate_max_extra_steps <= 1000:
@@ -1761,7 +1762,7 @@ class ModelCyclePorts:
                 tasks,
                 binding,
                 arm_label=label,
-                max_steps=self._candidate_max_extra_steps,
+                max_steps=self._shadow_max_steps,
                 objective_override=amendment.candidate_objective,
             )
             workspace = self._arm_workspaces[label]
@@ -1826,7 +1827,7 @@ class ModelCyclePorts:
             tasks,
             self._bindings[Role.WARRIOR],
             arm_label=label,
-            max_steps=self._candidate_max_extra_steps,
+            max_steps=self._shadow_max_steps,
             objective_override=parent,
         )
         parent_eval = evaluate_frozen_workspace(
@@ -3051,7 +3052,7 @@ class ModelCyclePorts:
                 tasks,
                 champion_binding,
                 arm_label=champion_label,
-                max_steps=self._candidate_max_extra_steps,
+                max_steps=self._shadow_max_steps,
                 evaluation_seed=seed,
                 evaluation_design_id=design.design_id,
             )
@@ -3065,7 +3066,7 @@ class ModelCyclePorts:
                 tasks,
                 candidate_runtime,
                 arm_label=candidate_label,
-                max_steps=self._candidate_max_extra_steps,
+                max_steps=self._shadow_max_steps,
                 evaluation_seed=seed,
                 mcp_bridge=candidate_mcp_bridge,
                 mcp_candidate=mcp_candidate,
