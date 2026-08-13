@@ -200,6 +200,25 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(sleeps, [0.25])
         self.assertTrue(all(call[0].endswith("/responses") for call in transport.calls))
 
+    def test_server_error_501_is_retried_like_other_5xx(self) -> None:
+        transport = FakeTransport(
+            [
+                response({"error": "not implemented"}, 501),
+                response({"output_text": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            ]
+        )
+        sleeps: list[float] = []
+        result = ModelGateway(
+            self.config,
+            transport=transport,
+            retry=RetryPolicy(2, 0.25, 1),
+            sleeper=sleeps.append,
+        ).complete(self.request)
+        self.assertEqual(result.text, "ok")
+        self.assertEqual(sleeps, [0.25])
+        self.assertEqual(len(transport.calls), 2)
+        self.assertTrue(all(call[0].endswith("/responses") for call in transport.calls))
+
     def test_remote_disconnect_retries_same_endpoint(self) -> None:
         transport = FakeTransport(
             [

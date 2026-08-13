@@ -107,7 +107,8 @@ class RetryPolicy:
 
 
 _RESPONSES_PATH = "/responses"
-_NON_RETRYABLE_STATUSES = frozenset({400, 404, 405, 415, 422, 501})
+# 5xx (including 501) is always retryable, matching the transport layer.
+_NON_RETRYABLE_STATUSES = frozenset({400, 404, 405, 415, 422})
 
 
 class ModelGateway:
