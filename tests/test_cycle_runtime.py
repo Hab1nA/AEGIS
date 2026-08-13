@@ -282,7 +282,7 @@ def test_failed_cycle_can_retry_the_same_snapshot_after_control_plane_retry() ->
                 reason="control-plane restart after a repaired failure",
             )
             ports.solve = lambda snapshot, cohort: {"artifact": "solution"}
-            result = controller.run(snapshot, target_generation=2)
+            result = controller.run(snapshot, target_generation=2, retry=True)
             assert registry.projection.cycle_state is CycleState.COMPLETED
             assert result.cycle_summary.artifact_id.startswith("cycle-summary-sha256:")
         finally:

@@ -266,9 +266,14 @@ class EvolutionCycleController:
         )
         if current is None or snapshot.cycle_number > current.cycle_number:
             self._registry.record_snapshot(snapshot, retry=retry)
+        elif snapshot.snapshot_id == current.snapshot_id:
+            # A control-plane retry replays the exact snapshot that was already
+            # recorded for this cycle; skip re-recording (the content-addressed
+            # id guarantees identical content).
+            pass
         elif interrupted_retry or (retry and snapshot.cycle_number == current.cycle_number):
             self._registry.record_snapshot(snapshot, retry=True)
-        elif snapshot.snapshot_id != current.snapshot_id:
+        else:
             raise CycleRuntimeError("snapshot conflicts with the recorded cycle")
         self._registry.transition_cycle("lock_snapshot")
         self._registry.transition_cycle("lock_cohort", evidence_id=cohort.cohort_id)

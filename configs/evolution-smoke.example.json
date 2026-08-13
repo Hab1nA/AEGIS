@@ -1,8 +1,8 @@
 {
   "campaign_id": "evolution-smoke-v2",
-  "max_rounds": 2,
-  "total_tokens": 20000000,
-  "max_requests": 120,
+  "max_rounds": 64,
+  "total_tokens": 60000000,
+  "max_requests": 500,
   "wall_time_seconds": 28800,
   "task_pack_paths": [],
   "acceptance_profile": "autonomous_evolution_v2",
@@ -10,7 +10,7 @@
     "enabled": true,
     "task_holdout_delay_cycles": 1,
     "council_max_messages": 24,
-    "council_max_tokens": 32768,
+    "council_max_tokens": 262144,
     "objective_history_window": 3,
     "objective_probation_cycles": 2,
     "public_repo_url": "https://github.com/Hab1nA/AEGIS",
@@ -35,19 +35,19 @@
     "warrior": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.55,
-      "max_output_tokens": 16384,
+      "max_output_tokens": 65536,
       "reasoning_effort": "max"
     },
     "judge": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
-      "max_output_tokens": 16384,
+      "max_output_tokens": 65536,
       "reasoning_effort": "max"
     },
     "prosecutor": {
       "model": "deepseek-v4-flash",
       "budget_share": 0.225,
-      "max_output_tokens": 16384,
+      "max_output_tokens": 65536,
       "reasoning_effort": "max"
     }
   }

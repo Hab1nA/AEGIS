@@ -419,6 +419,10 @@ class CurriculumRegistry:
         if not isinstance(snapshot, CurriculumSnapshot):
             raise TypeError("snapshot must be a CurriculumSnapshot")
         if snapshot.snapshot_id in self._projection.snapshots:
+            if retry:
+                # Same-cycle control-plane retry replays the exact snapshot;
+                # the content-addressed id guarantees identical content.
+                return self._projection
             raise CurriculumRegistryError("curriculum snapshot is already registered")
         if snapshot.campaign_id != self._campaign_id:
             raise CurriculumRegistryError("snapshot belongs to a different campaign")
