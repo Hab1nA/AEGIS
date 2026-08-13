@@ -4640,6 +4640,7 @@ def run_v2_cycle(
         }
     try:
         state = curriculum.projection.cycle_state
+        was_retry = state is CycleState.FAILED
         if state is CycleState.FAILED:
             curriculum.transition_cycle(
                 "retry",
@@ -4671,7 +4672,12 @@ def run_v2_cycle(
                 evolution=ports,
             ),
         )
-        return controller.run(snapshot, target_generation=target, cohort_limit=cohort_limit)
+        return controller.run(
+            snapshot,
+            target_generation=target,
+            cohort_limit=cohort_limit,
+            retry=was_retry,
+        )
     except BaseException as exc:
         if not repair_on_failure or event_store is None:
             raise

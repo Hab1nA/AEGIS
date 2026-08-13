@@ -241,6 +241,7 @@ class EvolutionCycleController:
         *,
         target_generation: int,
         cohort_limit: int | None = None,
+        retry: bool = False,
     ) -> CycleRunResult:
         state = self._registry.projection.cycle_state
         if state not in {CycleState.CREATED, CycleState.COMPLETED}:
@@ -258,7 +259,7 @@ class EvolutionCycleController:
         # idempotently while still requiring an exact content match.
         current = self._registry.projection.current_snapshot
         if current is None or snapshot.cycle_number > current.cycle_number:
-            self._registry.record_snapshot(snapshot)
+            self._registry.record_snapshot(snapshot, retry=retry)
         elif snapshot.snapshot_id != current.snapshot_id:
             raise CycleRuntimeError("snapshot conflicts with the recorded cycle")
         self._registry.transition_cycle("lock_snapshot")

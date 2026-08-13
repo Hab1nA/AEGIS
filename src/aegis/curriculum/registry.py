@@ -413,7 +413,9 @@ class CurriculumRegistry:
             },
         )
 
-    def record_snapshot(self, snapshot: CurriculumSnapshot) -> CycleProjection:
+    def record_snapshot(
+        self, snapshot: CurriculumSnapshot, *, retry: bool = False
+    ) -> CycleProjection:
         if not isinstance(snapshot, CurriculumSnapshot):
             raise TypeError("snapshot must be a CurriculumSnapshot")
         if snapshot.snapshot_id in self._projection.snapshots:
@@ -435,6 +437,25 @@ class CurriculumRegistry:
             if self._projection.cycle_state is not CycleState.CREATED:
                 raise CurriculumRegistryError("first snapshot requires a created cycle")
         else:
+            if (
+                retry
+                and self._projection.cycle_state is CycleState.CREATED
+                and snapshot.cycle_number == previous.cycle_number
+            ):
+                if snapshot.parent_snapshot_id != previous.parent_snapshot_id:
+                    raise CurriculumRegistryError(
+                        "retry snapshot must keep the previous parent lineage"
+                    )
+                return self._append(
+                    CURRICULUM_SNAPSHOT_RECORDED_V2,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "snapshot": snapshot.to_mapping(),
+                        "previous_cycle_state": self._projection.cycle_state.value,
+                        "cycle_state": CycleState.CREATED.value,
+                        "retry": True,
+                    },
+                )
             if self._projection.cycle_state is not CycleState.COMPLETED:
                 raise CurriculumRegistryError("the previous cycle must complete before a new snapshot")
             if snapshot.cycle_number != previous.cycle_number + 1:
@@ -835,6 +856,7 @@ class CurriculumRegistry:
         snapshot = CurriculumSnapshot.from_mapping(data["snapshot"])
         previous_state = _cycle_state(data["previous_cycle_state"], "previous_cycle_state")
         target_state = _cycle_state(data["cycle_state"], "cycle_state")
+        retry = bool(data.get("retry", False))
         if previous_state is not projection.cycle_state or target_state is not CycleState.CREATED:
             raise CurriculumRegistryError("snapshot cycle state checkpoint does not match")
         if snapshot.campaign_id != projection.campaign_id:
@@ -859,6 +881,13 @@ class CurriculumRegistry:
         if previous is None:
             if snapshot.cycle_number != 1 or previous_state is not CycleState.CREATED:
                 raise CurriculumRegistryError("invalid first curriculum snapshot")
+        elif (
+            retry
+            and previous_state is CycleState.CREATED
+            and snapshot.cycle_number == previous.cycle_number
+            and snapshot.parent_snapshot_id == previous.parent_snapshot_id
+        ):
+            pass
         elif (
             previous_state is not CycleState.COMPLETED
             or snapshot.cycle_number != previous.cycle_number + 1
