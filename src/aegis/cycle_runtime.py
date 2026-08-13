@@ -260,6 +260,8 @@ class EvolutionCycleController:
         current = self._registry.projection.current_snapshot
         if current is None or snapshot.cycle_number > current.cycle_number:
             self._registry.record_snapshot(snapshot, retry=retry)
+        elif retry and snapshot.cycle_number == current.cycle_number:
+            self._registry.record_snapshot(snapshot, retry=True)
         elif snapshot.snapshot_id != current.snapshot_id:
             raise CycleRuntimeError("snapshot conflicts with the recorded cycle")
         self._registry.transition_cycle("lock_snapshot")
