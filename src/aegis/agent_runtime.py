@@ -2341,10 +2341,10 @@ class RoleAgentRuntime:
                         else "trusted_previous_tool_receipt"
                     )
                 else:
-                    # Plain-chat compatibility relays may occasionally ignore the
-                    # requested JSON contract. Reject the text without attempting
-                    # to extract or execute an ambiguous action, then let the model
-                    # correct itself within the existing bounded step loop.
+                    # Compatibility relays may occasionally ignore the requested
+                    # JSON contract. Reject the text without attempting to extract
+                    # or execute an ambiguous action, then let the model correct
+                    # itself within the existing bounded step loop.
                     observations.append(
                         ToolObservation(
                             step,

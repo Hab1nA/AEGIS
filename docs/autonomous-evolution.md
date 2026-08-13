@@ -139,11 +139,14 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 覆盖：控制文件默认拒绝、显式授权后放行、安全边界（沙箱/发布/配置/评测/归因）
 即使在元进化开启时也永远拒绝。
 
-- **DeepSeek JSON Output 模式**：`AEGIS_OPENAI_STRUCTURED_FORMAT=json_object`
-  让网关对结构化请求优先发送 `response_format: {"type":"json_object"}`（回退链
-  `chat_json_object → chat_json_schema → chat_plain`；relay 对 `json_schema`
-  返回 400 属能力失败，会按设计回退）。system prompt 必须包含 "json" 字样，
-  `RoleAgentRuntime` 的固定提示词已满足。
+- **强制 JSON 输出（无 plain 模式）**：网关不存在 `chat_plain` 模式，任何请求
+  （含无 `output_schema` 的）都必须携带 JSON 格式约束：
+  `AEGIS_OPENAI_STRUCTURED_FORMAT=json_object` 时对结构化请求优先发送
+  `response_format: {"type":"json_object"}`（能力失败时仅在
+  `chat_json_object ↔ chat_json_schema` 之间切换；relay 对 `json_schema`
+  返回 400 属能力失败，会回退到 `json_object`）。所有模式都强制 JSON 输出，
+  两个 JSON 模式均被拒绝时直接报错，绝不降级到无约束文本。system prompt
+  必须包含 "json" 字样，`RoleAgentRuntime` 的固定提示词已满足。
 - **最高推理强度**：角色配置 `reasoning_effort: "max"`。该 relay 的
   `deepseek-v4-flash` 是隐藏推理模型，medium/未设置时曾出现长时间挂起或把
   输出预算全部花在 `reasoning_content` 上；max 在实测中稳定返回。

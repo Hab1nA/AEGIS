@@ -360,15 +360,15 @@ class GatewayTests(unittest.TestCase):
             (Message("user", "return JSON"),),
             100,
         )
-        plain = {
+        chat_json = {
             "choices": [{"message": {"content": "{}"}}],
             "usage": {"prompt_tokens": 2, "completion_tokens": 1},
         }
         transport = FakeTransport(
             [
                 response({"error": "responses unsupported"}, 400),
-                response(plain),
-                response(plain),
+                response(chat_json),
+                response(chat_json),
             ]
         )
         gateway = ModelGateway(self.config, transport=transport)
@@ -377,7 +377,100 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(gateway.complete(request).text, "{}")
 
         self.assertEqual(len(transport.calls), 3)
-        self.assertNotIn("response_format", transport.calls[-1][2])
+        self.assertEqual(transport.calls[-1][2]["response_format"], {"type": "json_object"})
+
+    def test_unstructured_chat_request_still_forces_json_object(self) -> None:
+        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat")
+        transport = FakeTransport(
+            [
+                response(
+                    {
+                        "choices": [{"message": {"content": "{}"}}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                    }
+                )
+            ]
+        )
+        request = GatewayRequest("model-a", (Message("user", "hello"),), 100)
+
+        result = ModelGateway(config, transport=transport).complete(request)
+
+        self.assertEqual(result.protocol, "chat")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(transport.calls[0][2]["response_format"], {"type": "json_object"})
+
+    def test_unstructured_auto_fallback_uses_json_object_not_plain(self) -> None:
+        transport = FakeTransport(
+            [
+                response({"error": "responses unsupported"}, 400),
+                response(
+                    {
+                        "choices": [{"message": {"content": "{}"}}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                    }
+                ),
+            ]
+        )
+        request = GatewayRequest("model-a", (Message("user", "hello"),), 100)
+
+        result = ModelGateway(self.config, transport=transport).complete(request)
+
+        self.assertEqual(result.protocol, "chat")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(transport.calls[1][2]["response_format"], {"type": "json_object"})
+
+    def test_json_schema_mode_skipped_for_unstructured_requests(self) -> None:
+        # structured_format=auto prefers json_schema for schema'd requests, but a
+        # schema-less request must skip json_schema entirely and use json_object.
+        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat")
+        transport = FakeTransport(
+            [
+                response(
+                    {
+                        "choices": [{"message": {"content": "{}"}}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                    }
+                )
+            ]
+        )
+        request = GatewayRequest("model-a", (Message("user", "hello"),), 100)
+
+        result = ModelGateway(config, transport=transport).complete(request)
+
+        self.assertEqual(result.protocol, "chat")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(transport.calls[0][2]["response_format"], {"type": "json_object"})
+
+    def test_payload_builders_force_json_without_schema(self) -> None:
+        request = GatewayRequest("model-a", (Message("user", "hello"),), 100)
+        self.assertEqual(
+            ModelGateway._responses_payload(request)["text"],
+            {"format": {"type": "json_object"}},
+        )
+        self.assertEqual(
+            ModelGateway._chat_payload(request)["response_format"],
+            {"type": "json_object"},
+        )
+        self.assertEqual(
+            ModelGateway._responses_payload(request, json_object=True)["text"],
+            {"format": {"type": "json_object"}},
+        )
+        self.assertEqual(
+            ModelGateway._chat_payload(request, json_object=True)["response_format"],
+            {"type": "json_object"},
+        )
+
+    def test_all_candidate_modes_are_json_constrained(self) -> None:
+        configs = [
+            GatewayConfig("https://relay.invalid/v1", "secret", protocol="auto"),
+            GatewayConfig("https://relay.invalid/v1", "secret", protocol="responses"),
+            GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat"),
+        ]
+        for config in configs:
+            for structured in (False, True):
+                modes = ModelGateway(config)._candidate_modes(structured)
+                self.assertTrue(modes)
+                self.assertNotIn("chat_plain", modes)
 
     def test_cached_capability_failure_reprobes_and_replaces_mode(self) -> None:
         request = GatewayRequest(
@@ -385,7 +478,7 @@ class GatewayTests(unittest.TestCase):
             (Message("user", "return JSON"),),
             100,
         )
-        plain = {
+        chat_json = {
             "choices": [{"message": {"content": "{}"}}],
             "usage": {"prompt_tokens": 2, "completion_tokens": 1},
         }
@@ -393,8 +486,8 @@ class GatewayTests(unittest.TestCase):
         transport = FakeTransport(
             [
                 response({"error": "responses unsupported"}, 400),
-                response(plain),
-                response({"error": "plain chat capability changed"}, 400),
+                response(chat_json),
+                response({"error": "json chat capability changed"}, 400),
                 response(responses),
                 response(responses),
             ]

@@ -1,4 +1,4 @@
-"""OpenAI-compatible Responses-first gateway with Chat fallback."""
+"""OpenAI-compatible gateway that always forces JSON-formatted model output."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import socket
 import time
 import urllib.error
 import urllib.parse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from threading import RLock
 from typing import Callable, Literal, Mapping, cast
 
@@ -125,7 +125,7 @@ class RetryPolicy:
             raise ValueError("invalid retry policy")
 
 
-_GatewayMode = Literal["responses", "chat_json_schema", "chat_json_object", "chat_plain"]
+_GatewayMode = Literal["responses", "chat_json_schema", "chat_json_object"]
 _ENDPOINT_CAPABILITY_STATUSES = frozenset({400, 404, 405, 415, 422, 501})
 _FORMAT_CAPABILITY_STATUSES = frozenset({400, 415, 422})
 
@@ -189,10 +189,12 @@ class ModelGateway:
             else ("chat_json_schema", "chat_json_object")
         )
         if self._config.protocol == "chat":
-            return chat_structured if structured else ("chat_plain",)
+            return chat_structured if structured else ("chat_json_object",)
         if structured:
             return ("responses", *chat_structured)
-        return ("responses", "chat_plain")
+        # Even schema-less requests are JSON-constrained: json_schema is only
+        # possible when a schema exists, so the fallback is json_object.
+        return ("responses", "chat_json_object")
 
     @staticmethod
     def _is_capability_failure(mode: _GatewayMode, error: GatewayHTTPError) -> bool:
@@ -216,13 +218,12 @@ class ModelGateway:
                 token,
                 responses_json_object=(
                     self._config.structured_format == "json_object"
+                    or request.output_schema is None
                 ),
             )
         if mode == "chat_json_schema":
             return self._call_with_retry("chat", request, token)
-        if mode == "chat_json_object":
-            return self._call_with_retry("chat", request, token, chat_json_object=True)
-        return self._call_with_retry("chat", replace(request, output_schema=None), token)
+        return self._call_with_retry("chat", request, token, chat_json_object=True)
 
     def bind_attempt_observer(self, observer: GatewayAttemptObserver) -> None:
         """Bind accounting exactly once before the gateway is used.
@@ -442,18 +443,19 @@ class ModelGateway:
         }
         if request.tools:
             payload["tools"] = list(request.tools)
-        if request.output_schema:
-            if json_object:
-                payload["text"] = {"format": {"type": "json_object"}}
-            else:
-                payload["text"] = {
-                    "format": {
-                        "type": "json_schema",
-                        "name": "role_output",
-                        "strict": True,
-                        "schema": request.output_schema,
-                    }
+        if not json_object and request.output_schema:
+            payload["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "role_output",
+                    "strict": True,
+                    "schema": request.output_schema,
                 }
+            }
+        else:
+            # Plain output is never allowed: without a schema, json_object is
+            # the only JSON-constrained format available.
+            payload["text"] = {"format": {"type": "json_object"}}
         if request.seed is not None:
             payload["seed"] = request.seed
         if request.reasoning_effort is not None:
@@ -474,13 +476,13 @@ class ModelGateway:
         }
         if request.tools:
             payload["tools"] = list(request.tools)
-        if request.output_schema and json_object:
-            payload["response_format"] = {"type": "json_object"}
-        elif request.output_schema:
+        if not json_object and request.output_schema:
             payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {"name": "role_output", "strict": True, "schema": request.output_schema},
             }
+        else:
+            payload["response_format"] = {"type": "json_object"}
         if request.seed is not None:
             payload["seed"] = request.seed
         if request.reasoning_effort is not None:

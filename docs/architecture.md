@@ -77,10 +77,11 @@ model emits exactly one JSON action per turn, token usage is verified and
 recorded, and sandbox actions stay inside a prepared WSL/Podman container with
 per-role prepare/destroy and unique sandbox ids. Prosecutor and Judge contexts
 are redacted (private reasoning and raw tool output replaced by digests).
-Structured requests prefer DeepSeek JSON Output mode
-(`AEGIS_OPENAI_STRUCTURED_FORMAT=json_object`) when configured; the gateway
-detects relay-side truncation (`finish_reason: length`, or empty content with
-an exhausted completion budget — common for hidden-reasoning models) and raises
+Every model request is JSON-constrained — the gateway has no plain-output mode;
+DeepSeek JSON Output mode (`AEGIS_OPENAI_STRUCTURED_FORMAT=json_object`) sends
+`response_format: {"type":"json_object"}` when configured. The gateway detects
+relay-side truncation (`finish_reason: length`, or empty content with an
+exhausted completion budget — common for hidden-reasoning models) and raises
 `GatewayTruncationError`, which the runtime turns into an actionable
 `model.response` rejection with usage accounting instead of a blind JSON parse
 failure.
