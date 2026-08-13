@@ -60,7 +60,7 @@ class GatewayTests(unittest.TestCase):
         self.config = GatewayConfig("https://relay.invalid/v1", "super-secret", 3)
         self.request = GatewayRequest("model-a", (Message("user", "hello"),), 100)
 
-    def test_responses_is_preferred_and_usage_is_verified(self) -> None:
+    def test_complete_uses_native_responses_json_object(self) -> None:
         transport = FakeTransport(
             [response({"output_text": "ok", "usage": {"input_tokens": 4, "output_tokens": 2}})]
         )
@@ -70,51 +70,32 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(result.usage.verified)
         self.assertTrue(transport.calls[0][0].endswith("/responses"))
         self.assertEqual(transport.calls[0][1]["Authorization"], "Bearer super-secret")
+        self.assertEqual(transport.calls[0][2]["text"], {"format": {"type": "json_object"}})
 
-    def test_reasoning_effort_is_forwarded_to_responses_and_chat(self) -> None:
+    def test_reasoning_effort_is_forwarded(self) -> None:
         request = GatewayRequest(
             "model-a", (Message("user", "hello"),), 100, reasoning_effort="low"
         )
-        self.assertEqual(ModelGateway._responses_payload(request)["reasoning_effort"], "low")
-        self.assertEqual(ModelGateway._chat_payload(request)["reasoning_effort"], "low")
+        self.assertEqual(ModelGateway._payload(request)["reasoning_effort"], "low")
         request_max = GatewayRequest(
             "model-a", (Message("user", "hello"),), 100, reasoning_effort="max"
         )
-        self.assertEqual(
-            ModelGateway._responses_payload(request_max)["reasoning_effort"], "max"
-        )
-        self.assertEqual(
-            ModelGateway._chat_payload(request_max)["reasoning_effort"], "max"
-        )
+        self.assertEqual(ModelGateway._payload(request_max)["reasoning_effort"], "max")
         with self.assertRaisesRegex(ValueError, "reasoning_effort"):
             GatewayRequest(
                 "model-a", (Message("user", "hello"),), 100, reasoning_effort="unbounded"
             )
 
-    def test_responses_payload_always_forces_json_object(self) -> None:
-        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="responses")
-        transport = FakeTransport(
-            [
-                response(
-                    {
-                        "output_text": "{}",
-                        "usage": {"input_tokens": 2, "output_tokens": 1},
-                    }
-                )
-            ]
-        )
-        request = GatewayRequest(
+    def test_payload_always_forces_json_object(self) -> None:
+        schema_less = GatewayRequest("model-a", (Message("user", "hello"),), 100)
+        with_schema = GatewayRequest(
             "model-a", (Message("user", "return JSON"),), 100, output_schema={"type": "object"}
         )
-        result = ModelGateway(config, transport=transport).complete(request)
-        self.assertEqual(result.protocol, "responses")
-        self.assertTrue(transport.calls[0][0].endswith("/responses"))
-        self.assertEqual(
-            transport.calls[0][2]["text"],
-            {"format": {"type": "json_object"}},
-        )
-        direct = ModelGateway._responses_payload(request)
-        self.assertEqual(direct["text"], {"format": {"type": "json_object"}})
+        for request in (schema_less, with_schema):
+            self.assertEqual(
+                ModelGateway._payload(request)["text"],
+                {"format": {"type": "json_object"}},
+            )
 
     def test_responses_extract_text_skips_reasoning_items(self) -> None:
         payload = {
@@ -135,7 +116,7 @@ class GatewayTests(unittest.TestCase):
             ]
         }
         self.assertEqual(
-            ModelGateway._extract_text("responses", payload),
+            ModelGateway._extract_text(payload),
             '{"action":"submit","arguments":{"summary":"OK"}}',
         )
         only_reasoning = {
@@ -146,339 +127,62 @@ class GatewayTests(unittest.TestCase):
                 }
             ]
         }
-        self.assertEqual(
-            ModelGateway._extract_text("responses", only_reasoning),
-            "think",
-        )
+        self.assertEqual(ModelGateway._extract_text(only_reasoning), "think")
 
-    def test_unsupported_responses_falls_back_to_chat(self) -> None:
-        transport = FakeTransport(
-            [
-                response({"error": "unsupported"}, 404),
-                response(
-                    {
-                        "choices": [{"message": {"content": "fallback"}}],
-                        "usage": {"prompt_tokens": 5, "completion_tokens": 2},
-                    }
-                ),
-            ]
-        )
-        result = ModelGateway(self.config, transport=transport).complete(self.request)
-        self.assertEqual(result.protocol, "chat")
-        self.assertEqual(
-            [call[0].rsplit("/", 1)[-1] for call in transport.calls], ["responses", "completions"]
-        )
-
-    def test_explicit_chat_protocol_skips_responses_probe(self) -> None:
-        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat")
+    def test_incomplete_status_raises_gateway_truncation_error(self) -> None:
         transport = FakeTransport(
             [
                 response(
                     {
-                        "choices": [{"message": {"content": "{}"}}],
-                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "output": [],
+                        "usage": {"input_tokens": 5, "output_tokens": 200},
                     }
                 )
             ]
         )
-        request = GatewayRequest(
-            "model-a", (Message("user", "return JSON"),), 100, output_schema={"type": "object"}
-        )
-        result = ModelGateway(config, transport=transport).complete(request)
-        self.assertEqual(result.protocol, "chat")
-        self.assertTrue(transport.calls[0][0].endswith("/chat/completions"))
-
-    def test_chat_protocol_sends_json_object_without_probe(self) -> None:
-        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat")
-        transport = FakeTransport(
-            [
-                response(
-                    {
-                        "choices": [{"message": {"content": "{}"}}],
-                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
-                    }
-                )
-            ]
-        )
-        request = GatewayRequest(
-            "model-a", (Message("user", "return JSON"),), 100, output_schema={"type": "object"}
-        )
-
-        result = ModelGateway(config, transport=transport).complete(request)
-
-        self.assertEqual(result.text, "{}")
-        self.assertEqual(len(transport.calls), 1)
-        self.assertTrue(transport.calls[0][0].endswith("/chat/completions"))
-        self.assertEqual(transport.calls[0][2]["response_format"], {"type": "json_object"})
-
-    def test_finish_reason_length_raises_gateway_truncation_error(self) -> None:
-        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat")
-        transport = FakeTransport(
-            [
-                response(
-                    {
-                        "choices": [
-                            {
-                                "message": {"content": "", "reasoning_content": "thinking"},
-                                "finish_reason": "length",
-                            }
-                        ],
-                        "usage": {"prompt_tokens": 5, "completion_tokens": 200},
-                    }
-                )
-            ]
-        )
-        request = GatewayRequest(
-            "model-a", (Message("user", "return JSON"),), 100, output_schema={"type": "object"}
-        )
-
         with self.assertRaises(GatewayTruncationError) as raised:
             ModelGateway(
-                config,
+                self.config,
                 transport=transport,
                 retry=RetryPolicy(max_attempts=1),
-            ).complete(request)
-
+            ).complete(self.request)
         self.assertIsNotNone(raised.exception.usage)
         self.assertEqual(raised.exception.usage.output_tokens, 200)
 
-    def test_empty_content_with_full_usage_raises_gateway_truncation_error(self) -> None:
-        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat")
+    def test_completed_response_without_text_raises_gateway_error(self) -> None:
         transport = FakeTransport(
             [
                 response(
                     {
-                        "choices": [{"message": {"content": ""}}],
-                        "usage": {"prompt_tokens": 5, "completion_tokens": 100},
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"input_tokens": 5, "output_tokens": 1},
                     }
                 )
             ]
         )
-        request = GatewayRequest(
-            "model-a", (Message("user", "return JSON"),), 100, output_schema={"type": "object"}
-        )
-
-        with self.assertRaises(GatewayTruncationError):
+        with self.assertRaisesRegex(GatewayError, "no text output"):
             ModelGateway(
-                config,
+                self.config,
                 transport=transport,
                 retry=RetryPolicy(max_attempts=1),
-            ).complete(request)
+            ).complete(self.request)
 
-    def test_explicit_responses_protocol_does_not_fallback(self) -> None:
-        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="responses")
-        transport = FakeTransport([response({"error": "unsupported"}, 400)])
-        with self.assertRaises(GatewayHTTPError):
-            ModelGateway(config, transport=transport).complete(self.request)
+    def test_non_retryable_http_error_is_not_retried(self) -> None:
+        transport = FakeTransport([response({"error": "bad request"}, 400)])
+        with self.assertRaises(GatewayHTTPError) as raised:
+            ModelGateway(
+                self.config,
+                transport=transport,
+                retry=RetryPolicy(3, 0, 0),
+                sleeper=lambda _: None,
+            ).complete(self.request)
+        self.assertEqual(raised.exception.status, 400)
         self.assertEqual(len(transport.calls), 1)
 
-    def test_not_implemented_falls_back_without_retrying_the_unsupported_mode(self) -> None:
-        transport = FakeTransport(
-            [
-                response({"error": "not implemented"}, 501),
-                response(
-                    {
-                        "choices": [{"message": {"content": "fallback"}}],
-                        "usage": {"prompt_tokens": 5, "completion_tokens": 2},
-                    }
-                ),
-            ]
-        )
-        result = ModelGateway(self.config, transport=transport).complete(self.request)
-        self.assertEqual(result.protocol, "chat")
-        self.assertEqual(len(transport.calls), 2)
-
-    def test_responses_unsupported_falls_back_to_chat_json_object_and_accounts_attempts(self) -> None:
-        observer = RecordingObserver()
-        request = GatewayRequest(
-            "model-a",
-            (Message("user", "return JSON"),),
-            100,
-            output_schema={"type": "object", "additionalProperties": False},
-        )
-        transport = FakeTransport(
-            [
-                response({"error": "responses unsupported"}, 400),
-                response(
-                    {
-                        "choices": [{"message": {"content": "{}"}}],
-                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
-                    }
-                ),
-            ]
-        )
-
-        result = ModelGateway(
-            self.config,
-            transport=transport,
-            attempt_observer=observer,
-        ).complete(request)
-
-        self.assertEqual(result.text, "{}")
-        self.assertEqual([item.protocol for item in observer.started], ["responses", "chat"])
-        self.assertEqual(transport.calls[1][2]["response_format"], {"type": "json_object"})
-        self.assertEqual([item.succeeded for _, item in observer.finished], [False, True])
-
-    def test_structured_request_never_falls_back_to_plain_chat(self) -> None:
-        request = GatewayRequest(
-            "model-a",
-            (Message("user", "return JSON"),),
-            100,
-            output_schema={"type": "object"},
-        )
-        transport = FakeTransport(
-            [
-                response({"error": "responses unsupported"}, 400),
-                response({"error": "json_object unsupported"}, 400),
-            ]
-        )
-
-        with self.assertRaises(GatewayError):
-            ModelGateway(self.config, transport=transport).complete(request)
-        for url, _, payload in transport.calls:
-            if url.endswith("/responses"):
-                self.assertIn("format", payload["text"])
-            else:
-                self.assertIn("response_format", payload)
-
-    def test_successful_fallback_mode_is_cached_for_later_requests(self) -> None:
-        request = GatewayRequest(
-            "model-a",
-            (Message("user", "return JSON"),),
-            100,
-        )
-        chat_json = {
-            "choices": [{"message": {"content": "{}"}}],
-            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
-        }
-        transport = FakeTransport(
-            [
-                response({"error": "responses unsupported"}, 400),
-                response(chat_json),
-                response(chat_json),
-            ]
-        )
-        gateway = ModelGateway(self.config, transport=transport)
-
-        self.assertEqual(gateway.complete(request).text, "{}")
-        self.assertEqual(gateway.complete(request).text, "{}")
-
-        self.assertEqual(len(transport.calls), 3)
-        self.assertEqual(transport.calls[-1][2]["response_format"], {"type": "json_object"})
-
-    def test_unstructured_chat_request_still_forces_json_object(self) -> None:
-        config = GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat")
-        transport = FakeTransport(
-            [
-                response(
-                    {
-                        "choices": [{"message": {"content": "{}"}}],
-                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
-                    }
-                )
-            ]
-        )
-        request = GatewayRequest("model-a", (Message("user", "hello"),), 100)
-
-        result = ModelGateway(config, transport=transport).complete(request)
-
-        self.assertEqual(result.protocol, "chat")
-        self.assertEqual(len(transport.calls), 1)
-        self.assertEqual(transport.calls[0][2]["response_format"], {"type": "json_object"})
-
-    def test_unstructured_auto_fallback_uses_json_object_not_plain(self) -> None:
-        transport = FakeTransport(
-            [
-                response({"error": "responses unsupported"}, 400),
-                response(
-                    {
-                        "choices": [{"message": {"content": "{}"}}],
-                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
-                    }
-                ),
-            ]
-        )
-        request = GatewayRequest("model-a", (Message("user", "hello"),), 100)
-
-        result = ModelGateway(self.config, transport=transport).complete(request)
-
-        self.assertEqual(result.protocol, "chat")
-        self.assertEqual(len(transport.calls), 2)
-        self.assertEqual(transport.calls[1][2]["response_format"], {"type": "json_object"})
-
-    def test_payload_builders_force_json_without_schema(self) -> None:
-        request = GatewayRequest("model-a", (Message("user", "hello"),), 100)
-        self.assertEqual(
-            ModelGateway._responses_payload(request)["text"],
-            {"format": {"type": "json_object"}},
-        )
-        self.assertEqual(
-            ModelGateway._chat_payload(request)["response_format"],
-            {"type": "json_object"},
-        )
-
-    def test_all_candidate_modes_are_json_constrained(self) -> None:
-        configs = [
-            GatewayConfig("https://relay.invalid/v1", "secret", protocol="auto"),
-            GatewayConfig("https://relay.invalid/v1", "secret", protocol="responses"),
-            GatewayConfig("https://relay.invalid/v1", "secret", protocol="chat"),
-        ]
-        for config in configs:
-            modes = ModelGateway(config)._candidate_modes()
-            self.assertTrue(modes)
-            self.assertNotIn("chat_plain", modes)
-            self.assertNotIn("chat_json_schema", modes)
-
-    def test_cached_capability_failure_reprobes_and_replaces_mode(self) -> None:
-        request = GatewayRequest(
-            "model-a",
-            (Message("user", "return JSON"),),
-            100,
-        )
-        chat_json = {
-            "choices": [{"message": {"content": "{}"}}],
-            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
-        }
-        responses = {"output_text": "{}", "usage": {"input_tokens": 2, "output_tokens": 1}}
-        transport = FakeTransport(
-            [
-                response({"error": "responses unsupported"}, 400),
-                response(chat_json),
-                response({"error": "json chat capability changed"}, 400),
-                response(responses),
-                response(responses),
-            ]
-        )
-        gateway = ModelGateway(self.config, transport=transport)
-
-        gateway.complete(request)
-        gateway.complete(request)
-        gateway.complete(request)
-
-        self.assertTrue(transport.calls[2][0].endswith("/chat/completions"))
-        self.assertTrue(transport.calls[3][0].endswith("/responses"))
-        self.assertTrue(transport.calls[4][0].endswith("/responses"))
-
-    def test_cached_auth_and_quota_failures_do_not_trigger_reprobe(self) -> None:
-        successful = response(
-            {"output_text": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
-        )
-        for status in (401, 429):
-            with self.subTest(status=status):
-                transport = FakeTransport([successful, response({"error": "denied"}, status)])
-                gateway = ModelGateway(
-                    self.config,
-                    transport=transport,
-                    retry=RetryPolicy(1, 0, 0),
-                    sleeper=lambda _: None,
-                )
-                gateway.complete(self.request)
-                with self.assertRaises(GatewayHTTPError) as raised:
-                    gateway.complete(self.request)
-                self.assertEqual(raised.exception.status, status)
-                self.assertEqual(len(transport.calls), 2)
-
-    def test_transient_errors_retry_without_protocol_fallback(self) -> None:
+    def test_transient_errors_retry_same_endpoint(self) -> None:
         transport = FakeTransport(
             [
                 GatewayHTTPError(429, "slow", retryable=True),
@@ -496,7 +200,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(sleeps, [0.25])
         self.assertTrue(all(call[0].endswith("/responses") for call in transport.calls))
 
-    def test_remote_disconnect_retries_same_protocol(self) -> None:
+    def test_remote_disconnect_retries_same_endpoint(self) -> None:
         transport = FakeTransport(
             [
                 http.client.RemoteDisconnected("upstream closed"),
@@ -513,7 +217,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(gateway.complete(self.request).text, "ok")
         self.assertTrue(all(call[0].endswith("/responses") for call in transport.calls))
 
-    def test_oserror_transport_flap_retries_same_protocol(self) -> None:
+    def test_oserror_transport_flap_retries_same_endpoint(self) -> None:
         transport = FakeTransport(
             [
                 FileNotFoundError(2, "No such file or directory"),
@@ -565,27 +269,6 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(succeeded.succeeded)
         self.assertTrue(succeeded.usage.verified)
         self.assertEqual(succeeded.usage.total_tokens, 5)
-
-    def test_protocol_fallback_accounts_both_actual_http_attempts(self) -> None:
-        observer = RecordingObserver()
-        transport = FakeTransport(
-            [
-                response({"error": "unsupported"}, 404),
-                response(
-                    {
-                        "choices": [{"message": {"content": "ok"}}],
-                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
-                    },
-                    201,
-                ),
-            ]
-        )
-        result = ModelGateway(self.config, transport=transport, attempt_observer=observer).complete(
-            self.request
-        )
-        self.assertEqual(result.status, 201)
-        self.assertEqual([item.protocol for item in observer.started], ["responses", "chat"])
-        self.assertEqual([item.succeeded for _, item in observer.finished], [False, True])
 
     def test_before_attempt_can_deny_without_transport_or_finish_callback(self) -> None:
         transport = FakeTransport([])
@@ -672,14 +355,16 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(config.base_url, "https://relay.invalid/v1")
         self.assertEqual(config.timeout_seconds, 900.0)
 
-    def test_structured_format_env_is_ignored(self) -> None:
+    def test_obsolete_protocol_and_format_env_vars_are_ignored(self) -> None:
         config = GatewayConfig.from_env(
             {
                 "AEGIS_OPENAI_BASE_URL": "https://relay.invalid/v1",
                 "AEGIS_OPENAI_API_KEY": "secret",
+                "AEGIS_OPENAI_PROTOCOL": "chat",
                 "AEGIS_OPENAI_STRUCTURED_FORMAT": "json_schema",
             }
         )
+        self.assertFalse(hasattr(config, "protocol"))
         self.assertFalse(hasattr(config, "structured_format"))
 
     def test_plain_http_is_rejected_except_explicit_loopback(self) -> None:
@@ -708,16 +393,15 @@ class GatewayTests(unittest.TestCase):
                 }
             )
 
-    def test_seed_is_strict_and_serialized_for_responses_and_chat(self) -> None:
+    def test_seed_is_strict_and_serialized(self) -> None:
         with self.assertRaisesRegex(ValueError, "seed"):
             GatewayRequest("m", (Message("user", "x"),), 10, seed=True)
         with self.assertRaisesRegex(ValueError, "seed"):
             GatewayRequest("m", (Message("user", "x"),), 10, seed=-1)
         request = GatewayRequest("m", (Message("user", "x"),), 10, seed=42)
-        self.assertEqual(ModelGateway._responses_payload(request)["seed"], 42)
-        self.assertEqual(ModelGateway._chat_payload(request)["seed"], 42)
+        self.assertEqual(ModelGateway._payload(request)["seed"], 42)
         no_seed = GatewayRequest("m", (Message("user", "x"),), 10)
-        self.assertNotIn("seed", ModelGateway._responses_payload(no_seed))
+        self.assertNotIn("seed", ModelGateway._payload(no_seed))
 
 
 class StdlibTransportTests(unittest.TestCase):

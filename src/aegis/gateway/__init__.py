@@ -1,4 +1,4 @@
-"""OpenAI-compatible model gateway and role protocols."""
+"""DeepSeek native Responses model gateway and role protocols."""
 
 from .client import GatewayConfig, ModelGateway, RetryPolicy
 from .protocols import Role, RoleOutput, RolePolicy, build_role_request, parse_role_output

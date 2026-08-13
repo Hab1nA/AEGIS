@@ -1,4 +1,4 @@
-"""OpenAI-compatible gateway that always forces json_object output."""
+"""DeepSeek native Responses API gateway forcing json_object output."""
 
 from __future__ import annotations
 
@@ -11,8 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 from dataclasses import dataclass
-from threading import RLock
-from typing import Callable, Literal, Mapping, cast
+from typing import Callable, Mapping
 
 from .transport import HTTPTransport, StdlibHTTPTransport
 from .types import (
@@ -35,7 +34,6 @@ class GatewayConfig:
     api_key: str
     timeout_seconds: float = 900.0
     allow_insecure_loopback: bool = False
-    protocol: Literal["auto", "responses", "chat"] = "auto"
 
     def __post_init__(self) -> None:
         parsed = urllib.parse.urlsplit(self.base_url)
@@ -58,15 +56,12 @@ class GatewayConfig:
             raise ValueError("api_key must not be empty")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
-        if self.protocol not in {"auto", "responses", "chat"}:
-            raise ValueError("protocol must be 'auto', 'responses', or 'chat'")
 
     def __repr__(self) -> str:
         return (
             f"GatewayConfig(base_url={self.base_url!r}, api_key='<redacted>', "
             f"timeout_seconds={self.timeout_seconds!r}, "
-            f"allow_insecure_loopback={self.allow_insecure_loopback!r}, "
-            f"protocol={self.protocol!r})"
+            f"allow_insecure_loopback={self.allow_insecure_loopback!r})"
         )
 
     @classmethod
@@ -92,16 +87,11 @@ class GatewayConfig:
         raw_insecure = source.get("AEGIS_ALLOW_INSECURE_LOOPBACK", "false").strip().lower()
         if raw_insecure not in {"true", "false"}:
             raise ValueError("AEGIS_ALLOW_INSECURE_LOOPBACK must be true or false")
-        protocol = source.get("AEGIS_OPENAI_PROTOCOL", "auto").strip().lower()
-        if protocol not in {"auto", "responses", "chat"}:
-            raise ValueError("AEGIS_OPENAI_PROTOCOL must be auto, responses, or chat")
-        checked_protocol = cast(Literal["auto", "responses", "chat"], protocol)
         return cls(
             base_url,
             api_key,
             timeout,
             raw_insecure == "true",
-            checked_protocol,
         )
 
 
@@ -116,9 +106,8 @@ class RetryPolicy:
             raise ValueError("invalid retry policy")
 
 
-_GatewayMode = Literal["responses", "chat_json_object"]
-_ENDPOINT_CAPABILITY_STATUSES = frozenset({400, 404, 405, 415, 422, 501})
-_FORMAT_CAPABILITY_STATUSES = frozenset({400, 415, 422})
+_RESPONSES_PATH = "/responses"
+_NON_RETRYABLE_STATUSES = frozenset({400, 404, 405, 415, 422, 501})
 
 
 class ModelGateway:
@@ -136,65 +125,10 @@ class ModelGateway:
         self._retry = retry or RetryPolicy()
         self._sleep = sleeper
         self._attempt_observer = attempt_observer
-        self._capability_lock = RLock()
-        self._preferred_mode: _GatewayMode | None = None
 
     def complete(self, request: GatewayRequest, *, cancel: CancelToken | None = None) -> GatewayResponse:
         token = cancel or CancelToken()
-        # Capability discovery mutates per-instance state. Serializing it also
-        # prevents concurrent first calls from repeating expensive probes. An
-        # RLock avoids deadlock if an observer performs a diagnostic re-entry.
-        with self._capability_lock:
-            preferred = self._preferred_mode
-            if preferred is not None:
-                try:
-                    return self._call_mode(preferred, request, token)
-                except GatewayHTTPError as exc:
-                    if not self._is_capability_failure(preferred, exc):
-                        raise
-                    self._preferred_mode = None
-
-            modes = list(self._candidate_modes())
-            if preferred is not None:
-                # The cached mode just failed. Reprobe every alternative before
-                # retrying it once at the end in case the rejection was transient.
-                modes = [mode for mode in modes if mode != preferred] + [preferred]
-            for index, mode in enumerate(modes):
-                try:
-                    response = self._call_mode(mode, request, token)
-                except GatewayHTTPError as exc:
-                    if index + 1 >= len(modes) or not self._is_capability_failure(mode, exc):
-                        raise
-                    continue
-                self._preferred_mode = mode
-                return response
-        raise GatewayError("model request failed without a gateway mode")
-
-    def _candidate_modes(self) -> tuple[_GatewayMode, ...]:
-        if self._config.protocol == "responses":
-            return ("responses",)
-        if self._config.protocol == "chat":
-            return ("chat_json_object",)
-        return ("responses", "chat_json_object")
-
-    @staticmethod
-    def _is_capability_failure(mode: _GatewayMode, error: GatewayHTTPError) -> bool:
-        statuses = (
-            _FORMAT_CAPABILITY_STATUSES
-            if mode == "chat_json_object"
-            else _ENDPOINT_CAPABILITY_STATUSES
-        )
-        return error.status in statuses
-
-    def _call_mode(
-        self,
-        mode: _GatewayMode,
-        request: GatewayRequest,
-        token: CancelToken,
-    ) -> GatewayResponse:
-        if mode == "responses":
-            return self._call_with_retry("responses", request, token)
-        return self._call_with_retry("chat", request, token)
+        return self._call_with_retry(request, token)
 
     def bind_attempt_observer(self, observer: GatewayAttemptObserver) -> None:
         """Bind accounting exactly once before the gateway is used.
@@ -207,14 +141,12 @@ class ModelGateway:
             getattr(observer, "after_attempt", None)
         ):
             raise TypeError("attempt observer must implement before_attempt and after_attempt")
-        with self._capability_lock:
-            if self._attempt_observer is not None:
-                raise RuntimeError("gateway attempt observer is already bound")
-            self._attempt_observer = observer
+        if self._attempt_observer is not None:
+            raise RuntimeError("gateway attempt observer is already bound")
+        self._attempt_observer = observer
 
     def _call_with_retry(
         self,
-        protocol: str,
         request: GatewayRequest,
         cancel: CancelToken,
     ) -> GatewayResponse:
@@ -222,7 +154,7 @@ class ModelGateway:
         for attempt in range(self._retry.max_attempts):
             cancel.raise_if_cancelled()
             lifecycle = GatewayAttempt(
-                protocol,
+                "responses",
                 attempt + 1,
                 request,
                 self._conservative_attempt_usage(request),
@@ -230,11 +162,7 @@ class ModelGateway:
             if self._attempt_observer is not None:
                 self._attempt_observer.before_attempt(lifecycle)
             try:
-                result = self._call(
-                    protocol,
-                    request,
-                    cancel,
-                )
+                result = self._call(request, cancel)
             except GatewayHTTPError as exc:
                 self._finish_attempt(lifecycle, None, exc)
                 last_error = exc
@@ -274,18 +202,12 @@ class ModelGateway:
 
     def _call(
         self,
-        protocol: str,
         request: GatewayRequest,
         cancel: CancelToken,
     ) -> GatewayResponse:
-        if protocol == "responses":
-            path = "/responses"
-            payload = self._responses_payload(request)
-        else:
-            path = "/chat/completions"
-            payload = self._chat_payload(request)
+        payload = self._payload(request)
         response = self._transport.post(
-            f"{self._config.base_url}{path}",
+            f"{self._config.base_url}{_RESPONSES_PATH}",
             headers={
                 "Authorization": f"Bearer {self._config.api_key}",
                 "Content-Type": "application/json",
@@ -304,56 +226,37 @@ class ModelGateway:
                 retryable=(
                     response.status in {408, 409, 429}
                     or response.status >= 500
-                    and response.status not in _ENDPOINT_CAPABILITY_STATUSES
+                    and response.status not in _NON_RETRYABLE_STATUSES
                 ),
             )
         try:
             data = json.loads(response.body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GatewayError("model relay returned invalid JSON") from exc
-        if self._is_truncated(protocol, data):
-            usage = self._extract_usage(protocol, data, request, "")
+        if self._is_truncated(data):
+            usage = self._extract_usage(data, request, "")
             raise GatewayTruncationError(
-                "model relay response was truncated before a complete JSON action was produced",
+                "model response was truncated before a complete JSON action was produced",
                 usage=usage,
             )
-        text = self._extract_text(protocol, data)
-        usage = self._extract_usage(protocol, data, request, text)
+        text = self._extract_text(data)
+        usage = self._extract_usage(data, request, text)
         return GatewayResponse(
-            text, usage, protocol, response.headers.get("x-request-id"), data, response.status
+            text, usage, "responses", response.headers.get("x-request-id"), data, response.status
         )
 
     @staticmethod
-    def _is_truncated(protocol: str, data: Mapping[str, object]) -> bool:
-        """Detect outputs cut short by the relay's own token budget.
+    def _is_truncated(data: Mapping[str, object]) -> bool:
+        """Detect outputs cut short by the native Responses API.
 
-        Hidden-reasoning relays may consume every completion token on
-        ``reasoning_content`` and return an empty ``content`` field with
-        ``finish_reason: "length"``.  Such a body is a successful HTTP response
-        but cannot be parsed as an action, so it must never be handed back as
-        model output.
+        An unfinished response carries ``status: "incomplete"`` and/or an
+        ``incomplete_details`` payload; it must never be handed back as model
+        output because it cannot contain a complete JSON action.
         """
-        if protocol != "chat":
-            return False
-        try:
-            choices = data["choices"]
-            assert isinstance(choices, list) and choices
-            choice = choices[0]
-            assert isinstance(choice, Mapping)
-            finish = choice.get("finish_reason")
-            if isinstance(finish, str) and finish.lower() == "length":
-                return True
-            message = choice.get("message")
-            if not isinstance(message, Mapping):
-                return False
-            content = message.get("content")
-            if not (isinstance(content, str) and content.strip()):
-                usage = data.get("usage")
-                if isinstance(usage, Mapping) and isinstance(usage.get("completion_tokens"), int):
-                    return True
-        except (KeyError, IndexError, TypeError, AssertionError):
-            return False
-        return False
+        incomplete = data.get("incomplete_details")
+        return data.get("status") == "incomplete" or (
+            isinstance(incomplete, Mapping) and bool(incomplete)
+        )
 
     @staticmethod
     def _conservative_attempt_usage(request: GatewayRequest) -> TokenUsage:
@@ -393,7 +296,7 @@ class ModelGateway:
         self._attempt_observer.after_attempt(attempt, result)
 
     @staticmethod
-    def _responses_payload(request: GatewayRequest) -> dict[str, object]:
+    def _payload(request: GatewayRequest) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": request.model,
             "input": [{"role": m.role, "content": m.content} for m in request.messages],
@@ -410,62 +313,41 @@ class ModelGateway:
         return payload
 
     @staticmethod
-    def _chat_payload(request: GatewayRequest) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "model": request.model,
-            "messages": [{"role": m.role, "content": m.content} for m in request.messages],
-            "max_tokens": request.max_output_tokens,
-            "temperature": request.temperature,
-        }
-        if request.tools:
-            payload["tools"] = list(request.tools)
-        payload["response_format"] = {"type": "json_object"}
-        if request.seed is not None:
-            payload["seed"] = request.seed
-        if request.reasoning_effort is not None:
-            payload["reasoning_effort"] = request.reasoning_effort
-        return payload
-
-    @staticmethod
-    def _extract_text(protocol: str, data: Mapping[str, object]) -> str:
+    def _extract_text(data: Mapping[str, object]) -> str:
         try:
-            if protocol == "chat":
-                choices = data["choices"]
-                assert isinstance(choices, list)
-                message = choices[0]["message"]
-                text = message["content"]
+            if isinstance(data.get("output_text"), str):
+                text = data["output_text"]
             else:
-                if isinstance(data.get("output_text"), str):
-                    text = data["output_text"]
-                else:
-                    output = data["output"]
-                    assert isinstance(output, list)
-                    # Hidden-reasoning relays emit a reasoning item before the
-                    # final message; output_text may be absent.  Take the last
-                    # message item's text, falling back to the first text item.
-                    text = ""
-                    first_text = ""
-                    for item in reversed(output):
-                        if not isinstance(item, Mapping):
-                            continue
-                        content = item.get("content")
-                        if not isinstance(content, list) or not content:
-                            continue
-                        candidate = content[0]
-                        candidate_text = (
-                            candidate.get("text")
-                            if isinstance(candidate, Mapping)
-                            else None
-                        )
-                        if not isinstance(candidate_text, str) or not candidate_text:
-                            continue
-                        if not first_text:
-                            first_text = candidate_text
-                        if item.get("type") == "message":
-                            text = candidate_text
-                            break
-                    if not text:
-                        text = first_text
+                output = data["output"]
+                assert isinstance(output, list)
+                # Reasoning items precede the final message; output_text may be
+                # absent.  Take the last message item's text, falling back to
+                # the first text item.
+                text = ""
+                first_text = ""
+                for item in reversed(output):
+                    if not isinstance(item, Mapping):
+                        continue
+                    content = item.get("content")
+                    if not isinstance(content, list) or not content:
+                        continue
+                    candidate = content[0]
+                    candidate_text = (
+                        candidate.get("text")
+                        if isinstance(candidate, Mapping)
+                        else None
+                    )
+                    if not isinstance(candidate_text, str) or not candidate_text:
+                        continue
+                    if not first_text:
+                        first_text = candidate_text
+                    if item.get("type") == "message":
+                        text = candidate_text
+                        break
+                if not text:
+                    text = first_text
+            if not text:
+                raise GatewayError("model relay response contains no text output")
             if not isinstance(text, str):
                 raise TypeError
             return text
@@ -474,21 +356,19 @@ class ModelGateway:
 
     @staticmethod
     def _extract_usage(
-        protocol: str, data: Mapping[str, object], request: GatewayRequest, text: str
+        data: Mapping[str, object], request: GatewayRequest, text: str
     ) -> TokenUsage:
         usage = data.get("usage")
         if isinstance(usage, Mapping):
-            input_key = "input_tokens" if protocol == "responses" else "prompt_tokens"
-            output_key = "output_tokens" if protocol == "responses" else "completion_tokens"
-            input_tokens = usage.get(input_key)
-            output_tokens = usage.get(output_key)
+            input_tokens = usage.get("input_tokens")
+            output_tokens = usage.get("output_tokens")
             if isinstance(input_tokens, int) and isinstance(output_tokens, int):
                 cached = 0
                 reasoning = 0
-                details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details")
+                details = usage.get("input_tokens_details")
                 if isinstance(details, Mapping) and isinstance(details.get("cached_tokens"), int):
                     cached = int(details["cached_tokens"])
-                out_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details")
+                out_details = usage.get("output_tokens_details")
                 if isinstance(out_details, Mapping) and isinstance(out_details.get("reasoning_tokens"), int):
                     reasoning = int(out_details["reasoning_tokens"])
                 return TokenUsage(input_tokens, output_tokens, cached, reasoning, True)

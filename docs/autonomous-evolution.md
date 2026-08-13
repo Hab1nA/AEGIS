@@ -88,10 +88,11 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 
 - `AEGIS_OPENAI_BASE_URL=https://cf.api.fan/v1`（必需）
 - `AEGIS_OPENAI_API_KEY=<sk-...>`（必需）
-- `AEGIS_OPENAI_PROTOCOL=responses`（必须直接使用 responses 协议）
-- 输出格式固定为 `json_object`：网关不提供其他格式（无 plain、无
-  json_schema），chat 载荷 `response_format` 与 responses 载荷
-  `text.format` 一律发送 `{"type":"json_object"}`，无需环境变量配置。
+- 协议固定为官方原生 Responses API：网关只调用 `{base_url}/responses`，
+  载荷 `text.format` 一律为 `{"type":"json_object"}`；不保留 chat 兼容
+  格式、plain 或 json_schema。`AEGIS_OPENAI_PROTOCOL` 与
+  `AEGIS_OPENAI_STRUCTURED_FORMAT` 已废弃，设置后会被忽略。base_url
+  可指向官方 `https://api.deepseek.com` 或当前 relay `https://cf.api.fan/v1`。
 - `AEGIS_OPENAI_TIMEOUT_SECONDS`（可选，默认 900）
 - campaign 配置三角色 `model: "deepseek-v4-flash"` 且
   `reasoning_effort: "max"`（配置与网关请求均接受 `max`）
@@ -139,13 +140,12 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 覆盖：控制文件默认拒绝、显式授权后放行、安全边界（沙箱/发布/配置/评测/归因）
 即使在元进化开启时也永远拒绝。
 
-- **强制 JSON 输出（只有 json_object）**：网关只有 `responses` 与
-  `chat_json_object` 两种模式，任何请求（含无 `output_schema` 的）都强制
-  携带 JSON 格式约束：chat 载荷 `response_format` 与 responses 载荷
-  `text.format` 一律为 `{"type":"json_object"}`。不保留 plain 与
-  json_schema；`responses` 被上游拒绝时才切换 `chat_json_object`，两者均被
-  拒绝时直接报错，绝不降级到无约束文本。system prompt 必须包含 "json"
-  字样，`RoleAgentRuntime` 的固定提示词已满足。
+- **单一原生协议（Responses + json_object）**：网关只调用 `/responses`，
+  任何请求（含无 `output_schema` 的）载荷固定
+  `text: {"format":{"type":"json_object"}}`；不存在 chat 兼容模式、plain
+  或 json_schema。响应未完成（`status: "incomplete"` / `incomplete_details`）
+  或无文本时直接报错，绝不把截断结果交给运行时。system prompt 必须包含
+  "json" 字样，`RoleAgentRuntime` 的固定提示词已满足。
 - **最高推理强度**：角色配置 `reasoning_effort: "max"`。该 relay 的
   `deepseek-v4-flash` 是隐藏推理模型，medium/未设置时曾出现长时间挂起或把
   输出预算全部花在 `reasoning_content` 上；max 在实测中稳定返回。

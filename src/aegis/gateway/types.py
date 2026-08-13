@@ -16,7 +16,7 @@ class GatewayCancelled(GatewayError):
 
 
 class GatewayHTTPError(GatewayError):
-    """HTTP failure with retry and fallback metadata."""
+    """HTTP failure with retry metadata."""
 
     def __init__(self, status: int, body: str, *, retryable: bool = False) -> None:
         super().__init__(f"model relay returned HTTP {status}")

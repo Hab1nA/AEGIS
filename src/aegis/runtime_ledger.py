@@ -1,9 +1,9 @@
 """Durable, exactly-once accounting for model gateway transport attempts.
 
 The ledger deliberately observes transport attempts rather than logical model
-calls: retries and protocol fallbacks consume provider resources and therefore
-must each be reserved and settled.  Reservations are append-only EventStore
-records, so an interrupted process conservatively retains the reserved usage.
+calls: retries consume provider resources and therefore must each be reserved
+and settled.  Reservations are append-only EventStore records, so an
+interrupted process conservatively retains the reserved usage.
 """
 
 from __future__ import annotations
