@@ -879,7 +879,7 @@ class ModelCyclePorts:
             max_steps=min(self._limits.max_steps, 10),
             objective=(
                 "Generate a minimal, safe repair patch for the failed role generation. "
-                "Submit one JSON payload with summary and a changes array; every change "
+                "Submit one payload with summary and a changes array; every change "
                 "must carry path, content_base64 and executable."
             ),
             context={
@@ -1289,7 +1289,7 @@ class ModelCyclePorts:
             objective=(
                 "Solve the dynamic cohort inside the sandbox.  Use at most 12 tool steps, then "
                 "write each solution under tasks/<task_id>/solution.py inside the workspace, run "
-                "the public tests under tasks/<task_id>/tests/public, then submit one JSON payload "
+                "the public tests under tasks/<task_id>/tests/public, then submit one payload "
                 "binding per-task artifact_id, solution summary, and public-test results.  Partial "
                 "or imperfect solutions are acceptable and required to advance the cycle; never "
                 "exceed the step budget without submitting.  If you identify a concrete, minimal, "
@@ -1349,7 +1349,7 @@ class ModelCyclePorts:
             Role.JUDGE,
             objective=(
                 "Review the Warrior submission against the sealed cohort.  Assess correctness, "
-                "quality, hidden-failure risk and the cost of the next experiment.  Submit one JSON "
+                "quality, hidden-failure risk and the cost of the next experiment.  Submit one "
                 "payload with bounded findings and a quality_score in [0,1].  For every staged MCP "
                 "candidate, include mcp_decisions[{candidate_id,decision,rationale}], where decision "
                 "is approve, reject, or abstain; approval only admits an isolated experiment."
@@ -1377,7 +1377,7 @@ class ModelCyclePorts:
             Role.PROSECUTOR,
             objective=(
                 "Audit token consumption, evidence integrity and risk for this cycle.  Submit one "
-                "JSON payload with usage_verified, risk findings, and a structured curriculum "
+                "payload with usage_verified, risk findings, and a structured curriculum "
                 "hypothesis list for the next cycle.  Independently decide every staged MCP candidate "
                 "using mcp_decisions[{candidate_id,decision,rationale}]; use reject as a veto."
             ),
@@ -1556,7 +1556,7 @@ class ModelCyclePorts:
                 role,
                 objective=(
                     "Critique the proposed objective amendment against sealed evidence. "
-                    "Submit JSON with summary and confidence."
+                    "Submit summary and confidence."
                 ),
                 context={
                     "snapshot": _truncate(snapshot.to_mapping()),
@@ -1580,7 +1580,7 @@ class ModelCyclePorts:
             vote_evidence = self._run_role(
                 role,
                 objective=(
-                    "Vote independently on the objective amendment.  Submit JSON with decision "
+                    "Vote independently on the objective amendment.  Submit a decision "
                     "equal to support, oppose, or abstain, plus a short summary."
                 ),
                 context={
@@ -2097,16 +2097,16 @@ class ModelCyclePorts:
                     "drafts/<task_id>/.  Every pack must contain manifest.json, prompt.md, "
                     "separate public and hidden pytest suites, a passing reference solution, "
                     "a known-defect solution and at least one mutant.  Run the public checks you "
-                    "can inspect, then submit a JSON summary listing the written draft paths.  "
+                    "can inspect, then submit a summary listing the written draft paths.  "
                     "You MUST materialize every file in the sandbox workspace using the "
                     "workspace.write action with path and base64 content; a description of the "
-                    "files in the JSON response is not acceptable. Write manifest.json exactly "
+                    "files in the response is not acceptable. Write manifest.json exactly "
                     "per the provided manifest_schema (the control plane recomputes "
                     "content_hash), and lay out files per the provided layout. The workspace "
                     "contains a complete working template under templates/example-task/; read "
                     "it with workspace.read, then copy and adapt that exact structure to "
                     "drafts/<task_id>/ with workspace.write. Do not embed archives or source "
-                    "files in the JSON response."
+                    "files in the response."
                 ),
                 context={
                     "snapshot": _truncate(snapshot.to_mapping()),
