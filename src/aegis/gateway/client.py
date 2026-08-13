@@ -184,9 +184,9 @@ class ModelGateway:
         if self._config.protocol == "responses":
             return ("responses",)
         chat_structured: tuple[_GatewayMode, ...] = (
-            ("chat_json_object", "chat_json_schema", "chat_plain")
+            ("chat_json_object", "chat_json_schema")
             if self._config.structured_format == "json_object"
-            else ("chat_json_schema", "chat_json_object", "chat_plain")
+            else ("chat_json_schema", "chat_json_object")
         )
         if self._config.protocol == "chat":
             return chat_structured if structured else ("chat_plain",)

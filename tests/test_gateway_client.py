@@ -17,6 +17,7 @@ from aegis.gateway.types import (
     GatewayAttempt,
     GatewayAttemptResult,
     GatewayCancelled,
+    GatewayError,
     GatewayHTTPError,
     GatewayRequest,
     GatewayTruncationError,
@@ -330,7 +331,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(transport.calls[2][2]["response_format"], {"type": "json_object"})
         self.assertEqual([item.succeeded for _, item in observer.finished], [False, False, True])
 
-    def test_unsupported_json_object_finally_falls_back_to_plain_chat(self) -> None:
+    def test_structured_request_never_falls_back_to_plain_chat(self) -> None:
         request = GatewayRequest(
             "model-a",
             (Message("user", "return JSON"),),
@@ -342,26 +343,22 @@ class GatewayTests(unittest.TestCase):
                 response({"error": "responses unsupported"}, 400),
                 response({"error": "json_schema unsupported"}, 400),
                 response({"error": "json_object unsupported"}, 400),
-                response(
-                    {
-                        "choices": [{"message": {"content": "{}"}}],
-                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
-                    }
-                ),
             ]
         )
 
-        result = ModelGateway(self.config, transport=transport).complete(request)
-
-        self.assertEqual(result.text, "{}")
-        self.assertNotIn("response_format", transport.calls[3][2])
+        with self.assertRaises(GatewayError):
+            ModelGateway(self.config, transport=transport).complete(request)
+        for url, _, payload in transport.calls:
+            if url.endswith("/responses"):
+                self.assertIn("format", payload["text"])
+            else:
+                self.assertIn("response_format", payload)
 
     def test_successful_fallback_mode_is_cached_for_later_requests(self) -> None:
         request = GatewayRequest(
             "model-a",
             (Message("user", "return JSON"),),
             100,
-            output_schema={"type": "object"},
         )
         plain = {
             "choices": [{"message": {"content": "{}"}}],
@@ -370,8 +367,6 @@ class GatewayTests(unittest.TestCase):
         transport = FakeTransport(
             [
                 response({"error": "responses unsupported"}, 400),
-                response({"error": "json_schema unsupported"}, 400),
-                response({"error": "json_object unsupported"}, 400),
                 response(plain),
                 response(plain),
             ]
@@ -381,7 +376,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(gateway.complete(request).text, "{}")
         self.assertEqual(gateway.complete(request).text, "{}")
 
-        self.assertEqual(len(transport.calls), 5)
+        self.assertEqual(len(transport.calls), 3)
         self.assertNotIn("response_format", transport.calls[-1][2])
 
     def test_cached_capability_failure_reprobes_and_replaces_mode(self) -> None:
@@ -389,7 +384,6 @@ class GatewayTests(unittest.TestCase):
             "model-a",
             (Message("user", "return JSON"),),
             100,
-            output_schema={"type": "object"},
         )
         plain = {
             "choices": [{"message": {"content": "{}"}}],
@@ -399,8 +393,6 @@ class GatewayTests(unittest.TestCase):
         transport = FakeTransport(
             [
                 response({"error": "responses unsupported"}, 400),
-                response({"error": "json_schema unsupported"}, 400),
-                response({"error": "json_object unsupported"}, 400),
                 response(plain),
                 response({"error": "plain chat capability changed"}, 400),
                 response(responses),
@@ -413,9 +405,9 @@ class GatewayTests(unittest.TestCase):
         gateway.complete(request)
         gateway.complete(request)
 
-        self.assertTrue(transport.calls[4][0].endswith("/chat/completions"))
-        self.assertTrue(transport.calls[5][0].endswith("/responses"))
-        self.assertTrue(transport.calls[6][0].endswith("/responses"))
+        self.assertTrue(transport.calls[2][0].endswith("/chat/completions"))
+        self.assertTrue(transport.calls[3][0].endswith("/responses"))
+        self.assertTrue(transport.calls[4][0].endswith("/responses"))
 
     def test_cached_auth_and_quota_failures_do_not_trigger_reprobe(self) -> None:
         successful = response(
