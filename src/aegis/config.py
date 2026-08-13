@@ -122,6 +122,7 @@ class AutonomyV2Config:
     environment_output_repository: str | None = None
     scanner_binary: str = "trivy"
     candidate_max_extra_steps: int = 12
+    require_warrior_strategy_proposal: bool = False
 
     _FIELDS = frozenset(
         {
@@ -156,6 +157,7 @@ class AutonomyV2Config:
             "environment_output_repository",
             "scanner_binary",
             "candidate_max_extra_steps",
+            "require_warrior_strategy_proposal",
         }
     )
     _EVOLUTION_SURFACES = frozenset(
@@ -385,6 +387,10 @@ class AutonomyV2Config:
             environment_output_repository=environment_output,
             scanner_binary=scanner_binary,
             candidate_max_extra_steps=candidate_steps,
+            require_warrior_strategy_proposal=_bool(
+                raw.get("require_warrior_strategy_proposal", False),
+                "autonomy_v2.require_warrior_strategy_proposal",
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -424,6 +430,7 @@ class AutonomyV2Config:
             "environment_output_repository": self.environment_output_repository,
             "scanner_binary": self.scanner_binary,
             "candidate_max_extra_steps": self.candidate_max_extra_steps,
+            "require_warrior_strategy_proposal": self.require_warrior_strategy_proposal,
         }
 
 

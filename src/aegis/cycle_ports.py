@@ -670,6 +670,7 @@ class ModelCyclePorts:
         runtime_consumed: Mapping[str, float | int] | None = None,
         objective_governance: ObjectiveGovernanceRegistry | None = None,
         runtime_ledger: RuntimeGatewayAttemptObserver | None = None,
+        require_warrior_strategy_proposal: bool = False,
     ) -> None:
         self._gateway = gateway
         self._sandbox = sandbox
@@ -702,6 +703,7 @@ class ModelCyclePorts:
         self._objective_probation_cycles = objective_probation_cycles
         self._council_max_messages = council_max_messages
         self._council_max_tokens = council_max_tokens
+        self._require_warrior_strategy_proposal = require_warrior_strategy_proposal
         self._objective_history_path = data_dir / "objective_history.jsonl"
         self._campaign_event_store = history_store or activation_store
         self._attribution_ledger = data_dir / "attribution_arms.jsonl"
@@ -1330,6 +1332,11 @@ class ModelCyclePorts:
             request_seed=evaluation_seed,
             mcp_bridge=mcp_bridge,
             paired_design_id=evaluation_design_id,
+            required_action_groups=(
+                (frozenset({"strategy.propose"}),)
+                if self._require_warrior_strategy_proposal
+                else ()
+            ),
         )
         artifact_id = evidence.get("workspace_artifact_id")
         size = evidence.get("workspace_size_bytes")
@@ -4460,6 +4467,9 @@ def run_v2_cycle(
     autonomy_config = getattr(campaign_config, "autonomy_v2", None)
     council_max_messages = int(getattr(autonomy_config, "council_max_messages", 24))
     council_max_tokens = int(getattr(autonomy_config, "council_max_tokens", 1_048_576))
+    require_warrior_strategy_proposal = bool(
+        getattr(autonomy_config, "require_warrior_strategy_proposal", False)
+    )
     runtime_consumed: dict[str, float | int] = {
         "max_total_tokens": 0,
         "max_requests": 0,
@@ -4609,6 +4619,7 @@ def run_v2_cycle(
         runtime_consumed=runtime_consumed,
         objective_governance=objective_governance,
         runtime_ledger=runtime_ledger,
+        require_warrior_strategy_proposal=require_warrior_strategy_proposal,
     )
     if effective_policy is not None and effective_policy.maintenance_only:
         maintenance = ports._run_role(

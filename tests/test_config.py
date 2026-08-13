@@ -166,6 +166,49 @@ class ConfigTests(unittest.TestCase):
                 )
             )
 
+    def test_require_warrior_strategy_proposal_is_optional_and_validated(self):
+        roles = {
+            "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},
+            "judge": {"model": "j", "budget_share": 0.225, "max_output_tokens": 4096},
+            "prosecutor": {"model": "p", "budget_share": 0.225, "max_output_tokens": 4096},
+        }
+        config = CampaignConfig.from_mapping(
+            valid_config(
+                acceptance_profile="autonomous_evolution_v2",
+                roles=roles,
+                task_pack_paths=[],
+                autonomy_v2={
+                    "public_repo_url": "https://github.com/example/aegis-roles.git",
+                    "require_warrior_strategy_proposal": True,
+                },
+            )
+        )
+        assert config.autonomy_v2 is not None
+        self.assertTrue(config.autonomy_v2.require_warrior_strategy_proposal)
+        self.assertEqual(CampaignConfig.from_mapping(config.to_dict()), config)
+        default = CampaignConfig.from_mapping(
+            valid_config(
+                acceptance_profile="autonomous_evolution_v2",
+                roles=roles,
+                task_pack_paths=[],
+                autonomy_v2={"public_repo_url": "https://github.com/example/aegis-roles.git"},
+            )
+        )
+        assert default.autonomy_v2 is not None
+        self.assertFalse(default.autonomy_v2.require_warrior_strategy_proposal)
+        with self.assertRaisesRegex(ConfigError, "require_warrior_strategy_proposal"):
+            CampaignConfig.from_mapping(
+                valid_config(
+                    acceptance_profile="autonomous_evolution_v2",
+                    roles=roles,
+                    task_pack_paths=[],
+                    autonomy_v2={
+                        "public_repo_url": "https://github.com/example/aegis-roles.git",
+                        "require_warrior_strategy_proposal": "yes",
+                    },
+                )
+            )
+
     def test_dynamic_v2_cannot_relax_the_safety_constitution(self):
         roles = {
             "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},
