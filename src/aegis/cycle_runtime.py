@@ -258,9 +258,15 @@ class EvolutionCycleController:
         # already recorded this snapshot, so re-recording is skipped
         # idempotently while still requiring an exact content match.
         current = self._registry.projection.current_snapshot
+        interrupted_retry = (
+            state is CycleState.CREATED
+            and current is not None
+            and snapshot.cycle_number == current.cycle_number
+            and snapshot.snapshot_id != current.snapshot_id
+        )
         if current is None or snapshot.cycle_number > current.cycle_number:
             self._registry.record_snapshot(snapshot, retry=retry)
-        elif retry and snapshot.cycle_number == current.cycle_number:
+        elif interrupted_retry or (retry and snapshot.cycle_number == current.cycle_number):
             self._registry.record_snapshot(snapshot, retry=True)
         elif snapshot.snapshot_id != current.snapshot_id:
             raise CycleRuntimeError("snapshot conflicts with the recorded cycle")
