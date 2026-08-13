@@ -641,7 +641,7 @@ class ModelCyclePorts:
         objective_history_window: int = 3,
         objective_probation_cycles: int = 2,
         council_max_messages: int = 24,
-        council_max_tokens: int = 262_144,
+        council_max_tokens: int = 1_048_576,
         public_repo_url: str | None = None,
         source_commit: str | None = None,
         evolution: EvolutionRegistry | None = None,
@@ -4329,7 +4329,7 @@ def _runtime_policy_genesis_values(
         ),
         "subagent_max_steps": int(getattr(autonomy, "subagent_max_steps", 8)),
         "council_max_messages": int(getattr(autonomy, "council_max_messages", 24)),
-        "council_max_tokens": int(getattr(autonomy, "council_max_tokens", 262_144)),
+        "council_max_tokens": int(getattr(autonomy, "council_max_tokens", 1_048_576)),
         "command_timeout_seconds": float(limits.max_timeout_seconds),
         "sealed_timeout_seconds": float(limits.max_timeout_seconds),
         "subagent_timeout_seconds": float(
@@ -4459,7 +4459,7 @@ def run_v2_cycle(
     runtime_ledger: RuntimeGatewayAttemptObserver | None = None
     autonomy_config = getattr(campaign_config, "autonomy_v2", None)
     council_max_messages = int(getattr(autonomy_config, "council_max_messages", 24))
-    council_max_tokens = int(getattr(autonomy_config, "council_max_tokens", 262_144))
+    council_max_tokens = int(getattr(autonomy_config, "council_max_tokens", 1_048_576))
     runtime_consumed: dict[str, float | int] = {
         "max_total_tokens": 0,
         "max_requests": 0,

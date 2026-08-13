@@ -90,7 +90,7 @@ class AutonomyV2Config:
     dynamic_only: bool = True
     task_holdout_delay_cycles: int = 1
     council_max_messages: int = 24
-    council_max_tokens: int = 262_144
+    council_max_tokens: int = 1_048_576
     objective_history_window: int = 3
     objective_probation_cycles: int = 2
     public_repo_url: str | None = None
@@ -347,7 +347,7 @@ class AutonomyV2Config:
                 raw.get("council_max_messages", 24), "autonomy_v2.council_max_messages"
             ),
             council_max_tokens=_positive_int(
-                raw.get("council_max_tokens", 262_144), "autonomy_v2.council_max_tokens"
+                raw.get("council_max_tokens", 1_048_576), "autonomy_v2.council_max_tokens"
             ),
             objective_history_window=_positive_int(
                 raw.get("objective_history_window", 3),

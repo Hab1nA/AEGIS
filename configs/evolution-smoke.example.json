@@ -10,7 +10,7 @@
     "enabled": true,
     "task_holdout_delay_cycles": 1,
     "council_max_messages": 24,
-    "council_max_tokens": 262144,
+    "council_max_tokens": 1048576,
     "objective_history_window": 3,
     "objective_probation_cycles": 2,
     "public_repo_url": "https://github.com/Hab1nA/AEGIS",
