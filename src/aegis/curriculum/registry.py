@@ -848,15 +848,16 @@ class CurriculumRegistry:
     def _apply_snapshot_event(
         projection: CycleProjection, payload: object, event_type: str
     ) -> CycleProjection:
+        payload_data = dict(payload) if isinstance(payload, Mapping) else payload
+        retry = bool(payload_data.pop("retry", False)) if isinstance(payload_data, dict) else False
         data = _strict_payload(
-            payload,
+            payload_data,
             {"schema_version", "snapshot", "previous_cycle_state", "cycle_state"},
             event_type,
         )
         snapshot = CurriculumSnapshot.from_mapping(data["snapshot"])
         previous_state = _cycle_state(data["previous_cycle_state"], "previous_cycle_state")
         target_state = _cycle_state(data["cycle_state"], "cycle_state")
-        retry = bool(data.get("retry", False))
         if previous_state is not projection.cycle_state or target_state is not CycleState.CREATED:
             raise CurriculumRegistryError("snapshot cycle state checkpoint does not match")
         if snapshot.campaign_id != projection.campaign_id:
