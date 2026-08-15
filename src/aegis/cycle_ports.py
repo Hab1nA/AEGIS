@@ -67,6 +67,7 @@ from aegis.council import (
     CouncilMessage,
     CouncilMessageType,
     CouncilOutcome,
+    CouncilProtocolError,
     CouncilProposalKind,
     CouncilTranscript,
     EvidenceClaim,
@@ -164,7 +165,7 @@ from aegis.mcp import (
     McpRegistry,
     McpRiskLevel,
 )
-from aegis.models import Role, canonical_json
+from aegis.models import JsonValue, Role, canonical_json, thaw_json
 from aegis.objectives import (
     AdaptiveObjectiveVersion,
     AmendmentDecision,
@@ -193,6 +194,7 @@ from aegis.roles import RoleRegistry
 from aegis.roles.generation import GenerationBundle, RoleGeneration
 from aegis.runtime_ledger import (
     AccountingContext,
+    RuntimeBudgetExceeded,
 )
 from aegis.runtime_ledger import (
     GatewayAttemptObserver as RuntimeGatewayAttemptObserver,
@@ -312,6 +314,48 @@ def _score(value: object) -> float:
     if not math.isfinite(numeric):
         return 0.5
     return min(1.0, max(0.0, numeric))
+
+
+def _validate_runtime_policy_council_decisions(
+    raw_decisions: object, pending: set[str]
+) -> list[Mapping[str, Any]]:
+    if not isinstance(raw_decisions, list):
+        raise ValueError("runtime_policy_decisions must be a list")
+    expected_keys = {
+        "amendment_id",
+        "decision",
+        "reason",
+        "replacement_amendment_id",
+    }
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for item in raw_decisions:
+        if not isinstance(item, Mapping) or set(item) != expected_keys:
+            raise ValueError("runtime-policy council decision has an invalid schema")
+        amendment_id = item["amendment_id"]
+        decision = item["decision"]
+        reason = item["reason"]
+        replacement = item["replacement_amendment_id"]
+        if not isinstance(amendment_id, str) or not amendment_id:
+            raise ValueError("runtime-policy council decision has an invalid amendment id")
+        if amendment_id in by_id:
+            raise ValueError(
+                "council must decide every pending runtime-policy amendment exactly once"
+            )
+        if decision not in {"ratify", "revise", "rollback"}:
+            raise ValueError("runtime-policy council decision is invalid")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("runtime-policy council decision requires a reason")
+        if decision == "ratify":
+            if replacement is not None:
+                raise ValueError("ratification cannot name a replacement amendment")
+        elif not isinstance(replacement, str) or not replacement:
+            raise ValueError("revision or rollback requires a replacement amendment")
+        by_id[amendment_id] = dict(item)
+    if set(by_id) != pending:
+        raise ValueError(
+            "council must decide every pending runtime-policy amendment exactly once"
+        )
+    return [by_id[amendment_id] for amendment_id in sorted(pending)]
 
 
 def _usage_summary(usages: Sequence[TokenUsage]) -> Mapping[str, int]:
@@ -713,7 +757,6 @@ class ModelCyclePorts:
         self._default_image = default_image
         self._evaluate_candidates_enabled = evaluate_candidates_enabled
         self._candidate_max_extra_steps = candidate_max_extra_steps
-        self._shadow_max_steps = max(candidate_max_extra_steps, self._limits.max_steps)
         if isinstance(candidate_max_extra_steps, bool) or not isinstance(
             candidate_max_extra_steps, int
         ) or not 1 <= candidate_max_extra_steps <= 1000:
@@ -913,6 +956,35 @@ class ModelCyclePorts:
             self._runtime_consumed.get("max_requests", 0)
         ) + 1
 
+    def _policy_value(self, name: str, fallback: Any) -> Any:
+        if self._runtime_policy_registry is None:
+            return fallback
+        boundary = RuntimeStageBoundary(
+            self._runtime_policy_cycle,
+            self._runtime_stage_ordinal,
+            f"stage:{self._runtime_stage_ordinal}",
+        )
+        policy = self._runtime_policy_registry.effective_for_stage(boundary)
+        return policy.values.get(name, fallback)
+
+    def _candidate_step_limit(self) -> int:
+        return int(
+            self._policy_value("candidate_max_steps", self._candidate_max_extra_steps)
+        )
+
+    def _subagent_accounting_binding(self) -> Mapping[str, Any] | None:
+        if self._runtime_policy_registry is None:
+            return None
+        context = _ACCOUNTING_CONTEXT.get()
+        if context is None:
+            raise RuntimeError("subagent spawn is outside an accounting context")
+        return {
+            "event_store_path": str(self._runtime_policy_registry.store.path),
+            "artifact_root": str(self._runtime_policy_registry.artifacts.root),
+            "policy_campaign_id": self._runtime_policy_registry.campaign_id,
+            "parent_context": context.to_mapping(),
+        }
+
     def _adjust_runtime_policy(
         self, arguments: Mapping[str, Any]
     ) -> Mapping[str, Any]:
@@ -926,38 +998,38 @@ class ModelCyclePorts:
         requested_at = _RUNTIME_STAGE_BOUNDARY.get()
         if requested_at is None:
             raise RuntimeError("runtime policy amendment is outside a bounded stage")
-        effective_at = RuntimeStageBoundary(
-            requested_at.cycle,
-            requested_at.ordinal + 1,
-            f"stage:{requested_at.ordinal + 1}",
-        )
         target = arguments["rollback_target_policy_id"]
         if target is None:
-            amendment = self._runtime_policy_registry.request_patch_after_stage(
+            amendment = self._runtime_policy_registry.request_patch_immediately(
                 requested_by=Role.PROSECUTOR,
                 requested_at=requested_at,
-                effective_at=effective_at,
+                request_id=str(arguments["request_id"]),
+                base_policy_id=str(arguments["base_policy_id"]),
                 patch=cast(Mapping[str, Any], arguments["patch"]),
                 consumed=consumed,
                 reason=str(arguments["reason"]).strip(),
+                evidence_refs=tuple(cast(list[str], arguments["evidence_refs"])),
             )
         else:
-            amendment = self._runtime_policy_registry.request_rollback_after_stage(
+            amendment = self._runtime_policy_registry.request_rollback_immediately(
                 requested_by=Role.PROSECUTOR,
                 requested_at=requested_at,
-                effective_at=effective_at,
+                request_id=str(arguments["request_id"]),
+                base_policy_id=str(arguments["base_policy_id"]),
                 target_policy_id=cast(str, target),
                 consumed=consumed,
                 reason=str(arguments["reason"]).strip(),
+                evidence_refs=tuple(cast(list[str], arguments["evidence_refs"])),
             )
         return {
             "amendment_id": amendment.amendment_id,
             "base_policy_id": amendment.base_policy_id,
             "resulting_policy_id": amendment.resulting_policy_id,
-            "effective_cycle": amendment.effective_at.cycle,
-            "effective_stage": amendment.effective_at.to_mapping(),
+            "effective_cycle": amendment.requested_at.cycle,
+            "effective_stage": amendment.requested_at.to_mapping(),
+            "revision": amendment.revision,
             "maintenance_only": self._runtime_policy_registry.effective_for_stage(
-                amendment.effective_at
+                amendment.requested_at
             ).maintenance_only,
         }
 
@@ -994,10 +1066,16 @@ class ModelCyclePorts:
         policy_max_steps = self._limits.max_steps
         policy_timeout = self._limits.max_timeout_seconds
         if self._runtime_policy_registry is not None:
-            stage_policy = self._runtime_policy_registry.effective_for_stage(boundary)
-            policy_max_steps = cast(int, stage_policy.values["max_steps"])
+            stage_policy = (
+                self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
+                if paired_design_id is not None
+                else self._runtime_policy_registry.effective_for_stage(boundary)
+            )
+            policy_max_steps = int(
+                cast(Mapping[str, Any], stage_policy.values["role_max_steps"])[role.value]
+            )
             policy_timeout = float(
-                cast(float | int, stage_policy.values["command_timeout_seconds"])
+                cast(Mapping[str, Any], stage_policy.values["role_command_timeout_seconds"])[role.value]
             )
             outputs = cast(
                 Mapping[str, Any], stage_policy.values["role_max_output_tokens"]
@@ -1028,6 +1106,19 @@ class ModelCyclePorts:
             "subagent_manager": self._subagent_manager,
             "meta_evolution_enabled": self._meta_evolution_enabled,
             "runtime_policy_adjuster": self._adjust_runtime_policy,
+            "runtime_policy_values": (
+                (lambda: cast(
+                    Mapping[str, Any],
+                    (
+                        self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
+                        if paired_design_id is not None
+                        else self._runtime_policy_registry.effective_for_stage(boundary)
+                    ).values,
+                ))
+                if self._runtime_policy_registry is not None
+                else None
+            ),
+            "subagent_accounting_binding": self._subagent_accounting_binding,
             "allowed_actions_override": restrict_actions,
         }
         broker_tuple = self._broker_for_binding(role, binding, sandbox_id)
@@ -1059,6 +1150,25 @@ class ModelCyclePorts:
                 self._sandbox, sandbox_id, stage_workspace
             )
         try:
+            def active_policy_values(_runtime_role: GatewayRole) -> Mapping[str, Any]:
+                if self._runtime_policy_registry is None:
+                    return {}
+                values = cast(
+                    dict[str, Any],
+                    thaw_json(cast(
+                        JsonValue,
+                        (
+                            self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
+                            if paired_design_id is not None
+                            else self._runtime_policy_registry.effective_for_stage(boundary)
+                        ).values,
+                    )),
+                )
+                if max_steps is not None:
+                    steps = cast(dict[str, Any], values["role_max_steps"])
+                    steps[role.value] = min(int(steps[role.value]), max_steps)
+                return values
+
             runtime = RoleAgentRuntime(
                 self._gateway,
                 dispatcher,
@@ -1070,8 +1180,31 @@ class ModelCyclePorts:
                 request_seed=request_seed,
                 workflow=dict(binding.workflow) if binding.workflow else None,
                 subject=dict(binding.subject) if binding.subject else None,
+                policy_provider=(
+                    active_policy_values if self._runtime_policy_registry is not None else None
+                ),
             )
             runtime_context = dict(context)
+            if self._runtime_policy_registry is not None:
+                active_policy = (
+                    self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
+                    if paired_design_id is not None
+                    else self._runtime_policy_registry.effective_for_stage(boundary)
+                )
+                runtime_context["runtime_policy"] = {
+                    "policy_id": active_policy.policy_id,
+                    "schema_version": active_policy.schema_version,
+                    "values": thaw_json(cast(JsonValue, active_policy.values)),
+                    "consumed": dict(
+                        self._runtime_ledger.consumed().to_policy_mapping()
+                        if self._runtime_ledger is not None
+                        else self._runtime_consumed
+                    ),
+                    "pending_council_review": [
+                        item.amendment_id
+                        for item in self._runtime_policy_registry.pending_council_amendments()
+                    ],
+                }
             if role is Role.WARRIOR and binding.mcps:
                 runtime_context["active_mcp_bindings"] = [
                     {
@@ -1122,6 +1255,17 @@ class ModelCyclePorts:
                     for item in result.observations[:100]
                 ],
             }
+            if self._runtime_policy_registry is not None:
+                evidence["runtime_policy_id"] = (
+                    self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
+                    if paired_design_id is not None
+                    else self._runtime_policy_registry.effective_for_stage(boundary)
+                ).policy_id
+                evidence["runtime_policy_amendments"] = [
+                    item.amendment_id
+                    for item in self._runtime_policy_registry.immediate_amendments
+                    if item.requested_at == boundary
+                ]
             if stage_workspace is not None and workspace_digest is not None:
                 evidence["workspace_digest"] = workspace_digest
                 evidence["workspace_staged"] = True
@@ -1421,9 +1565,16 @@ class ModelCyclePorts:
             role,
             objective=(
                 "Prepare an independent, role-scoped reflection for the council: what worked, "
-                "what should change, and which next hypothesis deserves a test."
+                "what should change, and which next hypothesis deserves a test. If resources or "
+                "governance setpoints constrained the work, include runtime_policy_requests as a "
+                "list of {request_id,base_policy_id,patch,rationale,evidence_refs}; this is advisory "
+                "and only the Prosecutor may apply it."
             ),
-            restrict_actions=frozenset({"submit", "strategy.propose"}),
+            restrict_actions=(
+                frozenset({"submit", "strategy.propose", "aegis.adjust_runtime_policy"})
+                if role is Role.PROSECUTOR
+                else frozenset({"submit", "strategy.propose"})
+            ),
             context={
                 "snapshot": _truncate(snapshot.to_mapping()),
                 "submission": _brief(self._artifacts, submission),
@@ -1460,7 +1611,28 @@ class ModelCyclePorts:
             token_usage=int(usage.get("input_tokens", 0))
             + int(usage.get("output_tokens", 0)),
         )
-        return {**evidence, "role": role.value, "message": message.to_mapping()}
+        requests = evidence.get("submission", {}).get("runtime_policy_requests", [])
+        valid_requests: list[Mapping[str, Any]] = []
+        if isinstance(requests, list):
+            for item in requests:
+                if (
+                    isinstance(item, Mapping)
+                    and set(item) == {"request_id", "base_policy_id", "patch", "rationale", "evidence_refs"}
+                    and isinstance(item["request_id"], str)
+                    and isinstance(item["base_policy_id"], str)
+                    and isinstance(item["patch"], Mapping)
+                    and bool(item["patch"])
+                    and isinstance(item["rationale"], str)
+                    and isinstance(item["evidence_refs"], list)
+                    and all(isinstance(ref, str) and ref.strip() for ref in item["evidence_refs"])
+                ):
+                    valid_requests.append(dict(item))
+        return {
+            **evidence,
+            "role": role.value,
+            "message": message.to_mapping(),
+            "runtime_policy_requests": valid_requests,
+        }
 
     def deliberate(
         self,
@@ -1471,10 +1643,22 @@ class ModelCyclePorts:
         prosecutor_audit: ArtifactRef,
     ) -> Mapping[str, Any]:
         cycle_id = f"cycle:{snapshot.cycle_number}"
+        council_max_messages = self._council_max_messages
+        council_max_tokens = self._council_max_tokens
+        if self._runtime_policy_registry is not None:
+            council_policy = self._runtime_policy_registry.effective_for_stage(
+                RuntimeStageBoundary(
+                    self._runtime_policy_cycle,
+                    self._runtime_stage_ordinal + 1,
+                    f"stage:{self._runtime_stage_ordinal + 1}",
+                )
+            )
+            council_max_messages = int(cast(int, council_policy.values["council_max_messages"]))
+            council_max_tokens = int(cast(int, council_policy.values["council_max_tokens"]))
         transcript = CouncilTranscript(
             cycle_id,
-            max_messages=self._council_max_messages,
-            max_tokens=self._council_max_tokens,
+            max_messages=council_max_messages,
+            max_tokens=council_max_tokens,
         )
         reflection_payloads = [_read(self._artifacts, ref) for ref in reflections]
         for payload in reflection_payloads:
@@ -1487,7 +1671,11 @@ class ModelCyclePorts:
                 "capability_tags, capability_weights for efficiency/generalization/quality/retention, "
                 "and rationale.  The constitution cannot be changed. For every L2 MCP candidate, "
                 "also include mcp_decisions[{candidate_id,decision,rationale}], where decision is "
-                "approve, reject, or abstain. Treat any Prosecutor rejection as a veto."
+                "approve, reject, or abstain. Treat any Prosecutor rejection as a veto. For every "
+                "pending runtime-policy amendment submit exactly one runtime_policy_decisions entry "
+                "{amendment_id,decision,reason,replacement_amendment_id}; decision is ratify, revise, "
+                "or rollback. For revise/rollback first apply the compensating policy action and name "
+                "its amendment id; ratify uses replacement_amendment_id=null."
             ),
             context={
                 "snapshot": _truncate(snapshot.to_mapping()),
@@ -1495,9 +1683,73 @@ class ModelCyclePorts:
                 "warrior_submission": _brief(self._artifacts, submission),
                 "judge_review": _brief(self._artifacts, judge_review),
                 "prosecutor_audit": _brief(self._artifacts, prosecutor_audit),
+                "pending_runtime_policy_amendments": (
+                    [item.to_artifact_mapping() for item in self._runtime_policy_registry.pending_council_amendments()]
+                    if self._runtime_policy_registry is not None
+                    else []
+                ),
             },
         )
         chair_submission = chair.get("submission", {})
+        runtime_policy_decisions: list[Mapping[str, Any]] = []
+        if self._runtime_policy_registry is not None:
+            raw_decisions = (
+                chair_submission.get("runtime_policy_decisions", [])
+                if isinstance(chair_submission, Mapping)
+                else []
+            )
+            pending_items = self._runtime_policy_registry.pending_council_amendments()
+            pending = {item.amendment_id for item in pending_items}
+            if pending:
+                try:
+                    validated_decisions = _validate_runtime_policy_council_decisions(
+                        raw_decisions, pending
+                    )
+                except ValueError as exc:
+                    decision_repair = self._run_role(
+                        Role.PROSECUTOR,
+                        objective=(
+                            "Repair the runtime-policy council decision schema exactly once. "
+                            "For every currently pending amendment submit exactly one "
+                            "runtime_policy_decisions entry with amendment_id, decision, reason, "
+                            "and replacement_amendment_id. decision must be ratify, revise, or "
+                            "rollback. Ratify requires replacement_amendment_id=null; for revise "
+                            "or rollback first apply a compensating policy action and cite its "
+                            "amendment id. Do not omit, duplicate, or decide any non-pending id."
+                        ),
+                        context={
+                            "pending_runtime_policy_amendments": [
+                                item.to_artifact_mapping()
+                                for item in self._runtime_policy_registry.pending_council_amendments()
+                            ],
+                            "invalid_runtime_policy_decisions": _truncate(raw_decisions),
+                            "validation_error": str(exc)[:2000],
+                        },
+                    )
+                    repaired_submission = decision_repair.get("submission", {})
+                    raw_decisions = (
+                        repaired_submission.get("runtime_policy_decisions", [])
+                        if isinstance(repaired_submission, Mapping)
+                        else []
+                    )
+                    pending = {
+                        item.amendment_id
+                        for item in self._runtime_policy_registry.pending_council_amendments()
+                    }
+                    validated_decisions = _validate_runtime_policy_council_decisions(
+                        raw_decisions, pending
+                    )
+                for raw in validated_decisions:
+                    runtime_policy_decisions.append(
+                        self._runtime_policy_registry.record_council_decision(
+                            amendment_id=cast(str, raw["amendment_id"]),
+                            decision=cast(str, raw["decision"]),
+                            reason=cast(str, raw["reason"]),
+                            replacement_amendment_id=cast(
+                                str | None, raw["replacement_amendment_id"]
+                            ),
+                        )
+                    )
         mcp_decisions = (
             chair_submission.get("mcp_decisions", [])
             if isinstance(chair_submission, Mapping)
@@ -1511,6 +1763,7 @@ class ModelCyclePorts:
                 "messages": [item.to_mapping() for item in transcript.messages],
                 "amendment": None,
                 "mcp_decisions": mcp_decisions,
+                "runtime_policy_decisions": runtime_policy_decisions,
             }
         repair: Mapping[str, Any] | None = None
         try:
@@ -1538,6 +1791,7 @@ class ModelCyclePorts:
                     "messages": [item.to_mapping() for item in transcript.messages],
                     "amendment": None,
                     "mcp_decisions": mcp_decisions,
+                    "runtime_policy_decisions": runtime_policy_decisions,
                 }
             if not isinstance(repaired_payload, Mapping):
                 raise ValueError("repaired objective amendment must be an object or null")
@@ -1618,6 +1872,7 @@ class ModelCyclePorts:
             "messages": [item.to_mapping() for item in transcript.messages],
             "amendment": amendment.to_mapping(),
             "mcp_decisions": mcp_decisions,
+            "runtime_policy_decisions": runtime_policy_decisions,
         }
 
     @staticmethod
@@ -1744,7 +1999,10 @@ class ModelCyclePorts:
         self, amendment: ObjectiveAmendment
     ) -> tuple[ShadowObjectiveResult, ...]:
         results: list[ShadowObjectiveResult] = []
-        history = self._objective_history()[-self._objective_history_window :]
+        history_window = int(
+            self._policy_value("objective_history_window", self._objective_history_window)
+        )
+        history = self._objective_history()[-history_window:]
         for index, item in enumerate(history):
             snapshot = self._curriculum.projection.snapshots.get(str(item["snapshot_id"]))
             if snapshot is None or not bool(item.get("usage_verified", False)):
@@ -1769,7 +2027,7 @@ class ModelCyclePorts:
                 tasks,
                 binding,
                 arm_label=label,
-                max_steps=self._shadow_max_steps,
+                max_steps=self._candidate_step_limit(),
                 objective_override=amendment.candidate_objective,
             )
             workspace = self._arm_workspaces[label]
@@ -1834,7 +2092,7 @@ class ModelCyclePorts:
             tasks,
             self._bindings[Role.WARRIOR],
             arm_label=label,
-            max_steps=self._shadow_max_steps,
+            max_steps=self._candidate_step_limit(),
             objective_override=parent,
         )
         parent_eval = evaluate_frozen_workspace(
@@ -2050,8 +2308,8 @@ class ModelCyclePorts:
             shadows,
             current_cycle=snapshot.cycle_number,
             integrity_objection=integrity_objection,
-            required_history=self._objective_history_window,
-            probation_cycles=self._objective_probation_cycles,
+            required_history=int(self._policy_value("objective_history_window", self._objective_history_window)),
+            probation_cycles=int(self._policy_value("objective_probation_cycles", self._objective_probation_cycles)),
         )
         try:
             governed_admitted = self._record_governed_objective(
@@ -2070,7 +2328,7 @@ class ModelCyclePorts:
                 self._curriculum.provision_objective(amendment.candidate_objective)
             self._curriculum.start_objective_probation(
                 amendment.proposed_objective_id,
-                required_cycles=self._objective_probation_cycles,
+                required_cycles=int(self._policy_value("objective_probation_cycles", self._objective_probation_cycles)),
                 effective_cycle=amendment.effective_cycle,
             )
         outcome = CouncilOutcome(
@@ -2096,7 +2354,10 @@ class ModelCyclePorts:
         repair_feedback: list[str] = []
         evidence: Mapping[str, Any] | None = None
         drafts: list[Mapping[str, Any]] = []
-        for attempt in range(1, _TASK_AUTHORING_ATTEMPTS + 1):
+        authoring_attempts = int(
+            self._policy_value("task_authoring_attempts", _TASK_AUTHORING_ATTEMPTS)
+        )
+        for attempt in range(1, authoring_attempts + 1):
             evidence = self._run_role(
                 Role.JUDGE,
                 objective=(
@@ -2176,7 +2437,7 @@ class ModelCyclePorts:
             raise RuntimeError("task authoring did not run")
         return {
             **evidence,
-            "authoring_attempt": _TASK_AUTHORING_ATTEMPTS,
+            "authoring_attempt": authoring_attempts,
             "drafts": drafts,
             "authoring_errors": repair_feedback[:32],
             "declarative_only": False,
@@ -2198,7 +2459,10 @@ class ModelCyclePorts:
             roots = _draft_taskpack_roots(root)
             if not roots:
                 return [], ["no drafts/<task_id>/manifest.json was written"]
-            for draft_root in roots[:_MAX_PROPOSALS]:
+            proposal_limit = int(
+                self._policy_value("task_proposals_per_cycle", _MAX_PROPOSALS)
+            )
+            for draft_root in roots[:proposal_limit]:
                 try:
                     _repair_taskpack_content_hash(draft_root)
                     pack = TaskPack.load(draft_root)
@@ -2407,7 +2671,10 @@ class ModelCyclePorts:
                     "declarative_only": False,
                     "no_tasks_authored": True,
                 }
-            for draft_root in draft_roots[:_MAX_PROPOSALS]:
+            proposal_limit = int(
+                self._policy_value("task_proposals_per_cycle", _MAX_PROPOSALS)
+            )
+            for draft_root in draft_roots[:proposal_limit]:
                 try:
                     _repair_taskpack_content_hash(draft_root)
                     pack = TaskPack.load(draft_root)
@@ -2419,7 +2686,7 @@ class ModelCyclePorts:
                         source_evidence_ids=tuple(
                             sorted((forged_tasks.artifact_id, snapshot.snapshot_id))
                         ),
-                        holdout_delay=self._holdout_delay,
+                        holdout_delay=int(self._policy_value("task_holdout_delay_cycles", self._holdout_delay)),
                     )
                     if record.status is DynamicTaskStatus.REJECTED:
                         rejected.append(
@@ -2576,6 +2843,9 @@ class ModelCyclePorts:
             "report": None,
             "role_generations": [],
         }
+        if int(self._policy_value("candidate_evaluations_per_cycle", 1)) == 0:
+            result["enabled"] = False
+            result["disabled_reason"] = "runtime policy candidate evaluation budget is zero"
         if not result["enabled"]:
             return result
         assert self._evolution is not None
@@ -3059,7 +3329,7 @@ class ModelCyclePorts:
                 tasks,
                 champion_binding,
                 arm_label=champion_label,
-                max_steps=self._shadow_max_steps,
+                max_steps=self._candidate_step_limit(),
                 evaluation_seed=seed,
                 evaluation_design_id=design.design_id,
             )
@@ -3073,7 +3343,7 @@ class ModelCyclePorts:
                 tasks,
                 candidate_runtime,
                 arm_label=candidate_label,
-                max_steps=self._shadow_max_steps,
+                max_steps=self._candidate_step_limit(),
                 evaluation_seed=seed,
                 mcp_bridge=candidate_mcp_bridge,
                 mcp_candidate=mcp_candidate,
@@ -3277,6 +3547,9 @@ class ModelCyclePorts:
         """Register one qualified candidate in the MAP-Elites archive."""
         if self._population is None:
             return None
+        self._population.set_max_cells(
+            int(self._policy_value("population_max_cells", 256))
+        )
         try:
             content = _load_json_artifact(
                 self._artifacts, candidate.surface.value, candidate.artifact_id
@@ -4324,32 +4597,62 @@ def _runtime_policy_genesis_values(
     role_configs: Mapping[str, RoleConfig],
 ) -> dict[str, Any]:
     autonomy = getattr(campaign_config, "autonomy_v2", None)
+    def role_int(value: int) -> dict[str, int]:
+        return {name: int(value) for name in role_configs}
+
+    def role_float(value: float) -> dict[str, float]:
+        return {name: float(value) for name in role_configs}
     return {
-        "max_cost_usd": 1_000_000_000.0,
         "max_total_tokens": int(campaign_config.total_tokens),
         "max_requests": int(campaign_config.max_requests),
-        "max_rounds": int(campaign_config.max_rounds),
-        "max_runtime_seconds": float(campaign_config.wall_time_seconds),
-        "max_steps": int(campaign_config.max_agent_steps),
-        "candidate_max_extra_steps": int(
-            getattr(autonomy, "candidate_max_extra_steps", 12)
-        ),
-        "subagent_max_steps": int(getattr(autonomy, "subagent_max_steps", 8)),
-        "council_max_messages": int(getattr(autonomy, "council_max_messages", 24)),
-        "council_max_tokens": int(getattr(autonomy, "council_max_tokens", 1_048_576)),
-        "command_timeout_seconds": float(limits.max_timeout_seconds),
-        "sealed_timeout_seconds": float(limits.max_timeout_seconds),
-        "subagent_timeout_seconds": float(
-            getattr(autonomy, "subagent_timeout_seconds", 180.0)
-        ),
-        "scan_timeout_seconds": 600.0,
-        "build_timeout_seconds": 3_600.0,
-        "role_budget_shares": {
+        "max_model_invocations": int(campaign_config.max_rounds),
+        "max_active_runtime_seconds": float(campaign_config.wall_time_seconds),
+        "role_token_shares": {
             name: float(config.budget_share) for name, config in role_configs.items()
         },
+        "role_max_steps": role_int(campaign_config.max_agent_steps),
         "role_max_output_tokens": {
             name: int(config.max_output_tokens) for name, config in role_configs.items()
         },
+        "role_reasoning_effort": {
+            name: config.reasoning_effort for name, config in role_configs.items()
+        },
+        "role_research_action_budgets": role_int(10),
+        "role_command_timeout_seconds": role_float(limits.max_timeout_seconds),
+        "role_max_read_bytes": role_int(limits.max_read_bytes),
+        "role_max_write_bytes": role_int(limits.max_write_bytes),
+        "role_max_tool_output_bytes": role_int(limits.max_tool_output_bytes),
+        "role_max_search_results": role_int(limits.max_search_results),
+        "gateway_timeout_seconds": 900.0,
+        "gateway_max_attempts": 6,
+        "gateway_base_delay_seconds": 0.5,
+        "gateway_max_delay_seconds": 4.0,
+        "subagent_max_spawns_per_run": 8,
+        "subagent_max_steps": int(getattr(autonomy, "subagent_max_steps", 8)),
+        "subagent_timeout_seconds": float(
+            getattr(autonomy, "subagent_timeout_seconds", 180.0)
+        ),
+        "subagent_max_result_bytes": int(getattr(autonomy, "subagent_max_result_bytes", 65_536)),
+        "subagent_max_output_tokens": 65_536,
+        "subagent_max_total_tokens": max(1, int(campaign_config.total_tokens) // 4),
+        "subagent_max_requests": max(1, int(campaign_config.max_requests) // 4),
+        "max_evolution_requests_per_run": 1,
+        "max_evolution_source_refs": 5,
+        "task_authoring_attempts": 2,
+        "task_proposals_per_cycle": 1,
+        "cohort_limit": 3,
+        "candidate_evaluations_per_cycle": 1,
+        "candidate_max_steps": int(getattr(autonomy, "candidate_max_extra_steps", 12)),
+        "population_max_cells": 128,
+        "council_max_messages": int(getattr(autonomy, "council_max_messages", 24)),
+        "council_max_tokens": int(getattr(autonomy, "council_max_tokens", 1_048_576)),
+        "task_holdout_delay_cycles": int(getattr(autonomy, "task_holdout_delay_cycles", 1)),
+        "objective_history_window": int(getattr(autonomy, "objective_history_window", 3)),
+        "objective_probation_cycles": int(getattr(autonomy, "objective_probation_cycles", 2)),
+        "dependency_download_timeout_seconds": 600.0,
+        "dependency_download_max_bytes": 512 * 1024 * 1024,
+        "build_timeout_seconds": 3_600.0,
+        "scan_timeout_seconds": 600.0,
     }
 
 
@@ -4473,9 +4776,8 @@ def run_v2_cycle(
     runtime_consumed: dict[str, float | int] = {
         "max_total_tokens": 0,
         "max_requests": 0,
-        "max_rounds": max(0, target - 1),
-        "max_runtime_seconds": 0,
-        "max_cost_usd": 0,
+        "max_model_invocations": max(0, target - 1),
+        "max_active_runtime_seconds": 0,
     }
     if campaign_config is not None and isinstance(auxiliary_store, EventStore):
         runtime_policy_registry = RuntimePolicyRegistry(
@@ -4496,16 +4798,16 @@ def run_v2_cycle(
         policy_hash = effective_policy.policy_id.rsplit(":", 1)[1]
         limits = replace(
             limits,
-            max_steps=cast(int, policy_values["max_steps"]),
+            max_steps=int(cast(Mapping[str, Any], policy_values["role_max_steps"])[Role.WARRIOR.value]),
             max_timeout_seconds=float(
-                cast(float | int, policy_values["command_timeout_seconds"])
+                cast(Mapping[str, Any], policy_values["role_command_timeout_seconds"])[Role.WARRIOR.value]
             ),
         )
         role_configs = {
             name: replace(
                 config,
                 budget_share=float(
-                    cast(Mapping[str, Any], policy_values["role_budget_shares"])[name]
+                    cast(Mapping[str, Any], policy_values["role_token_shares"])[name]
                 ),
                 max_output_tokens=int(
                     cast(Mapping[str, Any], policy_values["role_max_output_tokens"])[name]
@@ -4513,15 +4815,16 @@ def run_v2_cycle(
             )
             for name, config in role_configs.items()
         }
-        candidate_max_extra_steps = cast(
-            int, policy_values["candidate_max_extra_steps"]
-        )
+        candidate_max_extra_steps = cast(int, policy_values["candidate_max_steps"])
         subagent_max_steps = cast(int, policy_values["subagent_max_steps"])
         subagent_timeout_seconds = float(
             cast(float | int, policy_values["subagent_timeout_seconds"])
         )
         council_max_messages = cast(int, policy_values["council_max_messages"])
         council_max_tokens = cast(int, policy_values["council_max_tokens"])
+        configured_cohort_limit = int(cast(int, policy_values["cohort_limit"]))
+        cohort_limit = configured_cohort_limit
+        holdout_delay = int(cast(int, policy_values["task_holdout_delay_cycles"]))
         bind_observer = getattr(gateway, "bind_attempt_observer", None)
         if callable(bind_observer):
             runtime_ledger = RuntimeGatewayAttemptObserver(
@@ -4530,6 +4833,40 @@ def run_v2_cycle(
                 _gateway_accounting_context,
             )
             bind_observer(runtime_ledger)
+        bind_policy_provider = getattr(gateway, "bind_runtime_policy_provider", None)
+        if callable(bind_policy_provider):
+            def gateway_policy_values() -> Mapping[str, object]:
+                context = _ACCOUNTING_CONTEXT.get()
+                if context is not None and context.paired_design_id is not None:
+                    return cast(
+                        Mapping[str, object],
+                        runtime_policy_registry.policy_for_paired_design(
+                            context.paired_design_id
+                        ).values,
+                    )
+                boundary = (
+                    RuntimeStageBoundary(
+                        context.cycle, context.stage_ordinal, context.stage
+                    )
+                    if context is not None
+                    else runtime_policy_registry.resume_stage_boundary(target)
+                )
+                return cast(
+                    Mapping[str, object],
+                    runtime_policy_registry.effective_for_stage(boundary).values,
+                )
+            bind_policy_provider(gateway_policy_values)
+        if environment_builder is not None:
+            bind_environment_policy = getattr(
+                environment_builder, "bind_runtime_policy_provider", None
+            )
+            if callable(bind_environment_policy):
+                bind_environment_policy(
+                    lambda: cast(
+                        Mapping[str, object],
+                        runtime_policy_registry.latest_for_cycle(target).values,
+                    )
+                )
     else:
         effective_policy = None
         policy_hash = (
@@ -4647,20 +4984,22 @@ def run_v2_cycle(
             ports._runtime_stage_ordinal,
             f"stage:{ports._runtime_stage_ordinal}",
         )
-        amendment = runtime_policy_registry.amendment_for_stage(requested_boundary)
+        amendment = next(
+            (
+                item
+                for item in reversed(runtime_policy_registry.immediate_amendments)
+                if item.requested_at == requested_boundary
+            ),
+            None,
+        )
         if amendment is None:
-            raise RuntimeError("maintenance-only Prosecutor did not schedule a policy repair")
-        ref = artifacts.put_json("runtime-policy-maintenance", maintenance)
-        return {
-            "maintenance_only": True,
-            "campaign_id": campaign_id,
-            "cycle": target,
-            "policy_id": effective_policy.policy_id,
-            "amendment_id": amendment.amendment_id,
-            "effective_cycle": amendment.effective_at.cycle,
-            "effective_stage": amendment.effective_at.to_mapping(),
-            "evidence_id": ref.artifact_id,
-        }
+            raise RuntimeError("maintenance-only Prosecutor did not apply a policy repair")
+        artifacts.put_json("runtime-policy-maintenance", maintenance)
+        # The maintenance amendment restored a viable budget; continue the
+        # cycle in the same invocation instead of requiring a manual resume.
+        effective_policy = runtime_policy_registry.effective_for_stage(
+            runtime_policy_registry.resume_stage_boundary(target)
+        )
     try:
         state = curriculum.projection.cycle_state
         was_retry = state is CycleState.FAILED
@@ -4717,6 +5056,119 @@ def run_v2_cycle(
                 )
             except Exception:
                 pass
+        council_budget_exceeded = (
+            isinstance(exc, CouncilProtocolError)
+            and (
+                "council token limit" in cycle_error
+                or "council message limit" in cycle_error
+            )
+        )
+        if (
+            (isinstance(exc, RuntimeBudgetExceeded) or council_budget_exceeded)
+            and runtime_policy_registry is not None
+            and runtime_ledger is not None
+        ):
+            try:
+                consumed = runtime_ledger.consumed().to_policy_mapping()
+                boundary = runtime_policy_registry.resume_stage_boundary(target)
+                if isinstance(exc, RuntimeBudgetExceeded):
+                    maintenance_policy = runtime_policy_registry.arm_maintenance(
+                        requested_at=RuntimeStageBoundary(
+                            target, boundary.ordinal + 1, f"stage:{boundary.ordinal + 1}"
+                        ),
+                        consumed=consumed,
+                        reason=cycle_error,
+                    )
+                    maintenance_objective = (
+                        "The active runtime policy is below already consumed usage. "
+                        "Call aegis.adjust_runtime_policy exactly once to restore a viable "
+                        "next-stage budget or roll back to a viable historical policy, then submit."
+                    )
+                else:
+                    maintenance_policy = runtime_policy_registry.effective_for_stage(
+                        RuntimeStageBoundary(
+                            target, boundary.ordinal, f"stage:{boundary.ordinal}"
+                        )
+                    )
+                    maintenance_objective = (
+                        "The council exceeded its configured token or message budget. "
+                        "Call aegis.adjust_runtime_policy exactly once to raise council_max_tokens "
+                        "and/or council_max_messages enough for the remaining council deliberation, "
+                        "then submit."
+                    )
+                maintenance = ports._run_role(
+                    Role.PROSECUTOR,
+                    objective=maintenance_objective,
+                    context={
+                        "policy": maintenance_policy.to_mapping(),
+                        "consumed": consumed,
+                    },
+                    max_steps=3,
+                    accounting_stage="maintenance",
+                    required_action_groups=(frozenset({"aegis.adjust_runtime_policy"}),),
+                )
+                maintenance_boundary = RuntimeStageBoundary(
+                    target,
+                    ports._runtime_stage_ordinal,
+                    f"stage:{ports._runtime_stage_ordinal}",
+                )
+                amendment = next(
+                    (
+                        item
+                        for item in reversed(runtime_policy_registry.immediate_amendments)
+                        if item.requested_at == maintenance_boundary
+                    ),
+                    None,
+                )
+                if amendment is None:
+                    raise RuntimeError(
+                        "maintenance-only Prosecutor did not apply a policy repair"
+                    )
+                artifacts.put_json("runtime-policy-maintenance", maintenance)
+                state = curriculum.projection.cycle_state
+                was_retry = state is CycleState.FAILED
+                if state is CycleState.FAILED:
+                    curriculum.transition_cycle(
+                        "retry",
+                        reason="policy repaired by maintenance Prosecutor amendment",
+                    )
+                elif state not in {CycleState.CREATED, CycleState.COMPLETED}:
+                    curriculum.transition_cycle(
+                        "stop",
+                        reason="maintenance repaired an interrupted cycle",
+                    )
+                    curriculum.transition_cycle(
+                        "fail",
+                        reason="maintenance repaired an interrupted cycle",
+                    )
+                    curriculum.transition_cycle(
+                        "retry",
+                        reason="maintenance repaired an interrupted cycle",
+                    )
+                retry_controller = EvolutionCycleController(
+                    curriculum,
+                    _RegistryCohortProvider(dynamic),
+                    artifacts,
+                    CyclePorts(
+                        warrior=ports,
+                        judge=ports,
+                        quality=ports,
+                        prosecutor=ports,
+                        council=ports,
+                        evolution=ports,
+                    ),
+                )
+                try:
+                    return retry_controller.run(
+                        snapshot,
+                        target_generation=target,
+                        cohort_limit=cohort_limit,
+                        retry=was_retry,
+                    )
+                except BaseException as retry_exc:
+                    cycle_error = f"{cycle_error} | budget-repair retry failed: {retry_exc}"
+            except BaseException as maintenance_exc:
+                cycle_error = f"{cycle_error} | maintenance repair failed: {maintenance_exc}"
         active_role = active.for_role(repair_target_role)
         base_generation_id = "sha256:" + hashlib.sha256(
             active_role.role_version_id.encode("utf-8")

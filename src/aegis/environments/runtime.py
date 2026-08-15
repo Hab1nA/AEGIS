@@ -223,8 +223,8 @@ class BuildAttempt:
             raise ValueError("dependency artifact ids must be unique and canonically sorted")
         if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, (int, float)):
             raise TypeError("attempt timeout_seconds must be numeric")
-        if not math.isfinite(float(self.timeout_seconds)) or not 0 < float(self.timeout_seconds) <= 86_400:
-            raise ValueError("attempt timeout_seconds is outside the safe range")
+        if not math.isfinite(float(self.timeout_seconds)) or float(self.timeout_seconds) <= 0:
+            raise ValueError("attempt timeout_seconds must be finite and positive")
         object.__setattr__(self, "timeout_seconds", float(self.timeout_seconds))
         if self.network_enabled is not False or self.secret_names != () or self.host_mounts != ():
             raise ValueError("builder attempts must have no network, secrets, or host mounts")
@@ -612,8 +612,8 @@ class EnvironmentBuilder:
             (max_build_seconds, "max_build_seconds"),
             (scanner_timeout_seconds, "scanner_timeout_seconds"),
         ):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < float(value) <= 86_400:
-                raise ValueError(f"{name} is outside the safe range")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         self._resolver = resolver
         self._download_broker = download_broker
         self._oci_builder = oci_builder
@@ -627,10 +627,26 @@ class EnvironmentBuilder:
         self._max_build_seconds = float(max_build_seconds)
         self._scanner_timeout_seconds = float(scanner_timeout_seconds)
         self._nonce_factory = nonce_factory or (lambda: secrets.token_hex(32))
+        self._runtime_policy_provider: Callable[[], Mapping[str, object]] | None = None
+
+    def bind_runtime_policy_provider(
+        self, provider: Callable[[], Mapping[str, object]]
+    ) -> None:
+        if not callable(provider):
+            raise TypeError("runtime policy provider must be callable")
+        if self._runtime_policy_provider is not None:
+            raise RuntimeError("environment runtime policy provider is already bound")
+        self._runtime_policy_provider = provider
 
     def build(self, recipe: EnvironmentRecipe) -> BuildReceipt:
         if not isinstance(recipe, EnvironmentRecipe):
             raise TypeError("recipe must be an EnvironmentRecipe")
+        if self._runtime_policy_provider is not None:
+            values = self._runtime_policy_provider()
+            self._max_download_bytes = int(cast(int, values["dependency_download_max_bytes"]))
+            self._download_timeout_seconds = float(cast(float | int, values["dependency_download_timeout_seconds"]))
+            self._max_build_seconds = float(cast(float | int, values["build_timeout_seconds"]))
+            self._scanner_timeout_seconds = float(cast(float | int, values["scan_timeout_seconds"]))
         try:
             initial_resolutions = validate_environment_recipe(recipe, self._resolver, self._policy)
             intent = EnvironmentBuildIntent.create(

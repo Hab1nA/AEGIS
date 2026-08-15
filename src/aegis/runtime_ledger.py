@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, RLock
@@ -124,14 +124,24 @@ class RuntimeConsumption:
     verified_tokens: int = 0
     unverified_tokens: int = 0
     unsettled_requests: int = 0
+    role_tokens: Mapping[str, int] = field(default_factory=dict)
 
-    def to_policy_mapping(self) -> dict[str, int | float]:
+    @property
+    def model_invocations(self) -> int:
+        return self.rounds
+
+    @property
+    def active_runtime_seconds(self) -> float:
+        return self.runtime_seconds
+
+    def to_policy_mapping(self) -> dict[str, object]:
         """Return names accepted by ``RuntimePolicyRegistry.request_patch``."""
         return {
             "max_total_tokens": self.total_tokens,
             "max_requests": self.requests,
-            "max_rounds": self.rounds,
-            "max_runtime_seconds": self.runtime_seconds,
+            "max_model_invocations": self.model_invocations,
+            "max_active_runtime_seconds": self.active_runtime_seconds,
+            "role_tokens": dict(self.role_tokens),
         }
 
 
@@ -234,39 +244,44 @@ class GatewayAttemptObserver:
         policy = self._policy(context)
         candidate = self._reservation(attempt, context, policy, _aware_utc(self._clock()))
         with self._lock:
-            reservations, settlements = self._replay()
-            existing = reservations.get(candidate.attempt_id)
-            if existing is not None:
-                if not self._same_reservation_identity(existing, candidate):
-                    raise RuntimeLedgerIntegrityError("attempt reservation identity collision")
-                return
-            self._authorize(candidate, policy, reservations, settlements)
-            sequence = self._store.max_sequence(self._campaign_id)
-            try:
-                self._store.append_if_sequence(
-                    self._campaign_id,
-                    sequence,
-                    _RESERVED,
-                    self._reservation_mapping(candidate),
-                    created_at=candidate.reserved_at,
-                )
-            except EventStoreSequenceConflict as exc:
-                reservations, _ = self._replay()
+            for _retry in range(16):
+                reservations, settlements = self._replay()
                 existing = reservations.get(candidate.attempt_id)
-                if existing is not None and self._same_reservation_identity(existing, candidate):
+                if existing is not None:
+                    if not self._same_reservation_identity(existing, candidate):
+                        raise RuntimeLedgerIntegrityError("attempt reservation identity collision")
                     return
-                raise RuntimeLedgerError("gateway reservation raced with another writer") from exc
+                self._authorize(candidate, policy, reservations, settlements)
+                sequence = self._store.max_sequence(self._campaign_id)
+                try:
+                    self._store.append_if_sequence(
+                        self._campaign_id,
+                        sequence,
+                        _RESERVED,
+                        self._reservation_mapping(candidate),
+                        created_at=candidate.reserved_at,
+                    )
+                    return
+                except EventStoreSequenceConflict:
+                    continue
+            raise RuntimeLedgerError("gateway reservation exceeded concurrent-writer retry budget")
 
     def after_attempt(self, attempt: GatewayAttempt, result: GatewayAttemptResult) -> None:
         context = self._context(attempt.request)
-        policy = self._policy(context)
-        identity = self._reservation(attempt, context, policy, _aware_utc(self._clock()))
         now = _aware_utc(self._clock())
         with self._lock:
             reservations, settlements = self._replay()
-            reservation = reservations.get(identity.attempt_id)
-            if reservation is None:
+            request_digest = self._request_digest(attempt.request)
+            matches = [
+                item for item in reservations.values()
+                if item.context == context
+                and item.protocol == attempt.protocol
+                and item.attempt_number == attempt.attempt_number
+                and item.request_digest == request_digest
+            ]
+            if len(matches) != 1:
                 raise RuntimeLedgerIntegrityError("cannot settle an unreserved gateway attempt")
+            reservation = matches[0]
             existing = settlements.get(reservation.attempt_id)
             if existing is not None:
                 if (
@@ -291,31 +306,20 @@ class GatewayAttemptObserver:
                 result.error_type,
                 runtime,
             )
-            sequence = self._store.max_sequence(self._campaign_id)
-            try:
-                self._store.append_if_sequence(
-                    self._campaign_id,
-                    sequence,
-                    _SETTLED,
-                    self._settlement_mapping(settlement),
-                    created_at=now,
-                )
-            except EventStoreSequenceConflict as exc:
-                _, settlements = self._replay()
-                existing = settlements.get(reservation.attempt_id)
-                if existing is not None and (
-                    existing.succeeded,
-                    existing.usage,
-                    existing.status,
-                    existing.error_type,
-                ) == (
-                    settlement.succeeded,
-                    settlement.usage,
-                    settlement.status,
-                    settlement.error_type,
-                ):
+            for _retry in range(16):
+                sequence = self._store.max_sequence(self._campaign_id)
+                try:
+                    self._store.append_if_sequence(
+                        self._campaign_id, sequence, _SETTLED,
+                        self._settlement_mapping(settlement), created_at=now,
+                    )
                     return
-                raise RuntimeLedgerError("gateway settlement raced with another writer") from exc
+                except EventStoreSequenceConflict:
+                    _, settlements = self._replay()
+                    existing = settlements.get(reservation.attempt_id)
+                    if existing == settlement:
+                        return
+            raise RuntimeLedgerError("gateway settlement exceeded concurrent-writer retry budget")
 
     def consumed(self) -> RuntimeConsumption:
         """Return current durable consumption, charging open reservations conservatively."""
@@ -350,30 +354,83 @@ class GatewayAttemptObserver:
         invocation_ids = {item.context.invocation_id for item in reservations.values()}
         new_round = candidate.context.invocation_id not in invocation_ids
         if policy.maintenance_only:
-            self._authorize_maintenance(candidate, policy, reservations)
+            self._authorize_maintenance(candidate, policy, reservations, settlements)
             return
-        projected = {
-            "max_total_tokens": consumption.total_tokens + candidate.usage.total_tokens,
-            "max_requests": consumption.requests + 1,
-            "max_rounds": consumption.rounds + int(new_round),
-            "max_runtime_seconds": consumption.runtime_seconds,
-        }
+        if policy.schema_version == 1:
+            projected = {
+                "max_total_tokens": consumption.total_tokens + candidate.usage.total_tokens,
+                "max_requests": consumption.requests + 1,
+                "max_rounds": consumption.rounds + int(new_round),
+                "max_runtime_seconds": consumption.runtime_seconds,
+            }
+        else:
+            projected = {
+                "max_total_tokens": consumption.total_tokens + candidate.usage.total_tokens,
+                "max_requests": consumption.requests + 1,
+                "max_model_invocations": consumption.model_invocations + int(new_round),
+                "max_active_runtime_seconds": consumption.active_runtime_seconds,
+            }
         for name, amount in projected.items():
             limit = policy.values[name]
             if not isinstance(limit, (int, float)) or isinstance(limit, bool):
                 raise RuntimeLedgerIntegrityError(f"runtime policy {name} is not numeric")
             if amount > float(limit):
                 raise RuntimeBudgetExceeded(f"runtime policy {name} exhausted")
+        if policy.schema_version == 2:
+            shares = cast(Mapping[str, float], policy.values["role_token_shares"])
+            role_limit = float(cast(int, policy.values["max_total_tokens"])) * float(
+                shares[candidate.context.role.value]
+            )
+            role_projected = consumption.role_tokens.get(candidate.context.role.value, 0) + candidate.usage.total_tokens
+            if role_projected > role_limit:
+                raise RuntimeBudgetExceeded(
+                    f"runtime policy role_token_shares.{candidate.context.role.value} exhausted"
+                )
+            if candidate.context.stage.startswith("subagent:"):
+                child_attempts = [
+                    item for item in reservations.values()
+                    if item.context.stage.startswith("subagent:")
+                ]
+                child_tokens = sum(
+                    (
+                        settlements[item.attempt_id].usage
+                        if item.attempt_id in settlements
+                        else item.usage
+                    ).total_tokens
+                    for item in child_attempts
+                ) + candidate.usage.total_tokens
+                if len(child_attempts) + 1 > int(cast(int, policy.values["subagent_max_requests"])):
+                    raise RuntimeBudgetExceeded("runtime policy subagent_max_requests exhausted")
+                if child_tokens > int(cast(int, policy.values["subagent_max_total_tokens"])):
+                    raise RuntimeBudgetExceeded("runtime policy subagent_max_total_tokens exhausted")
 
     @staticmethod
     def _authorize_maintenance(
         candidate: _Reservation,
         policy: RuntimePolicyVersion,
         reservations: Mapping[str, _Reservation],
+        settlements: Mapping[str, _Settlement],
     ) -> None:
         context = candidate.context
-        if context.role is not Role.PROSECUTOR or context.stage != "maintenance":
+        same_invocation_all = [
+            item for item in reservations.values()
+            if item.context.invocation_id == context.invocation_id
+        ]
+        convergence_grace = (
+            context.role is Role.PROSECUTOR
+            and context.stage != "maintenance"
+            and policy.parent_policy_id is not None
+            and any(item.policy_id == policy.parent_policy_id for item in same_invocation_all)
+        )
+        if context.role is not Role.PROSECUTOR or (
+            context.stage != "maintenance" and not convergence_grace
+        ):
             raise RuntimeBudgetExceeded("maintenance-only policy permits only prosecutor maintenance")
+        if convergence_grace:
+            grace_attempts = [item for item in same_invocation_all if item.policy_id == policy.policy_id]
+            if len(grace_attempts) >= 3:
+                raise RuntimeBudgetExceeded("policy convergence grace is limited to three attempts")
+            return
         prior = [
             item
             for item in reservations.values()
@@ -384,7 +441,24 @@ class GatewayAttemptObserver:
         ]
         invocation_ids = {item.context.invocation_id for item in prior}
         if invocation_ids and context.invocation_id not in invocation_ids:
-            raise RuntimeBudgetExceeded("maintenance-only policy permits one invocation")
+            prior_settlements = [
+                settlements.get(item.attempt_id) for item in prior
+            ]
+            # A transport failure (HTTP/protocol error) does not consume the
+            # one-maintenance-invocation budget: a fresh invocation may retry
+            # only when every prior attempt under this policy failed to settle.
+            prior_all_failed = (
+                all(
+                    settlement is not None and not settlement.succeeded
+                    for settlement in prior_settlements
+                )
+                if prior_settlements
+                else False
+            )
+            if not prior_all_failed:
+                raise RuntimeBudgetExceeded(
+                    "maintenance-only policy permits one invocation"
+                )
         same_invocation = [
             item for item in prior if item.context.invocation_id == context.invocation_id
         ]
@@ -398,12 +472,14 @@ class GatewayAttemptObserver:
     ) -> RuntimeConsumption:
         total = verified = unverified = unsettled = 0
         runtime = 0.0
+        role_tokens = {role.value: 0 for role in Role}
         invocation_ids: set[str] = set()
         for attempt_id, reservation in reservations.items():
             settlement = settlements.get(attempt_id)
             usage = reservation.usage if settlement is None else settlement.usage
             tokens = usage.total_tokens
             total += tokens
+            role_tokens[reservation.context.role.value] += tokens
             if usage.verified:
                 verified += tokens
             else:
@@ -421,6 +497,7 @@ class GatewayAttemptObserver:
             verified_tokens=verified,
             unverified_tokens=unverified,
             unsettled_requests=unsettled,
+            role_tokens=role_tokens,
         )
 
     @staticmethod
@@ -515,6 +592,7 @@ class GatewayAttemptObserver:
     def _replay(self) -> tuple[dict[str, _Reservation], dict[str, _Settlement]]:
         reservations: dict[str, _Reservation] = {}
         settlements: dict[str, _Settlement] = {}
+        known_policy_ids = {item.policy_id for item in self._registry.versions}
         reservation_fields = {
             "attempt_id",
             "context",
@@ -570,7 +648,7 @@ class GatewayAttemptObserver:
                     or not isinstance(reservation.attempt_number, int)
                     or reservation.attempt_number < 1
                     or not isinstance(reservation.policy_id, str)
-                    or not reservation.policy_id.startswith("runtime-policy-sha256:")
+                    or reservation.policy_id not in known_policy_ids
                     or not isinstance(reservation.request_digest, str)
                     or not reservation.request_digest.startswith("gateway-request-sha256:")
                     or reservation.attempt_id != expected_id

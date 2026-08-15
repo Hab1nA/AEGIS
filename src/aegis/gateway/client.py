@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Callable, Mapping, cast
 
 from .transport import HTTPTransport, StdlibHTTPTransport
 from .types import (
@@ -126,10 +126,30 @@ class ModelGateway:
         self._retry = retry or RetryPolicy()
         self._sleep = sleeper
         self._attempt_observer = attempt_observer
+        self._runtime_policy_provider: Callable[[], Mapping[str, object]] | None = None
 
     def complete(self, request: GatewayRequest, *, cancel: CancelToken | None = None) -> GatewayResponse:
         token = cancel or CancelToken()
-        return self._call_with_retry(request, token)
+        retry = self._retry
+        timeout = self._config.timeout_seconds
+        if self._runtime_policy_provider is not None:
+            values = self._runtime_policy_provider()
+            retry = RetryPolicy(
+                max_attempts=int(cast(int, values["gateway_max_attempts"])),
+                base_delay_seconds=float(cast(float | int, values["gateway_base_delay_seconds"])),
+                max_delay_seconds=float(cast(float | int, values["gateway_max_delay_seconds"])),
+            )
+            timeout = float(cast(float | int, values["gateway_timeout_seconds"]))
+        return self._call_with_retry(request, token, retry=retry, timeout_seconds=timeout)
+
+    def bind_runtime_policy_provider(
+        self, provider: Callable[[], Mapping[str, object]]
+    ) -> None:
+        if not callable(provider):
+            raise TypeError("runtime policy provider must be callable")
+        if self._runtime_policy_provider is not None:
+            raise RuntimeError("gateway runtime policy provider is already bound")
+        self._runtime_policy_provider = provider
 
     def bind_attempt_observer(self, observer: GatewayAttemptObserver) -> None:
         """Bind accounting exactly once before the gateway is used.
@@ -150,9 +170,12 @@ class ModelGateway:
         self,
         request: GatewayRequest,
         cancel: CancelToken,
+        *,
+        retry: RetryPolicy,
+        timeout_seconds: float,
     ) -> GatewayResponse:
         last_error: BaseException | None = None
-        for attempt in range(self._retry.max_attempts):
+        for attempt in range(retry.max_attempts):
             cancel.raise_if_cancelled()
             lifecycle = GatewayAttempt(
                 "responses",
@@ -163,11 +186,11 @@ class ModelGateway:
             if self._attempt_observer is not None:
                 self._attempt_observer.before_attempt(lifecycle)
             try:
-                result = self._call(request, cancel)
+                result = self._call(request, cancel, timeout_seconds=timeout_seconds)
             except GatewayHTTPError as exc:
                 self._finish_attempt(lifecycle, None, exc)
                 last_error = exc
-                if not exc.retryable or attempt + 1 >= self._retry.max_attempts:
+                if not exc.retryable or attempt + 1 >= retry.max_attempts:
                     raise
             except (
                 urllib.error.URLError,
@@ -183,12 +206,12 @@ class ModelGateway:
             ) as exc:
                 self._finish_attempt(lifecycle, None, exc)
                 last_error = exc
-                if attempt + 1 >= self._retry.max_attempts:
+                if attempt + 1 >= retry.max_attempts:
                     raise GatewayError("model relay unavailable after retries") from exc
             except GatewayTruncationError as exc:
                 self._finish_attempt(lifecycle, None, exc)
                 last_error = exc
-                if attempt + 1 >= self._retry.max_attempts:
+                if attempt + 1 >= retry.max_attempts:
                     raise
             except Exception as exc:
                 self._finish_attempt(lifecycle, None, exc)
@@ -196,7 +219,7 @@ class ModelGateway:
             else:
                 self._finish_attempt(lifecycle, result, None)
                 return result
-            delay = min(self._retry.max_delay_seconds, self._retry.base_delay_seconds * (2**attempt))
+            delay = min(retry.max_delay_seconds, retry.base_delay_seconds * (2**attempt))
             cancel.raise_if_cancelled()
             self._sleep(delay)
         raise GatewayError("model request failed") from last_error
@@ -205,6 +228,8 @@ class ModelGateway:
         self,
         request: GatewayRequest,
         cancel: CancelToken,
+        *,
+        timeout_seconds: float,
     ) -> GatewayResponse:
         payload = self._payload(request)
         response = self._transport.post(
@@ -216,7 +241,7 @@ class ModelGateway:
                 "User-Agent": "AEGIS/0.1",
             },
             body=json.dumps(payload, separators=(",", ":")).encode(),
-            timeout=self._config.timeout_seconds,
+            timeout=timeout_seconds,
             cancel=cancel,
         )
         if response.status >= 300:

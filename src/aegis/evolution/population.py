@@ -171,14 +171,28 @@ class PopulationArchive:
             raise TypeError("store must be an EventStore")
         if isinstance(max_cells, bool) or not isinstance(max_cells, int):
             raise PopulationArchiveError("max_cells must be an integer")
-        if not 1 <= max_cells <= 4096:
-            raise PopulationArchiveError("max_cells must be in [1, 4096]")
+        if max_cells < 1:
+            raise PopulationArchiveError("max_cells must be positive")
         self._store = store
         self._campaign_id = str(campaign_id)
         self._stream_id = population_stream_id(self._campaign_id)
         self._max_cells = max_cells
         self._projection = PopulationProjection(self._campaign_id, self._stream_id)
         self.refresh()
+
+    def set_max_cells(self, max_cells: int) -> None:
+        if isinstance(max_cells, bool) or not isinstance(max_cells, int) or max_cells < 1:
+            raise PopulationArchiveError("max_cells must be a positive integer")
+        self._max_cells = max_cells
+        self.refresh()
+        if len(self._projection.cells) > max_cells:
+            retained = sorted(
+                self._projection.cells.items(), key=lambda item: item[1].sequence, reverse=True
+            )[:max_cells]
+            self._projection = PopulationProjection(
+                self._campaign_id, self._stream_id, self._projection.sequence,
+                dict(retained), self._projection.entries,
+            )
 
     def refresh(self) -> None:
         events = self._store.read(self._stream_id, after_sequence=0)

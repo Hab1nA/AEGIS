@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -53,20 +54,20 @@ class SubagentLimits:
     def __post_init__(self) -> None:
         if isinstance(self.max_steps, bool) or not isinstance(self.max_steps, int):
             raise SubagentRuntimeError("subagent max_steps must be an integer")
-        if not 1 <= self.max_steps <= 1000:
-            raise SubagentRuntimeError("subagent max_steps must be in [1, 1000]")
+        if self.max_steps < 1:
+            raise SubagentRuntimeError("subagent max_steps must be positive")
         if isinstance(self.timeout_seconds, bool) or not isinstance(
             self.timeout_seconds, (int, float)
         ):
             raise SubagentRuntimeError("subagent timeout must be numeric")
-        if not 1 <= float(self.timeout_seconds) <= 3600:
-            raise SubagentRuntimeError("subagent timeout must be in [1, 3600]")
+        if float(self.timeout_seconds) <= 0:
+            raise SubagentRuntimeError("subagent timeout must be positive")
         if isinstance(self.max_result_bytes, bool) or not isinstance(
             self.max_result_bytes, int
         ):
             raise SubagentRuntimeError("subagent result size must be an integer")
-        if not 1 <= self.max_result_bytes <= 4 * 1024 * 1024:
-            raise SubagentRuntimeError("subagent result size is outside the safe range")
+        if self.max_result_bytes < 1:
+            raise SubagentRuntimeError("subagent result size must be positive")
         object.__setattr__(self, "timeout_seconds", float(self.timeout_seconds))
 
 
@@ -101,7 +102,7 @@ class SubagentSpec:
             raise SubagentRuntimeError("runtime executor must not carry a script")
         if len(self.input_refs) > MAX_SUBAGENT_INPUT_REFS:
             raise SubagentRuntimeError("subagent input_refs exceeds the limit")
-        if not isinstance(self.max_output_tokens, int) or not 1 <= self.max_output_tokens <= 1_048_576:
+        if not isinstance(self.max_output_tokens, int) or self.max_output_tokens < 1:
             raise SubagentRuntimeError("subagent max_output_tokens is invalid")
         try:
             encoded = canonical_json(self.to_mapping(include_id=False)).encode("utf-8")
@@ -230,8 +231,12 @@ class SubagentManager:
         self._outputs: dict[str, Path] = {}
         self._workspaces: dict[str, Path] = {}
         self._results: dict[str, Mapping[str, Any]] = {}
+        self._spec_limits: dict[str, SubagentLimits] = {}
+        self._deadlines: dict[str, float] = {}
 
-    def spawn(self, spec: SubagentSpec) -> Mapping[str, Any]:
+    def spawn(
+        self, spec: SubagentSpec, *, accounting_binding: Mapping[str, Any] | None = None
+    ) -> Mapping[str, Any]:
         if spec.subagent_id in self._running:
             raise SubagentRuntimeError("subagent is already running")
         if len(self._running) >= self._max_concurrency:
@@ -254,11 +259,13 @@ class SubagentManager:
             ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env=self._worker_env(),
+            env=self._worker_env(accounting_binding),
         )
         self._running[spec.subagent_id] = process
         self._outputs[spec.subagent_id] = output_path
         self._workspaces[spec.subagent_id] = workspace
+        self._spec_limits[spec.subagent_id] = spec.limits
+        self._deadlines[spec.subagent_id] = time.monotonic() + spec.limits.timeout_seconds
         return {
             "subagent_id": spec.subagent_id,
             "status": "running",
@@ -271,13 +278,19 @@ class SubagentManager:
             },
         }
 
-    def _worker_env(self) -> dict[str, str]:
+    def _worker_env(self, accounting_binding: Mapping[str, Any] | None) -> dict[str, str]:
         environment = dict(os.environ)
         package_root = str(Path(aegis.__file__).resolve().parent.parent)
         existing = environment.get("PYTHONPATH", "")
         environment["PYTHONPATH"] = (
             package_root if not existing else package_root + os.pathsep + existing
         )
+        if accounting_binding is not None:
+            environment["AEGIS_SUBAGENT_ACCOUNTING_BINDING"] = canonical_json(
+                accounting_binding
+            )
+        else:
+            environment.pop("AEGIS_SUBAGENT_ACCOUNTING_BINDING", None)
         return environment
 
     def status(self, subagent_id: str) -> Mapping[str, Any]:
@@ -286,6 +299,11 @@ class SubagentManager:
             raise SubagentRuntimeError("subagent is not running")
         poll = process.poll()
         if poll is None:
+            if time.monotonic() >= self._deadlines[subagent_id]:
+                process.kill()
+                process.wait()
+                finished = self._finish(subagent_id, -9, timed_out=True)
+                return {"subagent_id": subagent_id, "status": "finished", **finished}
             return {"subagent_id": subagent_id, "status": "running"}
         finished = self._finish(subagent_id, poll, timed_out=False)
         return {"subagent_id": subagent_id, "status": "finished", **finished}
@@ -298,7 +316,8 @@ class SubagentManager:
         if process is None:
             raise SubagentRuntimeError("subagent is not running")
         try:
-            exit_code = process.wait(timeout=timeout_seconds)
+            remaining = max(0.0, self._deadlines[subagent_id] - time.monotonic())
+            exit_code = process.wait(timeout=min(timeout_seconds, remaining))
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
@@ -311,10 +330,16 @@ class SubagentManager:
         self._running.pop(subagent_id, None)
         output_path = self._outputs.pop(subagent_id, None)
         workspace = self._workspaces.pop(subagent_id, None)
+        limits = self._spec_limits.pop(subagent_id, self._limits)
+        self._deadlines.pop(subagent_id, None)
         payload: dict[str, Any] = {}
         if output_path is not None and output_path.is_file():
             try:
+                if output_path.stat().st_size > limits.max_result_bytes:
+                    raise SubagentRuntimeError("subagent result exceeds max_result_bytes")
                 payload = json.loads(output_path.read_text(encoding="utf-8"))
+            except SubagentRuntimeError as exc:
+                payload = {"error": str(exc)}
             except (OSError, ValueError):
                 payload = {"error": "subagent result file is malformed"}
         if workspace is not None:

@@ -433,6 +433,46 @@ class SandboxAgentTests(unittest.TestCase):
             self.assertEqual(names.count("aegis-task-sealed"), 2)
             self.assertFalse((fixture.config.workspace_root / "task").exists())
 
+    def test_cleanup_reclaims_rootless_container_owned_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = AgentFixture(Path(directory))
+            fixture.agent.prepare("task")
+            root = fixture.config.workspace_root / "task"
+            original_rmtree = __import__("shutil").rmtree
+            calls = 0
+
+            def permission_then_remove(path):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise PermissionError("container uid owns workspace")
+                original_rmtree(path)
+
+            original_runner = fixture.runner
+
+            def runner(argv, *, input=None, timeout=None, env=None):
+                if argv[1:3] == ["unshare", "chown"]:
+                    original_runner.calls.append(
+                        (list(argv), input, timeout, dict(env or {}))
+                    )
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return original_runner(argv, input=input, timeout=timeout, env=env)
+
+            fixture.agent.runner = runner
+            with patch("aegis.sandbox.agent.shutil.rmtree", side_effect=permission_then_remove):
+                fixture.agent.destroy("task")
+
+            reclaim = [
+                argv for argv, *_ in fixture.runner.calls if argv[1:3] == ["unshare", "chown"]
+            ]
+            self.assertEqual(len(reclaim), 1)
+            self.assertEqual(
+                reclaim[0][2:7],
+                ["chown", "-R", "--no-dereference", "0:0", "--"],
+            )
+            self.assertEqual(Path(reclaim[0][-1]), root)
+            self.assertFalse(root.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

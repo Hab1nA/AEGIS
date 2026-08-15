@@ -356,6 +356,8 @@ def _run_v2_cycle_cli(
                 autonomy.subagent_max_result_bytes if autonomy is not None else 65_536
             ),
         )
+        if isinstance(result, dict) and result.get("maintenance_only"):
+            return result
         if hasattr(result, "status"):
             repaired_response = {
                 "campaign_id": config.campaign_id,

@@ -22,11 +22,13 @@ from aegis.models import JsonValue, Role, canonical_json, freeze_json, thaw_json
 _POLICY_KIND = "runtime-policy"
 _AMENDMENT_KIND = "runtime-policy-amendment"
 _STAGE_AMENDMENT_KIND = "runtime-policy-stage-amendment"
+_IMMEDIATE_AMENDMENT_KIND = "runtime-policy-immediate-amendment"
+_COUNCIL_DECISION_KIND = "runtime-policy-council-decision"
 _ROLES = frozenset(role.value for role in Role)
-_CUMULATIVE_LIMITS = frozenset(
+_LEGACY_CUMULATIVE_LIMITS = frozenset(
     {"max_cost_usd", "max_total_tokens", "max_requests", "max_rounds", "max_runtime_seconds"}
 )
-_INTEGER_LIMITS = frozenset(
+_LEGACY_INTEGER_LIMITS = frozenset(
     {
         "max_total_tokens",
         "max_requests",
@@ -38,7 +40,7 @@ _INTEGER_LIMITS = frozenset(
         "council_max_tokens",
     }
 )
-_TIMEOUT_LIMITS = frozenset(
+_LEGACY_TIMEOUT_LIMITS = frozenset(
     {
         "command_timeout_seconds",
         "sealed_timeout_seconds",
@@ -46,16 +48,75 @@ _TIMEOUT_LIMITS = frozenset(
         "scan_timeout_seconds",
     }
 )
-_ALLOWED_FIELDS = frozenset(
+_LEGACY_POLICY_FIELDS_V1 = frozenset(
     {
-        *_CUMULATIVE_LIMITS,
-        *_INTEGER_LIMITS,
-        *_TIMEOUT_LIMITS,
+        *_LEGACY_CUMULATIVE_LIMITS,
+        *_LEGACY_INTEGER_LIMITS,
+        *_LEGACY_TIMEOUT_LIMITS,
         "build_timeout_seconds",
         "role_budget_shares",
         "role_max_output_tokens",
     }
 )
+_V2_CUMULATIVE_LIMITS = frozenset(
+    {"max_total_tokens", "max_requests", "max_model_invocations", "max_active_runtime_seconds"}
+)
+_V2_ROLE_INTEGER_FIELDS = frozenset(
+    {
+        "role_max_steps",
+        "role_max_output_tokens",
+        "role_research_action_budgets",
+        "role_max_read_bytes",
+        "role_max_write_bytes",
+        "role_max_tool_output_bytes",
+        "role_max_search_results",
+    }
+)
+_V2_ROLE_NUMBER_FIELDS = frozenset({"role_command_timeout_seconds"})
+_V2_INTEGER_LIMITS = frozenset(
+    {
+        "max_total_tokens", "max_requests", "max_model_invocations",
+        "gateway_max_attempts", "subagent_max_spawns_per_run", "subagent_max_steps",
+        "subagent_max_result_bytes", "subagent_max_output_tokens", "subagent_max_total_tokens",
+        "subagent_max_requests", "max_evolution_requests_per_run", "max_evolution_source_refs",
+        "task_authoring_attempts", "task_proposals_per_cycle", "cohort_limit",
+        "candidate_evaluations_per_cycle", "candidate_max_steps", "population_max_cells",
+        "council_max_messages", "council_max_tokens", "task_holdout_delay_cycles",
+        "objective_history_window", "objective_probation_cycles", "dependency_download_max_bytes",
+    }
+)
+_V2_NUMBER_LIMITS = frozenset(
+    {
+        "max_active_runtime_seconds", "gateway_timeout_seconds", "gateway_base_delay_seconds",
+        "gateway_max_delay_seconds", "subagent_timeout_seconds",
+        "dependency_download_timeout_seconds", "build_timeout_seconds", "scan_timeout_seconds",
+    }
+)
+_V2_POSITIVE_INTEGER_LIMITS = frozenset(
+    {
+        "max_total_tokens", "max_requests", "max_model_invocations", "gateway_max_attempts",
+        "subagent_max_steps", "subagent_max_result_bytes", "subagent_max_output_tokens",
+        "candidate_max_steps", "council_max_messages", "council_max_tokens",
+        "task_authoring_attempts", "objective_history_window", "objective_probation_cycles",
+        "dependency_download_max_bytes", "task_holdout_delay_cycles", "cohort_limit",
+        "population_max_cells",
+    }
+)
+_V2_POSITIVE_ROLE_INTEGER_FIELDS = frozenset(
+    {"role_max_steps", "role_max_output_tokens", "role_max_read_bytes", "role_max_write_bytes",
+     "role_max_tool_output_bytes", "role_max_search_results"}
+)
+_POLICY_FIELDS_V2 = frozenset(
+    {
+        *_V2_CUMULATIVE_LIMITS, *_V2_ROLE_INTEGER_FIELDS, *_V2_ROLE_NUMBER_FIELDS,
+        *_V2_INTEGER_LIMITS, *_V2_NUMBER_LIMITS, "role_token_shares", "role_reasoning_effort",
+    }
+)
+# Backwards-compatible name used by the legacy amendment reader.
+_ALLOWED_FIELDS = _LEGACY_POLICY_FIELDS_V1
+_CUMULATIVE_LIMITS = _LEGACY_CUMULATIVE_LIMITS | _V2_CUMULATIVE_LIMITS
+_INTEGER_LIMITS = _LEGACY_INTEGER_LIMITS
+_TIMEOUT_LIMITS = _LEGACY_TIMEOUT_LIMITS
 _HOST_SAFETY_TERMS = (
     "windows",
     "wsl",
@@ -119,8 +180,38 @@ def _validate_role_numbers(value: object, name: str, *, shares: bool = False) ->
         else:
             result[cast(str, role)] = _positive_int(raw, f"{name}.{role}")
     if shares and not math.isclose(sum(cast(float, item) for item in result.values()), 1.0, abs_tol=1e-9):
-        raise RuntimePolicyError("role_budget_shares must sum to 1")
+        raise RuntimePolicyError(f"{name} must sum to 1")
     return result
+
+
+def _validate_role_nonnegative_integers(value: object, name: str) -> dict[str, int]:
+    if not isinstance(value, Mapping) or set(value) != _ROLES:
+        raise RuntimePolicyError(f"{name} must define exactly warrior, judge, and prosecutor")
+    result: dict[str, int] = {}
+    for role, raw in value.items():
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise RuntimePolicyError(f"{name}.{role} must be a non-negative integer")
+        result[cast(str, role)] = raw
+    return result
+
+
+def _validate_role_positive_numbers(value: object, name: str) -> dict[str, float]:
+    if not isinstance(value, Mapping) or set(value) != _ROLES:
+        raise RuntimePolicyError(f"{name} must define exactly warrior, judge, and prosecutor")
+    return {
+        cast(str, role): _positive_number(raw, f"{name}.{role}")
+        for role, raw in value.items()
+    }
+
+
+def _validate_role_reasoning(value: object) -> dict[str, str | None]:
+    if not isinstance(value, Mapping) or set(value) != _ROLES:
+        raise RuntimePolicyError("role_reasoning_effort must define exactly all roles")
+    allowed = {None, "none", "low", "medium", "high", "max"}
+    result = dict(value)
+    if any(item not in allowed for item in result.values()):
+        raise RuntimePolicyError("role_reasoning_effort contains an unsupported value")
+    return cast(dict[str, str | None], result)
 
 
 def _validate_provider_limits(value: object) -> dict[str, int]:
@@ -136,7 +227,7 @@ def _validate_provider_limits(value: object) -> dict[str, int]:
     return result
 
 
-def _validate_values(
+def _validate_values_v1(
     value: object, provider_output_limits: Mapping[str, int]
 ) -> Mapping[str, JsonValue]:
     if not isinstance(value, Mapping):
@@ -181,12 +272,87 @@ def _validate_values(
     return cast(Mapping[str, JsonValue], freeze_json(normalized))
 
 
-def _validate_consumed(value: Mapping[str, float | int]) -> Mapping[str, float]:
-    unknown = set(value) - _CUMULATIVE_LIMITS
+def _validate_values_v2(
+    value: object, provider_output_limits: Mapping[str, int]
+) -> Mapping[str, JsonValue]:
+    if not isinstance(value, Mapping):
+        raise RuntimePolicyError("runtime policy values must be a mapping")
+    unknown = set(value) - _POLICY_FIELDS_V2
+    if unknown:
+        names = ", ".join(sorted(str(item) for item in unknown))
+        if any(term in str(item).lower() for item in unknown for term in _HOST_SAFETY_TERMS):
+            raise RuntimePolicyError(f"host safety and resource-envelope fields are immutable: {names}")
+        raise RuntimePolicyError(f"runtime policy contains unsupported fields: {names}")
+    missing = _POLICY_FIELDS_V2 - set(value)
+    if missing:
+        raise RuntimePolicyError(f"runtime policy is missing fields: {', '.join(sorted(missing))}")
+
+    normalized: dict[str, Any] = {}
+    # Zero is meaningful for count budgets: it disables the corresponding action.
+    for name in _V2_INTEGER_LIMITS:
+        raw = value[name]
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise RuntimePolicyError(f"{name} must be a non-negative integer")
+        if name in _V2_POSITIVE_INTEGER_LIMITS and raw == 0:
+            raise RuntimePolicyError(f"{name} must be positive")
+        if name == "candidate_evaluations_per_cycle" and raw > 1:
+            raise RuntimePolicyError(
+                "candidate_evaluations_per_cycle is a bidirectional 0/1 control; "
+                "the cycle state machine records one paired evaluation artifact"
+            )
+        normalized[name] = raw
+    for name in _V2_NUMBER_LIMITS:
+        normalized[name] = _positive_number(value[name], name)
+    for name in _V2_ROLE_INTEGER_FIELDS:
+        raw_values = _validate_role_nonnegative_integers(value[name], name)
+        if name in _V2_POSITIVE_ROLE_INTEGER_FIELDS and any(raw == 0 for raw in raw_values.values()):
+            raise RuntimePolicyError(f"{name} values must be positive")
+        if name == "role_max_output_tokens":
+            for role, output in raw_values.items():
+                if output > provider_output_limits[role]:
+                    raise RuntimePolicyError(
+                        f"role_max_output_tokens.{role} exceeds the provider output profile"
+                    )
+        normalized[name] = raw_values
+    for name in _V2_ROLE_NUMBER_FIELDS:
+        normalized[name] = _validate_role_positive_numbers(value[name], name)
+    normalized["role_token_shares"] = _validate_role_numbers(
+        value["role_token_shares"], "role_token_shares", shares=True
+    )
+    normalized["role_reasoning_effort"] = _validate_role_reasoning(
+        value["role_reasoning_effort"]
+    )
+    if normalized["gateway_max_delay_seconds"] < normalized["gateway_base_delay_seconds"]:
+        raise RuntimePolicyError("gateway_max_delay_seconds must be at least gateway_base_delay_seconds")
+    return cast(Mapping[str, JsonValue], freeze_json(normalized))
+
+
+def _validate_values(
+    value: object, provider_output_limits: Mapping[str, int], *, schema_version: int = 1
+) -> Mapping[str, JsonValue]:
+    if schema_version == 1:
+        return _validate_values_v1(value, provider_output_limits)
+    if schema_version == 2:
+        return _validate_values_v2(value, provider_output_limits)
+    raise RuntimePolicyError(f"unsupported runtime policy schema version: {schema_version}")
+
+
+def _validate_consumed(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    unknown = set(value) - (_CUMULATIVE_LIMITS | {"role_tokens"})
     if unknown:
         raise RuntimePolicyError(f"consumed contains unsupported fields: {', '.join(sorted(unknown))}")
-    result: dict[str, float] = {}
+    result: dict[str, Any] = {}
     for name, raw in value.items():
+        if name == "role_tokens":
+            if not isinstance(raw, Mapping) or set(raw) != _ROLES:
+                raise RuntimePolicyError("consumed.role_tokens must define exactly all roles")
+            role_tokens: dict[str, float] = {}
+            for role, amount in raw.items():
+                if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(float(amount)) or float(amount) < 0:
+                    raise RuntimePolicyError(f"consumed.role_tokens.{role} must be finite and non-negative")
+                role_tokens[cast(str, role)] = float(amount)
+            result["role_tokens"] = MappingProxyType(role_tokens)
+            continue
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             raise RuntimePolicyError(f"consumed.{name} must be numeric")
         number = float(raw)
@@ -201,9 +367,64 @@ def _content_id(kind: str, payload: Mapping[str, Any]) -> str:
     return f"{kind}-sha256:{digest}"
 
 
+def _v2_matches_v1(v2: Mapping[str, JsonValue], v1: Mapping[str, JsonValue]) -> bool:
+    """Compare only historical semantics; removed cost/sealed controls are not migrated."""
+    role_steps = cast(Mapping[str, Any], v2["role_max_steps"])
+    role_timeouts = cast(Mapping[str, Any], v2["role_command_timeout_seconds"])
+    if len(set(role_steps.values())) != 1 or len(set(role_timeouts.values())) != 1:
+        return False
+    projection = {
+        "max_total_tokens": v2["max_total_tokens"],
+        "max_requests": v2["max_requests"],
+        "max_rounds": v2["max_model_invocations"],
+        "max_runtime_seconds": v2["max_active_runtime_seconds"],
+        "role_budget_shares": v2["role_token_shares"],
+        "role_max_output_tokens": v2["role_max_output_tokens"],
+        "max_steps": next(iter(role_steps.values())),
+        "candidate_max_extra_steps": v2["candidate_max_steps"],
+        "subagent_max_steps": v2["subagent_max_steps"],
+        "command_timeout_seconds": next(iter(role_timeouts.values())),
+        "subagent_timeout_seconds": v2["subagent_timeout_seconds"],
+        "build_timeout_seconds": v2["build_timeout_seconds"],
+        "scan_timeout_seconds": v2["scan_timeout_seconds"],
+        "council_max_messages": v2["council_max_messages"],
+        "council_max_tokens": v2["council_max_tokens"],
+    }
+    return all(v1.get(name) == value for name, value in projection.items())
+
+
+def _overlay_v1_on_v2(
+    v2: Mapping[str, JsonValue], v1: Mapping[str, JsonValue]
+) -> dict[str, Any]:
+    result = cast(dict[str, Any], thaw_json(cast(JsonValue, v2)))
+    result.update(
+        {
+            "max_total_tokens": v1["max_total_tokens"],
+            "max_requests": v1["max_requests"],
+            "max_model_invocations": v1["max_rounds"],
+            "max_active_runtime_seconds": v1["max_runtime_seconds"],
+            "role_token_shares": thaw_json(v1["role_budget_shares"]),
+            "role_max_output_tokens": thaw_json(v1["role_max_output_tokens"]),
+            "role_max_steps": {role: v1["max_steps"] for role in _ROLES},
+            "role_command_timeout_seconds": {
+                role: v1["command_timeout_seconds"] for role in _ROLES
+            },
+            "candidate_max_steps": v1["candidate_max_extra_steps"],
+            "subagent_max_steps": v1["subagent_max_steps"],
+            "subagent_timeout_seconds": v1["subagent_timeout_seconds"],
+            "build_timeout_seconds": v1["build_timeout_seconds"],
+            "scan_timeout_seconds": v1["scan_timeout_seconds"],
+            "council_max_messages": v1["council_max_messages"],
+            "council_max_tokens": v1["council_max_tokens"],
+        }
+    )
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimePolicyVersion:
     policy_id: str
+    schema_version: int
     parent_policy_id: str | None
     effective_cycle: int
     values: Mapping[str, JsonValue]
@@ -219,20 +440,32 @@ class RuntimePolicyVersion:
         effective_cycle: int,
         values: Mapping[str, Any],
         provider_output_limits: Mapping[str, int],
-        consumed: Mapping[str, float | int] | None = None,
+        consumed: Mapping[str, Any] | None = None,
+        schema_version: int | None = None,
     ) -> RuntimePolicyVersion:
         if isinstance(effective_cycle, bool) or not isinstance(effective_cycle, int) or effective_cycle < 0:
             raise RuntimePolicyError("effective_cycle must be a non-negative integer")
         limits = MappingProxyType(_validate_provider_limits(provider_output_limits))
-        normalized = _validate_values(values, limits)
+        if schema_version is None:
+            schema_version = 1 if set(values) == _LEGACY_POLICY_FIELDS_V1 else 2
+        if schema_version not in {1, 2}:
+            raise RuntimePolicyError("runtime policy schema version must be 1 or 2")
+        normalized = _validate_values(values, limits, schema_version=schema_version)
         usage = _validate_consumed(consumed or {})
-        reasons = tuple(
-            sorted(
-                name
-                for name, amount in usage.items()
-                if name in normalized and float(cast(float | int, normalized[name])) < amount
+        reason_items = [
+            name for name, amount in usage.items()
+            if name in normalized and float(cast(float | int, normalized[name])) < amount
+        ]
+        if schema_version == 2 and "role_tokens" in usage:
+            role_tokens = cast(Mapping[str, float], usage["role_tokens"])
+            shares = cast(Mapping[str, float], normalized["role_token_shares"])
+            total = float(cast(int, normalized["max_total_tokens"]))
+            reason_items.extend(
+                f"role_token_shares.{role}"
+                for role, amount in role_tokens.items()
+                if amount > total * float(shares[role])
             )
-        )
+        reasons = tuple(sorted(reason_items))
         material: dict[str, Any] = {
             "parent_policy_id": parent_policy_id,
             "effective_cycle": effective_cycle,
@@ -241,8 +474,11 @@ class RuntimePolicyVersion:
             "maintenance_only": bool(reasons),
             "maintenance_reasons": list(reasons),
         }
+        if schema_version == 2:
+            material = {"schema_version": 2, **material}
         return cls(
             _content_id(_POLICY_KIND, material),
+            schema_version,
             parent_policy_id,
             effective_cycle,
             normalized,
@@ -253,22 +489,29 @@ class RuntimePolicyVersion:
 
     @classmethod
     def from_artifact_mapping(cls, value: object) -> RuntimePolicyVersion:
+        if not isinstance(value, Mapping):
+            raise RuntimePolicyIntegrityError("runtime policy artifact has an invalid schema")
+        schema_version = value.get("schema_version", 1)
+        if schema_version not in {1, 2}:
+            raise RuntimePolicyIntegrityError("unsupported runtime policy schema version")
+        fields = {
+            "parent_policy_id", "effective_cycle", "values", "provider_output_limits",
+            "maintenance_only", "maintenance_reasons",
+        }
+        if schema_version == 2:
+            fields.add("schema_version")
         data = _strict_object(
             value,
-            {
-                "parent_policy_id",
-                "effective_cycle",
-                "values",
-                "provider_output_limits",
-                "maintenance_only",
-                "maintenance_reasons",
-            },
+            fields,
             "runtime policy artifact",
         )
         reasons = data["maintenance_reasons"]
         if not isinstance(reasons, list) or any(not isinstance(item, str) for item in reasons):
             raise RuntimePolicyIntegrityError("maintenance_reasons must be a string list")
-        if any(item not in _CUMULATIVE_LIMITS for item in reasons) or reasons != sorted(set(reasons)):
+        if any(
+            item not in _CUMULATIVE_LIMITS and not item.startswith("role_token_shares.")
+            for item in reasons
+        ) or reasons != sorted(set(reasons)):
             raise RuntimePolicyIntegrityError("maintenance_reasons contains invalid fields")
         maintenance_only = data["maintenance_only"]
         if not isinstance(maintenance_only, bool) or maintenance_only != bool(reasons):
@@ -280,7 +523,7 @@ class RuntimePolicyVersion:
         if parent is not None and not isinstance(parent, str):
             raise RuntimePolicyIntegrityError("parent_policy_id must be text or null")
         limits = MappingProxyType(_validate_provider_limits(data["provider_output_limits"]))
-        values = _validate_values(data["values"], limits)
+        values = _validate_values(data["values"], limits, schema_version=cast(int, schema_version))
         material = {
             "parent_policy_id": parent,
             "effective_cycle": effective_cycle,
@@ -289,8 +532,11 @@ class RuntimePolicyVersion:
             "maintenance_only": maintenance_only,
             "maintenance_reasons": reasons,
         }
+        if schema_version == 2:
+            material = {"schema_version": 2, **material}
         return cls(
             _content_id(_POLICY_KIND, material),
+            cast(int, schema_version),
             parent,
             effective_cycle,
             values,
@@ -300,7 +546,7 @@ class RuntimePolicyVersion:
         )
 
     def to_artifact_mapping(self) -> dict[str, Any]:
-        return {
+        result = {
             "parent_policy_id": self.parent_policy_id,
             "effective_cycle": self.effective_cycle,
             "values": thaw_json(cast(JsonValue, self.values)),
@@ -308,6 +554,9 @@ class RuntimePolicyVersion:
             "maintenance_only": self.maintenance_only,
             "maintenance_reasons": list(self.maintenance_reasons),
         }
+        if self.schema_version == 2:
+            return {"schema_version": 2, **result}
+        return result
 
     def to_mapping(self) -> dict[str, Any]:
         return {"policy_id": self.policy_id, **self.to_artifact_mapping()}
@@ -491,6 +740,64 @@ class StageRuntimePolicyAmendment:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ImmediateRuntimePolicyAmendment:
+    amendment_id: str
+    request_id: str
+    base_policy_id: str
+    requested_at: RuntimeStageBoundary
+    revision: int
+    requested_by: Role
+    kind: str
+    patch: Mapping[str, JsonValue]
+    rollback_target_policy_id: str | None
+    resulting_policy_id: str
+    reason: str
+    evidence_refs: tuple[str, ...]
+
+    @classmethod
+    def create(cls, *, request_id: str, base_policy_id: str,
+               requested_at: RuntimeStageBoundary, revision: int, kind: str,
+               patch: Mapping[str, Any], rollback_target_policy_id: str | None,
+               resulting_policy_id: str, reason: str,
+               evidence_refs: tuple[str, ...] = ()) -> "ImmediateRuntimePolicyAmendment":
+        if kind not in {"patch", "rollback"}:
+            raise RuntimePolicyError("immediate amendment kind must be patch or rollback")
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise RuntimePolicyError("request_id must be non-empty")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise RuntimePolicyError("revision must be a positive integer")
+        if not isinstance(reason, str) or not reason.strip() or reason != reason.strip():
+            raise RuntimePolicyError("amendment reason must be trimmed non-empty text")
+        if any(not isinstance(item, str) or not item.strip() for item in evidence_refs):
+            raise RuntimePolicyError("evidence_refs must contain non-empty text")
+        frozen_patch = cast(Mapping[str, JsonValue], freeze_json(patch))
+        material = {
+            "request_id": request_id, "base_policy_id": base_policy_id,
+            "requested_at": requested_at.to_mapping(), "revision": revision,
+            "requested_by": Role.PROSECUTOR.value, "kind": kind,
+            "patch": thaw_json(cast(JsonValue, frozen_patch)),
+            "rollback_target_policy_id": rollback_target_policy_id,
+            "resulting_policy_id": resulting_policy_id, "reason": reason,
+            "evidence_refs": list(evidence_refs),
+        }
+        return cls(_content_id(_IMMEDIATE_AMENDMENT_KIND, material), request_id,
+                   base_policy_id, requested_at, revision, Role.PROSECUTOR, kind,
+                   frozen_patch, rollback_target_policy_id, resulting_policy_id,
+                   reason, evidence_refs)
+
+    def to_artifact_mapping(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id, "base_policy_id": self.base_policy_id,
+            "requested_at": self.requested_at.to_mapping(), "revision": self.revision,
+            "requested_by": self.requested_by.value, "kind": self.kind,
+            "patch": thaw_json(cast(JsonValue, self.patch)),
+            "rollback_target_policy_id": self.rollback_target_policy_id,
+            "resulting_policy_id": self.resulting_policy_id, "reason": self.reason,
+            "evidence_refs": list(self.evidence_refs),
+        }
+
+
 _LOCKS_GUARD = Lock()
 _REGISTRY_LOCKS: dict[tuple[str, str], RLock] = {}
 
@@ -521,7 +828,11 @@ class RuntimePolicyRegistry:
         self._amendments: dict[int, RuntimePolicyAmendment] = {}
         self._stage_schedule: dict[tuple[int, int], tuple[RuntimeStageBoundary, str]] = {}
         self._stage_amendments: dict[tuple[int, int], StageRuntimePolicyAmendment] = {}
+        self._immediate_amendments: list[ImmediateRuntimePolicyAmendment] = []
+        self._council_decisions: dict[str, Mapping[str, JsonValue]] = {}
+        self._migration_policy_id: str | None = None
         self._paired_designs: dict[str, str] = {}
+        self._maintenance_armed: dict[RuntimeStageBoundary, str] = {}
         self._replay()
 
     @property
@@ -545,6 +856,43 @@ class RuntimePolicyRegistry:
             if existing is not None:
                 if existing == candidate.policy_id:
                     return self._versions[existing]
+                historical = self._versions[existing]
+                if historical.schema_version == 1 and candidate.schema_version == 2:
+                    if self._migration_policy_id is not None:
+                        migrated = self._versions[self._migration_policy_id]
+                        base_id = migrated.parent_policy_id
+                        if base_id is None:
+                            raise RuntimePolicyIntegrityError("v2 migration has no v1 parent")
+                        expected_values = freeze_json(
+                            _overlay_v1_on_v2(candidate.values, self._versions[base_id].values)
+                        )
+                        if migrated.values != expected_values:
+                            raise RuntimePolicyConflictError("campaign already has another v2 migration")
+                        return migrated
+                    latest_cycle = max(
+                        [*self._schedule, *(key[0] for key in self._stage_schedule)],
+                        default=0,
+                    )
+                    historical = self.latest_for_cycle(latest_cycle)
+                    if historical.schema_version != 1:
+                        raise RuntimePolicyConflictError(
+                            "campaign has an unsupported policy lineage before v2 migration"
+                        )
+                    migrated_values = _overlay_v1_on_v2(candidate.values, historical.values)
+                    migrated = RuntimePolicyVersion.create(
+                        parent_policy_id=historical.policy_id,
+                        effective_cycle=historical.effective_cycle,
+                        values=migrated_values,
+                        provider_output_limits=candidate.provider_output_limits,
+                        schema_version=2,
+                    )
+                    if not _v2_matches_v1(migrated.values, historical.values):
+                        raise RuntimePolicyConflictError(
+                            "v2 migration does not preserve the latest historical v1 semantics"
+                        )
+                    self._persist_migration(migrated, historical.policy_id)
+                    self._replay()
+                    return self._versions[migrated.policy_id]
                 raise RuntimePolicyConflictError("campaign already has a different genesis policy")
             self._persist_policy(candidate, "runtime_policy_genesis", None)
             self._replay()
@@ -553,10 +901,76 @@ class RuntimePolicyRegistry:
     def effective_for_cycle(self, cycle: int) -> RuntimePolicyVersion:
         if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 0:
             raise RuntimePolicyError("cycle must be a non-negative integer")
-        eligible = [item for item in self._schedule if item <= cycle]
-        if not eligible:
+        candidates = [
+            ((item_cycle, 0, 0), policy_id)
+            for item_cycle, policy_id in self._schedule.items()
+            if item_cycle <= cycle
+        ]
+        candidates.extend(
+            ((boundary.cycle, boundary.ordinal, 0), policy_id)
+            for boundary, policy_id in self._maintenance_armed.items()
+            if boundary.cycle <= cycle
+        )
+        migration = self._migration_candidate()
+        if migration is not None and migration[0][0] <= cycle:
+            candidates.append(migration)
+        if not candidates:
             raise RuntimePolicyError("runtime policy genesis has not been initialized")
-        return self._versions[self._schedule[max(eligible)]]
+        return self._versions[max(candidates, key=lambda item: item[0])[1]]
+
+    def _migration_candidate(self) -> tuple[tuple[int, int, int], str] | None:
+        if self._migration_policy_id is None:
+            return None
+        migrated = self._versions[self._migration_policy_id]
+        parent_id = migrated.parent_policy_id
+        positions: list[tuple[int, int, int]] = [
+            (cycle, 0, 0)
+            for cycle, policy_id in self._schedule.items()
+            if policy_id == parent_id
+        ]
+        positions.extend(
+            (key[0], key[1], 0)
+            for key, (_boundary, policy_id) in self._stage_schedule.items()
+            if policy_id == parent_id
+        )
+        positions.extend(
+            (item.requested_at.cycle, item.requested_at.ordinal, item.revision)
+            for item in self._immediate_amendments
+            if item.resulting_policy_id == parent_id
+        )
+        if not positions:
+            raise RuntimePolicyIntegrityError("v2 migration parent has no execution position")
+        cycle, ordinal, revision = max(positions)
+        return ((cycle, ordinal, revision + 1), self._migration_policy_id)
+
+    def latest_for_cycle(self, cycle: int) -> RuntimePolicyVersion:
+        """Return the latest revision reached in ``cycle`` without inventing a boundary."""
+        candidates: list[tuple[tuple[int, int, int], str]] = [
+            ((item_cycle, 0, 0), policy_id)
+            for item_cycle, policy_id in self._schedule.items()
+            if item_cycle <= cycle
+        ]
+        candidates.extend(
+            ((boundary.cycle, boundary.ordinal, 0), policy_id)
+            for boundary, policy_id in self._maintenance_armed.items()
+            if boundary.cycle <= cycle
+        )
+        candidates.extend(
+            ((key[0], key[1], 0), policy_id)
+            for key, (_boundary, policy_id) in self._stage_schedule.items()
+            if key[0] <= cycle
+        )
+        migration = self._migration_candidate()
+        if migration is not None:
+            candidates.append(migration)
+        candidates.extend(
+            ((item.requested_at.cycle, item.requested_at.ordinal, item.revision), item.resulting_policy_id)
+            for item in self._immediate_amendments
+            if item.requested_at.cycle <= cycle
+        )
+        if not candidates:
+            raise RuntimePolicyError("runtime policy genesis has not been initialized")
+        return self._versions[max(candidates, key=lambda item: item[0])[1]]
 
     def effective_for_stage(self, boundary: RuntimeStageBoundary) -> RuntimePolicyVersion:
         """Resolve the latest policy at an exact monotonic stage boundary."""
@@ -570,22 +984,261 @@ class RuntimePolicyRegistry:
             raise RuntimePolicyConflictError(
                 "stage ordinal is already bound to another stage name"
             )
-        candidates: list[tuple[tuple[int, int], str]] = [
-            ((cycle, 0), policy_id)
+        candidates: list[tuple[tuple[int, int, int], str]] = [
+            ((cycle, 0, 0), policy_id)
             for cycle, policy_id in self._schedule.items()
             if (cycle, 0) <= boundary.key
         ]
         candidates.extend(
-            (key, policy_id)
+            ((key[0], key[1], 0), policy_id)
             for key, (_, policy_id) in self._stage_schedule.items()
             if key <= boundary.key
+        )
+        migration = self._migration_candidate()
+        if migration is not None and migration[0][:2] <= boundary.key:
+            candidates.append(migration)
+        candidates.extend(
+            (
+                (item.requested_at.cycle, item.requested_at.ordinal, item.revision),
+                item.resulting_policy_id,
+            )
+            for item in self._immediate_amendments
+            if item.requested_at.key <= boundary.key
+        )
+        candidates.extend(
+            ((armed.cycle, armed.ordinal, 0), policy_id)
+            for armed, policy_id in self._maintenance_armed.items()
+            if armed.key <= boundary.key
         )
         if not candidates:
             raise RuntimePolicyError("runtime policy genesis has not been initialized")
         return self._versions[max(candidates, key=lambda item: item[0])[1]]
 
+    @property
+    def immediate_amendments(self) -> tuple[ImmediateRuntimePolicyAmendment, ...]:
+        return tuple(self._immediate_amendments)
+
+    def pending_council_amendments(self) -> tuple[ImmediateRuntimePolicyAmendment, ...]:
+        return tuple(
+            item for item in self._immediate_amendments
+            if item.amendment_id not in self._council_decisions
+        )
+
+    def record_council_decision(
+        self, *, amendment_id: str, decision: str, reason: str,
+        replacement_amendment_id: str | None = None,
+    ) -> Mapping[str, JsonValue]:
+        if decision not in {"ratify", "revise", "rollback"}:
+            raise RuntimePolicyError("council decision must be ratify, revise, or rollback")
+        if not isinstance(reason, str) or not reason.strip() or reason != reason.strip():
+            raise RuntimePolicyError("council decision reason must be trimmed non-empty text")
+        with self._lock:
+            self._replay()
+            amendment_ids = {item.amendment_id for item in self._immediate_amendments}
+            if amendment_id not in amendment_ids:
+                raise RuntimePolicyError("council decision references an unknown amendment")
+            if decision == "ratify" and replacement_amendment_id is not None:
+                raise RuntimePolicyError("ratification cannot name a replacement amendment")
+            if decision in {"revise", "rollback"} and replacement_amendment_id not in amendment_ids:
+                raise RuntimePolicyError("revision or rollback must name an applied replacement amendment")
+            if decision in {"revise", "rollback"}:
+                original_index = next(
+                    index for index, item in enumerate(self._immediate_amendments)
+                    if item.amendment_id == amendment_id
+                )
+                replacement_index = next(
+                    index for index, item in enumerate(self._immediate_amendments)
+                    if item.amendment_id == replacement_amendment_id
+                )
+                if replacement_index <= original_index:
+                    raise RuntimePolicyError("replacement amendment must be a later causal revision")
+            material: dict[str, Any] = {
+                "amendment_id": amendment_id, "decision": decision, "reason": reason,
+                "replacement_amendment_id": replacement_amendment_id,
+            }
+            decision_id = _content_id(_COUNCIL_DECISION_KIND, material)
+            record = cast(Mapping[str, JsonValue], freeze_json({"decision_id": decision_id, **material}))
+            existing = self._council_decisions.get(amendment_id)
+            if existing is not None:
+                if existing == record:
+                    return existing
+                raise RuntimePolicyConflictError("amendment already has another council decision")
+            ref = self.artifacts.put_json(_COUNCIL_DECISION_KIND, material)
+            if ref.artifact_id != decision_id:
+                raise RuntimePolicyIntegrityError("council decision CAS identity mismatch")
+            sequence = self.store.max_sequence(self.campaign_id)
+            self.store.append_if_sequence(
+                self.campaign_id, sequence, "runtime_policy_council_decided",
+                {"decision_ref": self._ref_mapping(ref)},
+            )
+            self._replay()
+            return self._council_decisions[amendment_id]
+
+    def arm_maintenance(
+        self,
+        *,
+        requested_at: RuntimeStageBoundary,
+        consumed: Mapping[str, Any],
+        reason: str,
+    ) -> RuntimePolicyVersion:
+        """Persist a maintenance-only policy when consumed usage exceeds limits.
+
+        The armed policy keeps the current values but records the already-consumed
+        usage, so the runtime ledger switches to maintenance authorization until
+        the Prosecutor applies a compensating amendment that restores a viable
+        budget.
+        """
+        if not isinstance(reason, str) or not reason.strip() or reason != reason.strip():
+            raise RuntimePolicyError("maintenance reason must be trimmed non-empty text")
+        with self._lock:
+            self._replay()
+            existing = self._maintenance_armed.get(requested_at)
+            if existing is not None:
+                return self._versions[existing]
+            base = self.effective_for_stage(requested_at)
+            if base.schema_version != 2:
+                raise RuntimePolicyError("maintenance arming requires a v2 runtime policy")
+            policy = RuntimePolicyVersion.create(
+                parent_policy_id=base.policy_id,
+                effective_cycle=requested_at.cycle,
+                values=base.values,
+                provider_output_limits=base.provider_output_limits,
+                consumed=consumed,
+                schema_version=2,
+            )
+            if not policy.maintenance_only:
+                raise RuntimePolicyError(
+                    "maintenance arming requires consumed usage above policy limits"
+                )
+            ref = self._put_policy(policy)
+            payload = {
+                "policy_ref": self._ref_mapping(ref),
+                "requested_at": requested_at.to_mapping(),
+            }
+            sequence = self.store.max_sequence(self.campaign_id)
+            try:
+                self.store.append_if_sequence(
+                    self.campaign_id,
+                    sequence,
+                    "runtime_policy_maintenance_armed",
+                    payload,
+                )
+            except EventStoreSequenceConflict as exc:
+                self._replay()
+                existing = self._maintenance_armed.get(requested_at)
+                if existing is not None and existing == policy.policy_id:
+                    return self._versions[existing]
+                raise RuntimePolicyConflictError(
+                    "runtime policy maintenance arming raced with another writer"
+                ) from exc
+            self._replay()
+            return self._versions[policy.policy_id]
+
+    def request_patch_immediately(
+        self, *, requested_by: Role | str, requested_at: RuntimeStageBoundary,
+        request_id: str, patch: Mapping[str, Any], consumed: Mapping[str, Any],
+        reason: str, evidence_refs: tuple[str, ...] = (),
+        base_policy_id: str | None = None,
+    ) -> ImmediateRuntimePolicyAmendment:
+        role = requested_by if isinstance(requested_by, Role) else Role(requested_by)
+        if role is not Role.PROSECUTOR:
+            raise RuntimePolicyError("only the prosecutor may amend runtime policy")
+        if not isinstance(patch, Mapping) or not patch:
+            raise RuntimePolicyError("runtime policy patch must be a non-empty mapping")
+        unknown = set(patch) - _POLICY_FIELDS_V2
+        if unknown:
+            raise RuntimePolicyError(
+                f"runtime policy patch cannot modify fields: {', '.join(sorted(map(str, unknown)))}"
+            )
+        with self._lock:
+            self._replay()
+            duplicate = next((item for item in self._immediate_amendments if item.request_id == request_id), None)
+            if duplicate is not None:
+                if (
+                    duplicate.kind == "patch"
+                    and duplicate.requested_at == requested_at
+                    and duplicate.base_policy_id == base_policy_id
+                    and thaw_json(cast(JsonValue, duplicate.patch)) == dict(patch)
+                    and duplicate.reason == reason
+                    and duplicate.evidence_refs == evidence_refs
+                ):
+                    return duplicate
+                raise RuntimePolicyConflictError("request_id already identifies another amendment request")
+            base = self.effective_for_stage(requested_at)
+            if base_policy_id is not None and base.policy_id != base_policy_id:
+                raise RuntimePolicyConflictError("base_policy_id is stale")
+            if base.schema_version != 2:
+                raise RuntimePolicyError("immediate amendments require a v2 runtime policy")
+            values = cast(dict[str, Any], thaw_json(cast(JsonValue, base.values)))
+            for name, raw in patch.items():
+                if values.get(name) == raw:
+                    continue
+                values[name] = raw
+            if values == thaw_json(cast(JsonValue, base.values)):
+                raise RuntimePolicyError("runtime policy patch is a no-op")
+            result = RuntimePolicyVersion.create(
+                parent_policy_id=base.policy_id, effective_cycle=requested_at.cycle,
+                values=values, provider_output_limits=base.provider_output_limits,
+                consumed=consumed, schema_version=2,
+            )
+            revision = 1 + sum(item.requested_at.key == requested_at.key for item in self._immediate_amendments)
+            amendment = ImmediateRuntimePolicyAmendment.create(
+                request_id=request_id, base_policy_id=base.policy_id,
+                requested_at=requested_at, revision=revision, kind="patch", patch=patch,
+                rollback_target_policy_id=None, resulting_policy_id=result.policy_id,
+                reason=reason, evidence_refs=evidence_refs,
+            )
+            return self._persist_immediate_amendment(result, amendment)
+
+    def request_rollback_immediately(
+        self, *, requested_by: Role | str, requested_at: RuntimeStageBoundary,
+        request_id: str, target_policy_id: str, consumed: Mapping[str, Any],
+        reason: str, evidence_refs: tuple[str, ...] = (),
+        base_policy_id: str | None = None,
+    ) -> ImmediateRuntimePolicyAmendment:
+        role = requested_by if isinstance(requested_by, Role) else Role(requested_by)
+        if role is not Role.PROSECUTOR:
+            raise RuntimePolicyError("only the prosecutor may roll back runtime policy")
+        with self._lock:
+            self._replay()
+            duplicate = next((item for item in self._immediate_amendments if item.request_id == request_id), None)
+            if duplicate is not None:
+                if (
+                    duplicate.kind == "rollback"
+                    and duplicate.requested_at == requested_at
+                    and duplicate.base_policy_id == base_policy_id
+                    and duplicate.rollback_target_policy_id == target_policy_id
+                    and duplicate.reason == reason
+                    and duplicate.evidence_refs == evidence_refs
+                ):
+                    return duplicate
+                raise RuntimePolicyConflictError("request_id already identifies another amendment request")
+            base = self.effective_for_stage(requested_at)
+            if base_policy_id is not None and base.policy_id != base_policy_id:
+                raise RuntimePolicyConflictError("base_policy_id is stale")
+            try:
+                target = self._versions[target_policy_id]
+            except KeyError as exc:
+                raise RuntimePolicyError("rollback target policy is unknown") from exc
+            if target.schema_version != 2:
+                raise RuntimePolicyError("immediate rollback target must use schema v2")
+            result = RuntimePolicyVersion.create(
+                parent_policy_id=base.policy_id, effective_cycle=requested_at.cycle,
+                values=cast(Mapping[str, Any], target.values),
+                provider_output_limits=target.provider_output_limits, consumed=consumed,
+                schema_version=2,
+            )
+            revision = 1 + sum(item.requested_at.key == requested_at.key for item in self._immediate_amendments)
+            amendment = ImmediateRuntimePolicyAmendment.create(
+                request_id=request_id, base_policy_id=base.policy_id,
+                requested_at=requested_at, revision=revision, kind="rollback", patch={},
+                rollback_target_policy_id=target.policy_id, resulting_policy_id=result.policy_id,
+                reason=reason, evidence_refs=evidence_refs,
+            )
+            return self._persist_immediate_amendment(result, amendment)
+
     def resume_stage_boundary(self, cycle: int) -> RuntimeStageBoundary:
-        """Return the latest persisted effective boundary for a resumed cycle."""
+        """Return a boundary strictly after all persisted policy activity in a cycle."""
         if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 0:
             raise RuntimePolicyError("cycle must be a non-negative integer")
         matches = [
@@ -593,6 +1246,14 @@ class RuntimePolicyRegistry:
             for (scheduled_cycle, _ordinal), (boundary, _policy_id) in self._stage_schedule.items()
             if scheduled_cycle == cycle
         ]
+        matches.extend(
+            item.requested_at
+            for item in self._immediate_amendments
+            if item.requested_at.cycle == cycle
+        )
+        matches.extend(
+            boundary for boundary in self._maintenance_armed if boundary.cycle == cycle
+        )
         if not matches:
             return RuntimeStageBoundary(cycle, 0, "stage:0")
         return max(matches, key=lambda item: item.ordinal)
@@ -627,7 +1288,7 @@ class RuntimePolicyRegistry:
         requested_at: RuntimeStageBoundary,
         effective_at: RuntimeStageBoundary,
         patch: Mapping[str, Any],
-        consumed: Mapping[str, float | int],
+        consumed: Mapping[str, Any],
         reason: str,
     ) -> StageRuntimePolicyAmendment:
         role = requested_by if isinstance(requested_by, Role) else Role(requested_by)
@@ -670,7 +1331,7 @@ class RuntimePolicyRegistry:
         requested_at: RuntimeStageBoundary,
         effective_at: RuntimeStageBoundary,
         target_policy_id: str,
-        consumed: Mapping[str, float | int],
+        consumed: Mapping[str, Any],
         reason: str,
     ) -> StageRuntimePolicyAmendment:
         role = requested_by if isinstance(requested_by, Role) else Role(requested_by)
@@ -708,7 +1369,7 @@ class RuntimePolicyRegistry:
         requested_by: Role | str,
         current_cycle: int,
         patch: Mapping[str, Any],
-        consumed: Mapping[str, float | int],
+        consumed: Mapping[str, Any],
         reason: str,
     ) -> RuntimePolicyAmendment:
         role = requested_by if isinstance(requested_by, Role) else Role(requested_by)
@@ -749,7 +1410,7 @@ class RuntimePolicyRegistry:
         requested_by: Role | str,
         current_cycle: int,
         target_policy_id: str,
-        consumed: Mapping[str, float | int],
+        consumed: Mapping[str, Any],
         reason: str,
     ) -> RuntimePolicyAmendment:
         role = requested_by if isinstance(requested_by, Role) else Role(requested_by)
@@ -865,6 +1526,60 @@ class RuntimePolicyRegistry:
         self._replay()
         return self._amendments[amendment.requested_cycle]
 
+    def _persist_migration(self, policy: RuntimePolicyVersion, base_policy_id: str) -> None:
+        ref = self._put_policy(policy)
+        sequence = self.store.max_sequence(self.campaign_id)
+        try:
+            self.store.append_if_sequence(
+                self.campaign_id,
+                sequence,
+                "runtime_policy_migrated_v2",
+                {"policy_ref": self._ref_mapping(ref), "base_policy_id": base_policy_id},
+            )
+        except EventStoreSequenceConflict as exc:
+            self._replay()
+            if self._migration_policy_id == policy.policy_id:
+                return
+            raise RuntimePolicyConflictError("runtime policy migration raced with another writer") from exc
+
+    def _persist_immediate_amendment(
+        self, policy: RuntimePolicyVersion, amendment: ImmediateRuntimePolicyAmendment
+    ) -> ImmediateRuntimePolicyAmendment:
+        existing = next(
+            (item for item in self._immediate_amendments if item.request_id == amendment.request_id),
+            None,
+        )
+        if existing is not None:
+            if existing.amendment_id == amendment.amendment_id:
+                return existing
+            raise RuntimePolicyConflictError("request_id already identifies another amendment")
+        policy_ref = self._put_policy(policy)
+        amendment_ref = self.artifacts.put_json(
+            _IMMEDIATE_AMENDMENT_KIND, amendment.to_artifact_mapping()
+        )
+        if amendment_ref.artifact_id != amendment.amendment_id:
+            raise RuntimePolicyIntegrityError("immediate amendment CAS identity mismatch")
+        sequence = self.store.max_sequence(self.campaign_id)
+        try:
+            self.store.append_if_sequence(
+                self.campaign_id, sequence, "runtime_policy_immediate_amendment_applied",
+                {"policy_ref": self._ref_mapping(policy_ref),
+                 "amendment_ref": self._ref_mapping(amendment_ref)},
+            )
+        except EventStoreSequenceConflict as exc:
+            self._replay()
+            existing = next(
+                (item for item in self._immediate_amendments if item.request_id == amendment.request_id),
+                None,
+            )
+            if existing is not None and existing.amendment_id == amendment.amendment_id:
+                return existing
+            raise RuntimePolicyConflictError("immediate amendment raced with another writer") from exc
+        self._replay()
+        return next(
+            item for item in self._immediate_amendments if item.request_id == amendment.request_id
+        )
+
     def _persist_stage_amendment(
         self,
         policy: RuntimePolicyVersion,
@@ -965,6 +1680,10 @@ class RuntimePolicyRegistry:
             tuple[int, int], tuple[RuntimeStageBoundary, str]
         ] = {}
         stage_amendments: dict[tuple[int, int], StageRuntimePolicyAmendment] = {}
+        immediate_amendments: list[ImmediateRuntimePolicyAmendment] = []
+        council_decisions: dict[str, Mapping[str, JsonValue]] = {}
+        maintenance_armed: dict[RuntimeStageBoundary, str] = {}
+        migration_policy_id: str | None = None
         paired: dict[str, str] = {}
         for event in self.store.read(self.campaign_id):
             payload = thaw_json(event.payload)
@@ -978,6 +1697,47 @@ class RuntimePolicyRegistry:
                     raise RuntimePolicyIntegrityError("multiple genesis policies exist")
                 versions[policy.policy_id] = policy
                 schedule[0] = policy.policy_id
+            elif event.event_type == "runtime_policy_migrated_v2":
+                policy = RuntimePolicyVersion.from_artifact_mapping(
+                    self._load_json(payload["policy_ref"], _POLICY_KIND)
+                )
+                base_policy_id = payload.get("base_policy_id")
+                if (
+                    policy.schema_version != 2
+                    or policy.policy_id != payload["policy_ref"]["artifact_id"]
+                    or policy.parent_policy_id != base_policy_id
+                    or base_policy_id not in versions
+                    or versions[cast(str, base_policy_id)].schema_version != 1
+                    or migration_policy_id is not None
+                ):
+                    raise RuntimePolicyIntegrityError("runtime policy v2 migration is invalid")
+                base = versions[cast(str, base_policy_id)]
+                positions: list[tuple[tuple[int, int, int], str]] = [
+                    ((item_cycle, 0, 0), item_policy)
+                    for item_cycle, item_policy in schedule.items()
+                ]
+                positions.extend(
+                    ((key[0], key[1], 0), item_policy)
+                    for key, (_boundary, item_policy) in stage_schedule.items()
+                )
+                positions.extend(
+                    (
+                        (item.requested_at.cycle, item.requested_at.ordinal, item.revision),
+                        item.resulting_policy_id,
+                    )
+                    for item in immediate_amendments
+                )
+                if (
+                    not positions
+                    or max(positions, key=lambda item: item[0])[1] != base_policy_id
+                    or policy.effective_cycle != base.effective_cycle
+                    or not _v2_matches_v1(policy.values, base.values)
+                ):
+                    raise RuntimePolicyIntegrityError(
+                        "runtime policy v2 migration does not preserve the latest v1 policy"
+                    )
+                versions[policy.policy_id] = policy
+                migration_policy_id = policy.policy_id
             elif event.event_type == "runtime_policy_amendment_scheduled":
                 policy = RuntimePolicyVersion.from_artifact_mapping(
                     self._load_json(payload["policy_ref"], _POLICY_KIND)
@@ -1081,6 +1841,177 @@ class RuntimePolicyRegistry:
                     policy.policy_id,
                 )
                 stage_amendments[stage_amendment.requested_at.key] = stage_amendment
+            elif event.event_type == "runtime_policy_immediate_amendment_applied":
+                policy = RuntimePolicyVersion.from_artifact_mapping(
+                    self._load_json(payload["policy_ref"], _POLICY_KIND)
+                )
+                data = self._load_json(payload["amendment_ref"], _IMMEDIATE_AMENDMENT_KIND)
+                refs = data["evidence_refs"]
+                if not isinstance(refs, list):
+                    raise RuntimePolicyIntegrityError("immediate amendment evidence_refs is invalid")
+                immediate_amendment = ImmediateRuntimePolicyAmendment.create(
+                    request_id=data["request_id"], base_policy_id=data["base_policy_id"],
+                    requested_at=RuntimeStageBoundary.from_mapping(data["requested_at"]),
+                    revision=data["revision"], kind=data["kind"], patch=data["patch"],
+                    rollback_target_policy_id=data["rollback_target_policy_id"],
+                    resulting_policy_id=data["resulting_policy_id"], reason=data["reason"],
+                    evidence_refs=tuple(refs),
+                )
+                if data["requested_by"] != Role.PROSECUTOR.value:
+                    raise RuntimePolicyIntegrityError("immediate amendment was not requested by prosecutor")
+                if immediate_amendment.amendment_id != payload["amendment_ref"]["artifact_id"]:
+                    raise RuntimePolicyIntegrityError("immediate amendment content address is invalid")
+                if policy.policy_id != payload["policy_ref"]["artifact_id"]:
+                    raise RuntimePolicyIntegrityError("immediate policy content address is invalid")
+                if policy.policy_id != immediate_amendment.resulting_policy_id or policy.parent_policy_id != immediate_amendment.base_policy_id:
+                    raise RuntimePolicyIntegrityError("immediate amendment policy lineage is invalid")
+                if immediate_amendment.base_policy_id not in versions:
+                    raise RuntimePolicyIntegrityError("immediate amendment base policy is unknown")
+                prior_candidates: list[tuple[tuple[int, int, int], str]] = [
+                    ((item_cycle, 0, 0), item_policy)
+                    for item_cycle, item_policy in schedule.items()
+                    if (item_cycle, 0) <= immediate_amendment.requested_at.key
+                ]
+                prior_candidates.extend(
+                    ((key[0], key[1], 0), item_policy)
+                    for key, (_boundary, item_policy) in stage_schedule.items()
+                    if key <= immediate_amendment.requested_at.key
+                )
+                prior_candidates.extend(
+                    ((armed.cycle, armed.ordinal, 0), item_policy)
+                    for armed, item_policy in maintenance_armed.items()
+                    if armed.key <= immediate_amendment.requested_at.key
+                )
+                if migration_policy_id is not None:
+                    migrated = versions[migration_policy_id]
+                    migration_parent = migrated.parent_policy_id
+                    migration_positions = [
+                        position
+                        for position, item_policy in prior_candidates
+                        if item_policy == migration_parent
+                    ]
+                    if migration_positions:
+                        cycle, ordinal, revision = max(migration_positions)
+                        prior_candidates.append(
+                            ((cycle, ordinal, revision + 1), migration_policy_id)
+                        )
+                prior_candidates.extend(
+                    (
+                        (item.requested_at.cycle, item.requested_at.ordinal, item.revision),
+                        item.resulting_policy_id,
+                    )
+                    for item in immediate_amendments
+                    if item.requested_at.key <= immediate_amendment.requested_at.key
+                )
+                if (
+                    not prior_candidates
+                    or max(prior_candidates, key=lambda item: item[0])[1]
+                    != immediate_amendment.base_policy_id
+                ):
+                    raise RuntimePolicyIntegrityError(
+                        "immediate amendment does not extend the effective policy"
+                    )
+                expected_revision = 1 + sum(
+                    item.requested_at.key == immediate_amendment.requested_at.key
+                    for item in immediate_amendments
+                )
+                if immediate_amendment.revision != expected_revision or any(
+                    item.request_id == immediate_amendment.request_id for item in immediate_amendments
+                ):
+                    raise RuntimePolicyIntegrityError("immediate amendment revision or request_id is invalid")
+                versions[policy.policy_id] = policy
+                immediate_amendments.append(immediate_amendment)
+            elif event.event_type == "runtime_policy_maintenance_armed":
+                if set(payload) != {"policy_ref", "requested_at"}:
+                    raise RuntimePolicyIntegrityError(
+                        "runtime policy maintenance arming has an invalid schema"
+                    )
+                policy = RuntimePolicyVersion.from_artifact_mapping(
+                    self._load_json(payload["policy_ref"], _POLICY_KIND)
+                )
+                if (
+                    policy.policy_id != payload["policy_ref"]["artifact_id"]
+                    or policy.schema_version != 2
+                    or not policy.maintenance_only
+                    or policy.parent_policy_id not in versions
+                ):
+                    raise RuntimePolicyIntegrityError(
+                        "runtime policy maintenance arming is invalid"
+                    )
+                boundary = RuntimeStageBoundary.from_mapping(payload["requested_at"])
+                if boundary.cycle != policy.effective_cycle:
+                    raise RuntimePolicyIntegrityError(
+                        "runtime policy maintenance boundary cycle is invalid"
+                    )
+                prior: list[tuple[tuple[int, int, int], str]] = [
+                    ((item_cycle, 0, 0), item_policy)
+                    for item_cycle, item_policy in schedule.items()
+                    if (item_cycle, 0) <= boundary.key
+                ]
+                prior.extend(
+                    ((key[0], key[1], 0), item_policy)
+                    for key, (_boundary, item_policy) in stage_schedule.items()
+                    if key <= boundary.key
+                )
+                prior.extend(
+                    (
+                        (item.requested_at.cycle, item.requested_at.ordinal, item.revision),
+                        item.resulting_policy_id,
+                    )
+                    for item in immediate_amendments
+                    if item.requested_at.key <= boundary.key
+                )
+                prior.extend(
+                    ((armed.cycle, armed.ordinal, 0), item_policy)
+                    for armed, item_policy in maintenance_armed.items()
+                    if armed.key <= boundary.key
+                )
+                if (
+                    not prior
+                    or max(prior, key=lambda item: item[0])[1]
+                    != policy.parent_policy_id
+                ):
+                    raise RuntimePolicyIntegrityError(
+                        "runtime policy maintenance arming does not extend the effective policy"
+                    )
+                versions[policy.policy_id] = policy
+                maintenance_armed[boundary] = policy.policy_id
+            elif event.event_type == "runtime_policy_council_decided":
+                data = self._load_json(payload["decision_ref"], _COUNCIL_DECISION_KIND)
+                strict = _strict_object(
+                    data,
+                    {"amendment_id", "decision", "reason", "replacement_amendment_id"},
+                    "runtime policy council decision",
+                )
+                decision_id = _content_id(_COUNCIL_DECISION_KIND, strict)
+                if decision_id != payload["decision_ref"]["artifact_id"]:
+                    raise RuntimePolicyIntegrityError("council decision content address is invalid")
+                amendment_id = strict["amendment_id"]
+                known = {item.amendment_id for item in immediate_amendments}
+                if amendment_id not in known or strict["decision"] not in {"ratify", "revise", "rollback"}:
+                    raise RuntimePolicyIntegrityError("council decision is invalid")
+                replacement = strict["replacement_amendment_id"]
+                if (strict["decision"] == "ratify" and replacement is not None) or (
+                    strict["decision"] != "ratify" and replacement not in known
+                ):
+                    raise RuntimePolicyIntegrityError("council replacement amendment is invalid")
+                if strict["decision"] != "ratify":
+                    original_index = next(
+                        index for index, item in enumerate(immediate_amendments)
+                        if item.amendment_id == amendment_id
+                    )
+                    replacement_index = next(
+                        index for index, item in enumerate(immediate_amendments)
+                        if item.amendment_id == replacement
+                    )
+                    if replacement_index <= original_index:
+                        raise RuntimePolicyIntegrityError(
+                            "council replacement amendment is not a later revision"
+                        )
+                record = cast(Mapping[str, JsonValue], freeze_json({"decision_id": decision_id, **strict}))
+                if amendment_id in council_decisions and council_decisions[amendment_id] != record:
+                    raise RuntimePolicyIntegrityError("multiple council decisions exist for one amendment")
+                council_decisions[amendment_id] = record
             elif event.event_type == "runtime_policy_paired_design_frozen":
                 if set(payload) not in (
                     {"design_id", "policy_id", "cycle"},
@@ -1114,14 +2045,37 @@ class RuntimePolicyRegistry:
                         "paired design boundary belongs to another cycle"
                     )
                 candidates = [
-                    ((item_cycle, 0), item_policy)
+                    ((item_cycle, 0, 0), item_policy)
                     for item_cycle, item_policy in schedule.items()
                     if (item_cycle, 0) <= boundary.key
                 ]
+                if migration_policy_id is not None:
+                    migrated = versions[migration_policy_id]
+                    migration_parent = migrated.parent_policy_id
+                    migration_positions = [
+                        position
+                        for position, item_policy in candidates
+                        if item_policy == migration_parent
+                    ]
+                    if migration_positions:
+                        cycle_at, ordinal_at, revision_at = max(migration_positions)
+                        candidates.append(
+                            ((cycle_at, ordinal_at, revision_at + 1), migration_policy_id)
+                        )
                 candidates.extend(
-                    (key, item_policy)
+                    ((key[0], key[1], 0), item_policy)
                     for key, (_, item_policy) in stage_schedule.items()
                     if key <= boundary.key
+                )
+                candidates.extend(
+                    ((armed.cycle, armed.ordinal, 0), item_policy)
+                    for armed, item_policy in maintenance_armed.items()
+                    if armed.key <= boundary.key
+                )
+                candidates.extend(
+                    ((item.requested_at.cycle, item.requested_at.ordinal, item.revision), item.resulting_policy_id)
+                    for item in immediate_amendments
+                    if item.requested_at.key <= boundary.key
                 )
                 if not candidates or max(candidates, key=lambda item: item[0])[1] != policy_id:
                     raise RuntimePolicyIntegrityError(
@@ -1135,4 +2089,8 @@ class RuntimePolicyRegistry:
         self._amendments = amendments
         self._stage_schedule = stage_schedule
         self._stage_amendments = stage_amendments
+        self._immediate_amendments = immediate_amendments
+        self._council_decisions = council_decisions
+        self._maintenance_armed = maintenance_armed
+        self._migration_policy_id = migration_policy_id
         self._paired_designs = paired

@@ -1020,7 +1020,11 @@ class SandboxAgent:
                 failures.append(f"{self._container_name(sandbox_id, suffix=suffix)}: {exc}")
         try:
             if root.exists():
-                shutil.rmtree(root)
+                try:
+                    shutil.rmtree(root)
+                except PermissionError:
+                    self._normalize_workspace_ownership(root)
+                    shutil.rmtree(root)
         except OSError as exc:
             failures.append(f"workspace: {exc}")
         if failures:
@@ -1047,6 +1051,28 @@ class SandboxAgent:
             normalized = detail.lower()
             if "no such container" not in normalized and "not found" not in normalized:
                 raise RuntimeError(detail or f"podman rm exited {result.returncode}")
+
+    def _normalize_workspace_ownership(self, root: Path) -> None:
+        """Reclaim files written through rootless Podman's user namespace."""
+        result = self.runner(
+            [
+                self.config.podman,
+                "unshare",
+                "chown",
+                "-R",
+                "--no-dereference",
+                "0:0",
+                "--",
+                str(root),
+            ],
+            timeout=30,
+            env=self._podman_env(),
+        )
+        if result.returncode != 0:
+            detail = _text(result.stderr).strip()
+            raise RuntimeError(
+                detail or f"podman unshare chown exited {result.returncode}"
+            )
 
     def _check_rootless_oci(self) -> tuple[bool, str]:
         if self.uid_getter() == 0:

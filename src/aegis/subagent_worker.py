@@ -147,6 +147,53 @@ def _run_runtime(spec: SubagentSpec, workdir: Path) -> tuple[str, Mapping[str, A
         gateway = ModelGateway(gateway_config)
     except (ValueError, OSError) as exc:
         raise SubagentRuntimeError(f"runtime executor gateway is unavailable: {exc}") from exc
+    accounting_store = None
+    raw_binding = os.environ.get("AEGIS_SUBAGENT_ACCOUNTING_BINDING")
+    if raw_binding:
+        try:
+            from aegis.artifacts import ContentAddressedArtifactStore
+            from aegis.event_store import EventStore
+            from aegis.runtime_ledger import AccountingContext, GatewayAttemptObserver
+            from aegis.runtime_policy import RuntimePolicyRegistry
+
+            binding = json.loads(raw_binding)
+            if not isinstance(binding, Mapping) or set(binding) != {
+                "event_store_path", "artifact_root", "policy_campaign_id", "parent_context"
+            }:
+                raise ValueError("invalid accounting binding schema")
+            parent = AccountingContext.from_mapping(binding["parent_context"])
+            accounting_store = EventStore(Path(binding["event_store_path"]))
+            registry = RuntimePolicyRegistry(
+                accounting_store,
+                ContentAddressedArtifactStore(Path(binding["artifact_root"])),
+                binding["policy_campaign_id"],
+            )
+            child_context = AccountingContext(
+                campaign_id=parent.campaign_id,
+                cycle=parent.cycle,
+                stage=f"subagent:{spec.subagent_id}",
+                stage_ordinal=parent.stage_ordinal,
+                role=parent.role,
+                invocation_id=f"{parent.invocation_id}/{spec.subagent_id}",
+                paired_design_id=parent.paired_design_id,
+            )
+            gateway.bind_attempt_observer(
+                GatewayAttemptObserver(accounting_store, registry, lambda _request: child_context)
+            )
+            gateway.bind_runtime_policy_provider(
+                lambda: cast(
+                    Mapping[str, object],
+                    registry.effective_for_stage(
+                        registry.stage_boundary(child_context.cycle, child_context.stage_ordinal, child_context.stage)
+                    ).values
+                    if child_context.paired_design_id is None
+                    else registry.policy_for_paired_design(child_context.paired_design_id).values,
+                )
+            )
+        except Exception as exc:
+            if accounting_store is not None:
+                accounting_store.close()
+            raise SubagentRuntimeError(f"runtime accounting binding is invalid: {exc}") from exc
     sandbox = LocalWorkspaceSandbox(workdir)
     allowed = frozenset({"workspace.read", "workspace.write", "submit"})
     dispatcher = ToolDispatcher(
@@ -163,11 +210,15 @@ def _run_runtime(spec: SubagentSpec, workdir: Path) -> tuple[str, Mapping[str, A
         limits=RuntimeLimits(max_steps=spec.limits.max_steps),
         max_output_tokens=spec.max_output_tokens,
     )
-    result = runtime.run(
-        Role.WARRIOR,
-        objective=spec.objective,
-        context=dict(spec.context),
-    )
+    try:
+        result = runtime.run(
+            Role.WARRIOR,
+            objective=spec.objective,
+            context=dict(spec.context),
+        )
+    finally:
+        if accounting_store is not None:
+            accounting_store.close()
     payload = dict(result.submission)
     summary = result.summary[:4096]
     return summary, {"submission": payload}, 0, False
@@ -207,6 +258,16 @@ def main(argv: list[str] | None = None) -> int:
         payload = {"error": f"{type(exc).__name__}: {exc}"}
         exit_code = 1
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    if "spec" in locals() and len(encoded) > spec.limits.max_result_bytes:
+        payload = {
+            "subagent_id": spec.subagent_id,
+            "error": "subagent result exceeds max_result_bytes",
+            "exit_code": 1,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        exit_code = 1
+        if len(encoded) > spec.limits.max_result_bytes:
+            encoded = b'{"error":"result limit too small"}'
     result_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
         prefix="result-", dir=str(result_path.parent)
