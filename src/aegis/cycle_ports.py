@@ -31,6 +31,7 @@ from aegis.activation import (
     ActivationReconciler,
 )
 from aegis.agent_runtime import (
+    FIXED_ROLE_MAX_STEPS,
     RoleAgentRuntime,
     RuntimeLimits,
     SandboxPluginExecutor,
@@ -67,7 +68,6 @@ from aegis.council import (
     CouncilMessage,
     CouncilMessageType,
     CouncilOutcome,
-    CouncilProtocolError,
     CouncilProposalKind,
     CouncilTranscript,
     EvidenceClaim,
@@ -684,8 +684,8 @@ class ModelCyclePorts:
         holdout_delay: int = 1,
         objective_history_window: int = 3,
         objective_probation_cycles: int = 2,
-        council_max_messages: int = 24,
-        council_max_tokens: int = 1_048_576,
+        council_max_messages: int = 200,
+        council_max_tokens: int = 4_194_304,
         public_repo_url: str | None = None,
         source_commit: str | None = None,
         evolution: EvolutionRegistry | None = None,
@@ -1063,16 +1063,13 @@ class ModelCyclePorts:
             self._runtime_policy_cycle, stage_ordinal, f"stage:{stage_ordinal}"
         )
         cfg = self._role_configs[role.value]
-        policy_max_steps = self._limits.max_steps
+        policy_max_steps = FIXED_ROLE_MAX_STEPS
         policy_timeout = self._limits.max_timeout_seconds
         if self._runtime_policy_registry is not None:
             stage_policy = (
                 self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
                 if paired_design_id is not None
                 else self._runtime_policy_registry.effective_for_stage(boundary)
-            )
-            policy_max_steps = int(
-                cast(Mapping[str, Any], stage_policy.values["role_max_steps"])[role.value]
             )
             policy_timeout = float(
                 cast(Mapping[str, Any], stage_policy.values["role_command_timeout_seconds"])[role.value]
@@ -1191,14 +1188,28 @@ class ModelCyclePorts:
                     if paired_design_id is not None
                     else self._runtime_policy_registry.effective_for_stage(boundary)
                 )
+                ledger_consumed = (
+                    self._runtime_ledger.consumed()
+                    if self._runtime_ledger is not None
+                    else None
+                )
                 runtime_context["runtime_policy"] = {
                     "policy_id": active_policy.policy_id,
                     "schema_version": active_policy.schema_version,
                     "values": thaw_json(cast(JsonValue, active_policy.values)),
                     "consumed": dict(
-                        self._runtime_ledger.consumed().to_policy_mapping()
-                        if self._runtime_ledger is not None
+                        ledger_consumed.to_policy_mapping()
+                        if ledger_consumed is not None
                         else self._runtime_consumed
+                    ),
+                    "waste": (
+                        {
+                            "waste_tokens": ledger_consumed.waste_tokens,
+                            "waste_requests": ledger_consumed.waste_requests,
+                            "waste_runtime_seconds": ledger_consumed.waste_runtime_seconds,
+                        }
+                        if ledger_consumed is not None
+                        else {}
                     ),
                     "pending_council_review": [
                         item.amendment_id
@@ -1645,16 +1656,6 @@ class ModelCyclePorts:
         cycle_id = f"cycle:{snapshot.cycle_number}"
         council_max_messages = self._council_max_messages
         council_max_tokens = self._council_max_tokens
-        if self._runtime_policy_registry is not None:
-            council_policy = self._runtime_policy_registry.effective_for_stage(
-                RuntimeStageBoundary(
-                    self._runtime_policy_cycle,
-                    self._runtime_stage_ordinal + 1,
-                    f"stage:{self._runtime_stage_ordinal + 1}",
-                )
-            )
-            council_max_messages = int(cast(int, council_policy.values["council_max_messages"]))
-            council_max_tokens = int(cast(int, council_policy.values["council_max_tokens"]))
         transcript = CouncilTranscript(
             cycle_id,
             max_messages=council_max_messages,
@@ -4602,40 +4603,55 @@ def _runtime_policy_genesis_values(
 
     def role_float(value: float) -> dict[str, float]:
         return {name: float(value) for name in role_configs}
+    from aegis.agent_runtime import (
+        FIXED_ROLE_MAX_READ_BYTES,
+        FIXED_ROLE_MAX_SEARCH_RESULTS,
+        FIXED_ROLE_MAX_TOOL_OUTPUT_BYTES,
+        FIXED_ROLE_MAX_WRITE_BYTES,
+        FIXED_ROLE_RESEARCH_ACTION_BUDGET,
+    )
+
     return {
-        "max_total_tokens": int(campaign_config.total_tokens),
-        "max_requests": int(campaign_config.max_requests),
-        "max_model_invocations": int(campaign_config.max_rounds),
-        "max_active_runtime_seconds": float(campaign_config.wall_time_seconds),
+        # Single external cost envelope: operator-set, far above any normal
+        # campaign consumption. Campaign config values may only raise them.
+        "max_total_tokens": max(int(campaign_config.total_tokens), 2_000_000_000),
+        "max_requests": max(int(campaign_config.max_requests), 100_000),
+        "max_model_invocations": max(int(campaign_config.max_rounds), 20_000),
+        "max_active_runtime_seconds": max(
+            float(campaign_config.wall_time_seconds), 3_600_000.0
+        ),
         "role_token_shares": {
             name: float(config.budget_share) for name, config in role_configs.items()
         },
-        "role_max_steps": role_int(campaign_config.max_agent_steps),
+        "role_max_steps": role_int(FIXED_ROLE_MAX_STEPS),
         "role_max_output_tokens": {
-            name: int(config.max_output_tokens) for name, config in role_configs.items()
+            name: max(int(config.max_output_tokens), 131_072)
+            for name, config in role_configs.items()
         },
         "role_reasoning_effort": {
             name: config.reasoning_effort for name, config in role_configs.items()
         },
-        "role_research_action_budgets": role_int(10),
-        "role_command_timeout_seconds": role_float(limits.max_timeout_seconds),
-        "role_max_read_bytes": role_int(limits.max_read_bytes),
-        "role_max_write_bytes": role_int(limits.max_write_bytes),
-        "role_max_tool_output_bytes": role_int(limits.max_tool_output_bytes),
-        "role_max_search_results": role_int(limits.max_search_results),
-        "gateway_timeout_seconds": 900.0,
-        "gateway_max_attempts": 6,
+        "role_research_action_budgets": role_int(FIXED_ROLE_RESEARCH_ACTION_BUDGET),
+        "role_command_timeout_seconds": role_float(3_600.0),
+        "role_max_read_bytes": role_int(FIXED_ROLE_MAX_READ_BYTES),
+        "role_max_write_bytes": role_int(FIXED_ROLE_MAX_WRITE_BYTES),
+        "role_max_tool_output_bytes": role_int(FIXED_ROLE_MAX_TOOL_OUTPUT_BYTES),
+        "role_max_search_results": role_int(FIXED_ROLE_MAX_SEARCH_RESULTS),
+        "gateway_timeout_seconds": 3_600.0,
+        "gateway_max_attempts": 10,
         "gateway_base_delay_seconds": 0.5,
-        "gateway_max_delay_seconds": 4.0,
-        "subagent_max_spawns_per_run": 8,
-        "subagent_max_steps": int(getattr(autonomy, "subagent_max_steps", 8)),
-        "subagent_timeout_seconds": float(
-            getattr(autonomy, "subagent_timeout_seconds", 180.0)
+        "gateway_max_delay_seconds": 8.0,
+        "subagent_max_spawns_per_run": 32,
+        "subagent_max_steps": 32,
+        "subagent_timeout_seconds": 600.0,
+        "subagent_max_result_bytes": 1_048_576,
+        "subagent_max_output_tokens": 131_072,
+        "subagent_max_total_tokens": max(
+            1, int(campaign_config.total_tokens) // 4, 300_000_000
         ),
-        "subagent_max_result_bytes": int(getattr(autonomy, "subagent_max_result_bytes", 65_536)),
-        "subagent_max_output_tokens": 65_536,
-        "subagent_max_total_tokens": max(1, int(campaign_config.total_tokens) // 4),
-        "subagent_max_requests": max(1, int(campaign_config.max_requests) // 4),
+        "subagent_max_requests": max(
+            1, int(campaign_config.max_requests) // 4, 5_000
+        ),
         "max_evolution_requests_per_run": 1,
         "max_evolution_source_refs": 5,
         "task_authoring_attempts": 2,
@@ -4644,15 +4660,15 @@ def _runtime_policy_genesis_values(
         "candidate_evaluations_per_cycle": 1,
         "candidate_max_steps": int(getattr(autonomy, "candidate_max_extra_steps", 12)),
         "population_max_cells": 128,
-        "council_max_messages": int(getattr(autonomy, "council_max_messages", 24)),
-        "council_max_tokens": int(getattr(autonomy, "council_max_tokens", 1_048_576)),
+        "council_max_messages": 200,
+        "council_max_tokens": 4_194_304,
         "task_holdout_delay_cycles": int(getattr(autonomy, "task_holdout_delay_cycles", 1)),
         "objective_history_window": int(getattr(autonomy, "objective_history_window", 3)),
         "objective_probation_cycles": int(getattr(autonomy, "objective_probation_cycles", 2)),
-        "dependency_download_timeout_seconds": 600.0,
-        "dependency_download_max_bytes": 512 * 1024 * 1024,
-        "build_timeout_seconds": 3_600.0,
-        "scan_timeout_seconds": 600.0,
+        "dependency_download_timeout_seconds": 3_600.0,
+        "dependency_download_max_bytes": 8 * 1024 * 1024 * 1024,
+        "build_timeout_seconds": 86_400.0,
+        "scan_timeout_seconds": 3_600.0,
     }
 
 
@@ -4798,7 +4814,7 @@ def run_v2_cycle(
         policy_hash = effective_policy.policy_id.rsplit(":", 1)[1]
         limits = replace(
             limits,
-            max_steps=int(cast(Mapping[str, Any], policy_values["role_max_steps"])[Role.WARRIOR.value]),
+            max_steps=FIXED_ROLE_MAX_STEPS,
             max_timeout_seconds=float(
                 cast(Mapping[str, Any], policy_values["role_command_timeout_seconds"])[Role.WARRIOR.value]
             ),
@@ -4806,9 +4822,6 @@ def run_v2_cycle(
         role_configs = {
             name: replace(
                 config,
-                budget_share=float(
-                    cast(Mapping[str, Any], policy_values["role_token_shares"])[name]
-                ),
                 max_output_tokens=int(
                     cast(Mapping[str, Any], policy_values["role_max_output_tokens"])[name]
                 ),
@@ -4820,8 +4833,8 @@ def run_v2_cycle(
         subagent_timeout_seconds = float(
             cast(float | int, policy_values["subagent_timeout_seconds"])
         )
-        council_max_messages = cast(int, policy_values["council_max_messages"])
-        council_max_tokens = cast(int, policy_values["council_max_tokens"])
+        council_max_messages = 200
+        council_max_tokens = 4_194_304
         configured_cohort_limit = int(cast(int, policy_values["cohort_limit"]))
         cohort_limit = configured_cohort_limit
         holdout_delay = int(cast(int, policy_values["task_holdout_delay_cycles"]))
@@ -5056,49 +5069,28 @@ def run_v2_cycle(
                 )
             except Exception:
                 pass
-        council_budget_exceeded = (
-            isinstance(exc, CouncilProtocolError)
-            and (
-                "council token limit" in cycle_error
-                or "council message limit" in cycle_error
-            )
-        )
         if (
-            (isinstance(exc, RuntimeBudgetExceeded) or council_budget_exceeded)
+            isinstance(exc, RuntimeBudgetExceeded)
             and runtime_policy_registry is not None
             and runtime_ledger is not None
         ):
             try:
                 consumed = runtime_ledger.consumed().to_policy_mapping()
                 boundary = runtime_policy_registry.resume_stage_boundary(target)
-                if isinstance(exc, RuntimeBudgetExceeded):
-                    maintenance_policy = runtime_policy_registry.arm_maintenance(
-                        requested_at=RuntimeStageBoundary(
-                            target, boundary.ordinal + 1, f"stage:{boundary.ordinal + 1}"
-                        ),
-                        consumed=consumed,
-                        reason=cycle_error,
-                    )
-                    maintenance_objective = (
+                maintenance_policy = runtime_policy_registry.arm_maintenance(
+                    requested_at=RuntimeStageBoundary(
+                        target, boundary.ordinal + 1, f"stage:{boundary.ordinal + 1}"
+                    ),
+                    consumed=consumed,
+                    reason=cycle_error,
+                )
+                maintenance = ports._run_role(
+                    Role.PROSECUTOR,
+                    objective=(
                         "The active runtime policy is below already consumed usage. "
                         "Call aegis.adjust_runtime_policy exactly once to restore a viable "
                         "next-stage budget or roll back to a viable historical policy, then submit."
-                    )
-                else:
-                    maintenance_policy = runtime_policy_registry.effective_for_stage(
-                        RuntimeStageBoundary(
-                            target, boundary.ordinal, f"stage:{boundary.ordinal}"
-                        )
-                    )
-                    maintenance_objective = (
-                        "The council exceeded its configured token or message budget. "
-                        "Call aegis.adjust_runtime_policy exactly once to raise council_max_tokens "
-                        "and/or council_max_messages enough for the remaining council deliberation, "
-                        "then submit."
-                    )
-                maintenance = ports._run_role(
-                    Role.PROSECUTOR,
-                    objective=maintenance_objective,
+                    ),
                     context={
                         "policy": maintenance_policy.to_mapping(),
                         "consumed": consumed,

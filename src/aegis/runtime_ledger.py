@@ -125,6 +125,9 @@ class RuntimeConsumption:
     unverified_tokens: int = 0
     unsettled_requests: int = 0
     role_tokens: Mapping[str, int] = field(default_factory=dict)
+    waste_tokens: int = 0
+    waste_requests: int = 0
+    waste_runtime_seconds: float = 0.0
 
     @property
     def model_invocations(self) -> int:
@@ -143,6 +146,14 @@ class RuntimeConsumption:
             "max_active_runtime_seconds": self.active_runtime_seconds,
             "role_tokens": dict(self.role_tokens),
         }
+
+    def to_audit_mapping(self) -> dict[str, object]:
+        """Return the normal envelope plus separately-tracked waste pools."""
+        result = self.to_policy_mapping()
+        result["waste_tokens"] = self.waste_tokens
+        result["waste_requests"] = self.waste_requests
+        result["waste_runtime_seconds"] = self.waste_runtime_seconds
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,19 +388,30 @@ class GatewayAttemptObserver:
             if amount > float(limit):
                 raise RuntimeBudgetExceeded(f"runtime policy {name} exhausted")
         if policy.schema_version == 2:
-            shares = cast(Mapping[str, float], policy.values["role_token_shares"])
-            role_limit = float(cast(int, policy.values["max_total_tokens"])) * float(
-                shares[candidate.context.role.value]
-            )
-            role_projected = consumption.role_tokens.get(candidate.context.role.value, 0) + candidate.usage.total_tokens
-            if role_projected > role_limit:
-                raise RuntimeBudgetExceeded(
-                    f"runtime policy role_token_shares.{candidate.context.role.value} exhausted"
-                )
+            # Per-role token shares are no longer enforced; only the single
+            # campaign cost envelope bounds execution. Waste pools get a
+            # pathological ceiling so a failure storm cannot spin forever
+            # without ever touching the normal envelope.
+            if consumption.waste_requests + 1 > int(
+                cast(int, policy.values["max_requests"])
+            ):
+                raise RuntimeBudgetExceeded("runtime policy waste_requests exhausted")
+            if consumption.waste_runtime_seconds > float(
+                cast(float | int, policy.values["max_active_runtime_seconds"])
+            ):
+                raise RuntimeBudgetExceeded("runtime policy waste_runtime exhausted")
+            if consumption.waste_tokens + candidate.usage.total_tokens > int(
+                cast(int, policy.values["max_total_tokens"])
+            ):
+                raise RuntimeBudgetExceeded("runtime policy waste_tokens exhausted")
             if candidate.context.stage.startswith("subagent:"):
                 child_attempts = [
                     item for item in reservations.values()
                     if item.context.stage.startswith("subagent:")
+                    and (
+                        item.attempt_id not in settlements
+                        or settlements[item.attempt_id].succeeded
+                    )
                 ]
                 child_tokens = sum(
                     (
@@ -472,10 +494,19 @@ class GatewayAttemptObserver:
     ) -> RuntimeConsumption:
         total = verified = unverified = unsettled = 0
         runtime = 0.0
+        waste_tokens = waste_requests = 0
+        waste_runtime = 0.0
         role_tokens = {role.value: 0 for role in Role}
         invocation_ids: set[str] = set()
         for attempt_id, reservation in reservations.items():
             settlement = settlements.get(attempt_id)
+            if settlement is not None and not settlement.succeeded:
+                # Transport failures (timeouts, HTTP errors) are waste: they
+                # never consume the normal budget envelope.
+                waste_tokens += settlement.usage.total_tokens
+                waste_requests += 1
+                waste_runtime += settlement.runtime_seconds
+                continue
             usage = reservation.usage if settlement is None else settlement.usage
             tokens = usage.total_tokens
             total += tokens
@@ -491,13 +522,16 @@ class GatewayAttemptObserver:
             invocation_ids.add(reservation.context.invocation_id)
         return RuntimeConsumption(
             total_tokens=total,
-            requests=len(reservations),
+            requests=len(reservations) - waste_requests,
             rounds=len(invocation_ids),
             runtime_seconds=runtime,
             verified_tokens=verified,
             unverified_tokens=unverified,
             unsettled_requests=unsettled,
             role_tokens=role_tokens,
+            waste_tokens=waste_tokens,
+            waste_requests=waste_requests,
+            waste_runtime_seconds=waste_runtime,
         )
 
     @staticmethod

@@ -6,7 +6,13 @@ from typing import Any, Mapping
 
 import pytest
 
-from aegis.agent_runtime import Action, RoleAgentRuntime, RuntimeLimits
+from aegis.agent_runtime import (
+    FIXED_ROLE_MAX_STEPS,
+    FIXED_ROLE_RESEARCH_ACTION_BUDGET,
+    Action,
+    RoleAgentRuntime,
+    RuntimeLimits,
+)
 from aegis.artifacts import ContentAddressedArtifactStore
 from aegis.cycle_ports import _validate_runtime_policy_council_decisions
 from aegis.event_store import EventStore
@@ -188,32 +194,32 @@ def test_immediate_bidirectional_chain_stale_noop_and_council_replay(tmp_path: P
         requested_at=boundary,
         request_id="raise-research",
         base_policy_id=genesis.policy_id,
-        patch={"role_research_action_budgets": {"warrior": 20, "judge": 10, "prosecutor": 10}},
+        patch={"max_active_runtime_seconds": 9_000.0},
         consumed={},
-        reason="warrior supplied evidence that more research is useful",
+        reason="warrior supplied evidence that more runtime is useful",
         evidence_refs=("reflection-sha256:" + "1" * 64,),
     )
     raised = policies.effective_for_stage(boundary)
     assert first.revision == 1
-    assert raised.values["role_research_action_budgets"]["warrior"] == 20
+    assert raised.values["max_active_runtime_seconds"] == 9_000.0
     second = policies.request_patch_immediately(
         requested_by=Role.PROSECUTOR,
         requested_at=boundary,
-        request_id="lower-research",
+        request_id="lower-runtime",
         base_policy_id=raised.policy_id,
-        patch={"role_research_action_budgets": {"warrior": 5, "judge": 10, "prosecutor": 10}},
+        patch={"max_active_runtime_seconds": 5_000.0},
         consumed={},
         reason="later evidence favors convergence",
     )
     assert second.revision == 2
-    assert policies.effective_for_stage(boundary).values["role_research_action_budgets"]["warrior"] == 5
+    assert policies.effective_for_stage(boundary).values["max_active_runtime_seconds"] == 5_000.0
     with pytest.raises(RuntimePolicyConflictError, match="stale"):
         policies.request_patch_immediately(
             requested_by=Role.PROSECUTOR,
             requested_at=boundary,
             request_id="stale",
             base_policy_id=genesis.policy_id,
-            patch={"council_max_messages": 30},
+            patch={"max_requests": 150},
             consumed={},
             reason="stale request",
         )
@@ -223,7 +229,7 @@ def test_immediate_bidirectional_chain_stale_noop_and_council_replay(tmp_path: P
             requested_at=boundary,
             request_id="noop",
             base_policy_id=second.resulting_policy_id,
-            patch={"council_max_messages": 24},
+            patch={"max_active_runtime_seconds": 5_000.0},
             consumed={},
             reason="no change",
         )
@@ -250,7 +256,7 @@ def test_immediate_request_id_reuse_requires_identical_content(tmp_path: Path) -
         requested_at=boundary,
         request_id="stable-request",
         base_policy_id=genesis.policy_id,
-        patch={"council_max_messages": 25},
+        patch={"max_active_runtime_seconds": 8_500.0},
         consumed={},
         reason="first request",
     )
@@ -260,7 +266,7 @@ def test_immediate_request_id_reuse_requires_identical_content(tmp_path: Path) -
             requested_at=boundary,
             request_id="stable-request",
             base_policy_id=genesis.policy_id,
-            patch={"council_max_messages": 26},
+            patch={"max_active_runtime_seconds": 8_600.0},
             consumed={},
             reason="different request",
         )
@@ -276,9 +282,9 @@ def test_resume_boundary_keeps_immediate_policy_after_cycle_retry(tmp_path: Path
         requested_at=first_boundary,
         request_id="repair-share",
         base_policy_id=genesis.policy_id,
-        patch={"role_token_shares": {"warrior": 0.35, "judge": 0.4, "prosecutor": 0.25}},
+        patch={"max_requests": 500},
         consumed={},
-        reason="repair a role budget exhaustion",
+        reason="raise request headroom after an exhaustion",
     )
     resumed = policies.resume_stage_boundary(2)
     assert resumed.ordinal == 9
@@ -287,7 +293,7 @@ def test_resume_boundary_keeps_immediate_policy_after_cycle_retry(tmp_path: Path
     store.close()
 
 
-def test_v2_ledger_enforces_real_per_role_token_shares(tmp_path: Path) -> None:
+def test_v2_ledger_does_not_enforce_per_role_token_shares(tmp_path: Path) -> None:
     store, policies = registry(tmp_path)
     values = values_v2(
         max_total_tokens=200,
@@ -301,34 +307,34 @@ def test_v2_ledger_enforces_real_per_role_token_shares(tmp_path: Path) -> None:
     request = GatewayRequest("model", (Message("user", "hello"),), 10)
     first = GatewayAttempt("responses", 1, request, TokenUsage(5, 15, 5, 15, False))
     second = GatewayAttempt("responses", 2, request, TokenUsage(5, 15, 5, 15, False))
+    # Shares are inert: the single envelope (not per-role shares) bounds cost.
     observer.before_attempt(first)
-    with pytest.raises(RuntimeBudgetExceeded, match="role_token_shares.warrior"):
-        observer.before_attempt(second)
-    assert observer.consumed().role_tokens["warrior"] == 20
+    observer.before_attempt(second)
+    assert observer.consumed().role_tokens["warrior"] == 40
     store.close()
 
 
-def test_lowering_role_share_below_consumed_enters_maintenance(tmp_path: Path) -> None:
+def test_lowering_envelope_below_consumed_enters_maintenance(tmp_path: Path) -> None:
     store, policies = registry(tmp_path)
     genesis = policies.genesis(values_v2(), provider_limits())
     amendment = policies.request_patch_immediately(
         requested_by=Role.PROSECUTOR,
         requested_at=RuntimeStageBoundary(0, 1, "stage:1"),
-        request_id="lower-share",
+        request_id="lower-runtime",
         base_policy_id=genesis.policy_id,
-        patch={"role_token_shares": {"warrior": 0.1, "judge": 0.45, "prosecutor": 0.45}},
+        patch={"max_active_runtime_seconds": 100.0},
         consumed={
             "max_total_tokens": 20_000,
             "max_requests": 1,
             "max_model_invocations": 1,
-            "max_active_runtime_seconds": 1.0,
-            "role_tokens": {"warrior": 20_000, "judge": 0, "prosecutor": 0},
+            "max_active_runtime_seconds": 999_999.0,
+            "role_tokens": {"warrior": 0, "judge": 0, "prosecutor": 0},
         },
-        reason="reduce the future warrior allocation",
+        reason="reduce the future runtime envelope",
     )
     policy = policies.effective_for_stage(amendment.requested_at)
     assert policy.maintenance_only
-    assert policy.maintenance_reasons == ("role_token_shares.warrior",)
+    assert policy.maintenance_reasons == ("max_active_runtime_seconds",)
     store.close()
 
 
@@ -371,7 +377,7 @@ class ActionGateway:
         )
 
 
-def test_role_runtime_rereads_steps_and_research_budget_each_boundary() -> None:
+def test_role_runtime_uses_fixed_safety_bounds_not_policy_budgets() -> None:
     policy = values_v2()
     policy["role_max_steps"]["warrior"] = 3
     policy["role_research_action_budgets"]["warrior"] = 1
@@ -382,13 +388,40 @@ def test_role_runtime_rereads_steps_and_research_budget_each_boundary() -> None:
         "model",
         limits=RuntimeLimits(max_steps=3),
         policy_provider=lambda _role: policy,
-        research_action_budget=1,
     )
     result = runtime.run(GatewayRole.WARRIOR, objective="test", context={})
     assert result.submission == {"research_calls": 2}
     assert dispatcher.research_calls == 2
     assert len(result.observations) == 3
-    assert runtime.limits.max_steps == 4
+    # Role-level step and research budgets are fixed safety constants, so the
+    # policy-provided values (3 steps / 1 research action) are ignored.
+    assert runtime.limits.max_steps == FIXED_ROLE_MAX_STEPS
+    assert runtime.research_action_budget == FIXED_ROLE_RESEARCH_ACTION_BUDGET
+
+
+def test_immediate_patch_whitelist_rejects_non_envelope_fields(tmp_path: Path) -> None:
+    store, policies = registry(tmp_path)
+    genesis = policies.genesis(values_v2(), provider_limits())
+    boundary = RuntimeStageBoundary(0, 1, "stage:1")
+    blocked = (
+        {"role_max_steps": {"warrior": 200, "judge": 200, "prosecutor": 200}},
+        {"role_token_shares": {"warrior": 0.4, "judge": 0.3, "prosecutor": 0.3}},
+        {"council_max_tokens": 1_000_000},
+        {"role_research_action_budgets": {"warrior": 50, "judge": 50, "prosecutor": 50}},
+        {"gateway_timeout_seconds": 7_200.0},
+    )
+    for index, patch in enumerate(blocked):
+        with pytest.raises(RuntimePolicyError, match="cannot modify fields"):
+            policies.request_patch_immediately(
+                requested_by=Role.PROSECUTOR,
+                requested_at=boundary,
+                request_id=f"blocked-{index}",
+                base_policy_id=genesis.policy_id,
+                patch=patch,
+                consumed={},
+                reason="non-envelope fields are not tunable",
+            )
+    store.close()
 
 
 def test_arm_maintenance_creates_maintenance_only_policy_and_survives_replay(
@@ -540,7 +573,9 @@ def test_maintenance_invocation_budget_is_released_after_transport_failure(
     )
     calls.append(second)
     observer.before_attempt(attempt)
-    assert observer.consumed().requests == 2
+    consumed = observer.consumed()
+    assert consumed.requests == 1
+    assert consumed.waste_requests == 1
     store.close()
 
 

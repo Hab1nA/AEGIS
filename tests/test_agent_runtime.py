@@ -1146,6 +1146,7 @@ class RuntimeTests(unittest.TestCase):
             ToolDispatcher(MemorySandbox(), FakeResearch(), "box"),
             "model",
             limits=RuntimeLimits(max_steps=12),
+            research_action_budget=10,
         )
         result = runtime.run(Role.WARRIOR, objective="work", context={})
         self.assertEqual(result.summary, "done")
@@ -1640,6 +1641,7 @@ class RuntimeTests(unittest.TestCase):
             ResearchOnlyDispatcher(),
             "model",
             eager_required_convergence=True,
+            research_action_budget=10,
         )
         observations = [
             ToolObservation(step, "research.search", {"accepted": False})

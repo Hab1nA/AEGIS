@@ -112,6 +112,12 @@ _POLICY_FIELDS_V2 = frozenset(
         *_V2_INTEGER_LIMITS, *_V2_NUMBER_LIMITS, "role_token_shares", "role_reasoning_effort",
     }
 )
+# The single external cost envelope: the only runtime-policy fields the
+# Prosecutor may adjust (with council ratification). Every other parameter is
+# a fixed safety constant or inert legacy value.
+_ENVELOPE_FIELDS = frozenset(
+    {"max_total_tokens", "max_requests", "max_model_invocations", "max_active_runtime_seconds"}
+)
 # Backwards-compatible name used by the legacy amendment reader.
 _ALLOWED_FIELDS = _LEGACY_POLICY_FIELDS_V1
 _CUMULATIVE_LIMITS = _LEGACY_CUMULATIVE_LIMITS | _V2_CUMULATIVE_LIMITS
@@ -456,15 +462,9 @@ class RuntimePolicyVersion:
             name for name, amount in usage.items()
             if name in normalized and float(cast(float | int, normalized[name])) < amount
         ]
-        if schema_version == 2 and "role_tokens" in usage:
-            role_tokens = cast(Mapping[str, float], usage["role_tokens"])
-            shares = cast(Mapping[str, float], normalized["role_token_shares"])
-            total = float(cast(int, normalized["max_total_tokens"]))
-            reason_items.extend(
-                f"role_token_shares.{role}"
-                for role, amount in role_tokens.items()
-                if amount > total * float(shares[role])
-            )
+        # Per-role token shares are inert legacy values: they are neither
+        # enforced by the ledger nor a maintenance trigger. Only the single
+        # campaign cost envelope can force maintenance mode.
         reasons = tuple(sorted(reason_items))
         material: dict[str, Any] = {
             "parent_policy_id": parent_policy_id,
@@ -1145,7 +1145,7 @@ class RuntimePolicyRegistry:
             raise RuntimePolicyError("only the prosecutor may amend runtime policy")
         if not isinstance(patch, Mapping) or not patch:
             raise RuntimePolicyError("runtime policy patch must be a non-empty mapping")
-        unknown = set(patch) - _POLICY_FIELDS_V2
+        unknown = set(patch) - _ENVELOPE_FIELDS
         if unknown:
             raise RuntimePolicyError(
                 f"runtime policy patch cannot modify fields: {', '.join(sorted(map(str, unknown)))}"

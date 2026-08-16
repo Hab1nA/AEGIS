@@ -145,7 +145,10 @@ def test_every_failure_class_settles_once(
         event for event in store.read("campaign-a") if event.event_type == "gateway_attempt_settled"
     ][0]
     assert settlement.payload["error_type"] == expected_error
-    assert observer.consumed().unverified_tokens == 20
+    # Failed attempts are waste: they never consume the normal envelope.
+    consumed = observer.consumed()
+    assert consumed.total_tokens == 0
+    assert consumed.waste_tokens == 20
     store.close()
 
 
@@ -163,9 +166,35 @@ def test_retries_and_protocol_fallback_are_independent_attempts_in_one_round(tmp
             GatewayAttemptResult(False, attempt.conservative_usage, 503, "GatewayHTTPError"),
         )
     consumed = observer.consumed()
-    assert consumed.requests == 3
-    assert consumed.rounds == 1
-    assert consumed.total_tokens == 60
+    assert consumed.requests == 0
+    assert consumed.rounds == 0
+    assert consumed.total_tokens == 0
+    assert consumed.waste_requests == 3
+    assert consumed.waste_tokens == 60
+    store.close()
+
+
+def test_timeout_storm_does_not_consume_budget_or_trigger_exhaustion(tmp_path: Path) -> None:
+    store, _registry, observer, request, _ = _setup(
+        tmp_path,
+        values=_values(max_requests=2, max_total_tokens=1000, max_runtime_seconds=100.0),
+    )
+    for number in range(1, 6):
+        attempt = _attempt(request, number)
+        observer.before_attempt(attempt)
+        observer.after_attempt(
+            attempt,
+            GatewayAttemptResult(False, attempt.conservative_usage, None, "TimeoutError"),
+        )
+    consumed = observer.consumed()
+    assert consumed.requests == 0
+    assert consumed.total_tokens == 0
+    assert consumed.runtime_seconds == 0.0
+    assert consumed.waste_requests == 5
+    # A subsequent successful attempt is still allowed: failures never touch
+    # the normal envelope (max_requests=2 would otherwise be exhausted).
+    observer.before_attempt(_attempt(request, 6))
+    assert observer.consumed().requests == 1
     store.close()
 
 
