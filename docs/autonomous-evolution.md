@@ -149,14 +149,17 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 - **最高推理强度**：角色配置 `reasoning_effort: "max"`。该 relay 的
   `deepseek-v4-flash` 是隐藏推理模型，medium/未设置时曾出现长时间挂起或把
   输出预算全部花在 `reasoning_content` 上；max 在实测中稳定返回。
-- **输出 token 上限**：deepseek-v4-flash 支持 1M 上下文与最高 384K 输出；
-  campaign 示例按模型能力把 `max_output_tokens` 设为 65536，保证 max 推理与
-  最终 JSON 内容都有余量，显著降低 `finish_reason: length` / 截断重试。
+- **输出 token 上限**：deepseek-v4-flash 支持 1M 上下文与最高 384K 输出
+  （即 393,216 token）；角色 `max_output_tokens` 默认直接对齐该能力上限
+  （393,216），保证 max 推理与最终 JSON 内容都有充足余量，显著降低
+  `finish_reason: length` / 截断重试。注意 `max_output_tokens` 同时涵盖
+  推理 token 与可见输出 token。
 - **预算默认值**：v2 周期每个模型阶段（warrior/judge/prosecutor/council/
   task-forge 等）各计一个 invocation（round），示例配置 `max_rounds` 默认 64、
-  `council_max_tokens` 默认 262144、`max_requests` 默认 500、`total_tokens`
-  默认 60M，确保真实模型一轮完整周期不被默认预算卡死；运行时仍可由检察官
-  按需调整后续预算。
+  `council_max_tokens` 固定 4,194,304（多轮议事 transcript 的累计上限，单次
+  模型调用仍受 1M 上下文与角色 `max_output_tokens` 约束）、`max_requests`
+  默认 500、`total_tokens` 默认 60M，确保真实模型一轮完整周期不被默认预算
+  卡死；运行时仍可由检察官按需调整后续预算。
 - **截断显式化**：网关检测到 `finish_reason: length` 或 content 为空且
   completion_tokens 已耗尽时抛出 `GatewayTruncationError`（携带 usage 记账），
   运行时把它转成可行动的 `model.response` 拒绝反馈（"只返回紧凑完整的 JSON
@@ -173,7 +176,7 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 ### 全真模型两代循环验收记录（2026-08-10，campaign `e2e-evo-20260810c`）
 
 采用上述约定（`deepseek-v4-flash` + `reasoning_effort=high` +
-`max_output_tokens=65536` + 固定 json_object 输出 + 直连路由）在真实
+当时 `max_output_tokens=65536` + 固定 json_object 输出 + 直连路由）在真实
 WSL/Podman 沙箱连续运行两代 `evolution-cycle --run`，
 两代均 `state: completed`、无 repair/rollback：
 

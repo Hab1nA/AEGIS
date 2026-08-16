@@ -549,7 +549,7 @@ def evaluate_objective_amendment(
 class CouncilTranscript:
     """In-memory protocol validator; durable storage remains the EventStore's job."""
 
-    def __init__(self, cycle_id: str, *, max_messages: int = 24, max_tokens: int = 1_048_576) -> None:
+    def __init__(self, cycle_id: str, *, max_messages: int = 24, max_tokens: int = 4_194_304) -> None:
         self._cycle_id = _text(cycle_id, "cycle_id", max_length=128)
         if max_messages <= 0 or max_tokens <= 0:
             raise CouncilProtocolError("council limits must be positive")
