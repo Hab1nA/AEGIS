@@ -9,7 +9,7 @@ import unittest
 import urllib.error
 from unittest.mock import patch
 
-from aegis.gateway.client import GatewayConfig, ModelGateway, RetryPolicy
+from aegis.gateway.client import GatewayConfig, ModelGateway, RetryPolicy, _user_agent
 from aegis.gateway.protocols import Role, RolePolicy, build_role_request, parse_role_output
 from aegis.gateway.transport import HTTPResponse, StdlibHTTPTransport
 from aegis.gateway.types import (
@@ -23,6 +23,15 @@ from aegis.gateway.types import (
     GatewayTruncationError,
     Message,
 )
+
+
+def test_user_agent_defaults_to_browser_and_is_overridable() -> None:
+    with patch.dict("os.environ", {}, clear=False):
+        agent = _user_agent()
+        assert "Mozilla/5.0" in agent
+        assert "Chrome" in agent
+    with patch.dict("os.environ", {"AEGIS_OPENAI_USER_AGENT": "custom-agent/1.0"}, clear=False):
+        assert _user_agent() == "custom-agent/1.0"
 
 
 class FakeTransport:

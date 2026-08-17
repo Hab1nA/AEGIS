@@ -107,6 +107,15 @@ class RetryPolicy:
 
 
 _RESPONSES_PATH = "/responses"
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def _user_agent() -> str:
+    """Browser-like identity for Cloudflare-fronted relays; overridable."""
+    return os.environ.get("AEGIS_OPENAI_USER_AGENT") or _DEFAULT_USER_AGENT
 # 5xx (including 501) is always retryable, matching the transport layer.
 _NON_RETRYABLE_STATUSES = frozenset({400, 404, 405, 415, 422})
 
@@ -238,7 +247,7 @@ class ModelGateway:
                 "Authorization": f"Bearer {self._config.api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "AEGIS/0.1",
+                "User-Agent": _user_agent(),
             },
             body=json.dumps(payload, separators=(",", ":")).encode(),
             timeout=timeout_seconds,
