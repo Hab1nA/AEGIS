@@ -833,6 +833,79 @@ class CyclePortsTests(unittest.TestCase):
                 dynamic.close()
                 store.close()
 
+    def test_task_authoring_repairs_reserved_task_id_within_attempt_loop(self) -> None:
+        """Reusing a built-in anchor id is rejected with repair feedback, and the
+        second authoring attempt registers a fresh slug in the same cycle."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = EventStore(root / "events.sqlite3")
+            dynamic = DynamicTaskRegistry(root / "tasks.sqlite3")
+            runner = AnchorRunner()
+            GenesisSeeder(dynamic, TaskForge(dynamic)).seed(runner)
+            curriculum = CurriculumRegistry(store, "cli")
+            roles = RoleRegistry(store, "cli")
+            reserved_spec = task_spec_from_pack(task_id="python-clamp-range")
+            fresh_spec = task_spec_from_pack(task_id="dynamic-next")
+            actions: list[dict[str, object]] = [
+                submit("solved", {"task_ids": [], "results": []}),
+                submit("reviewed", {"findings": [], "quality_score": 0.5}),
+                submit(
+                    "audited",
+                    {
+                        "usage_verified": True,
+                        "safety_passed": True,
+                        "integrity_passed": True,
+                        "curriculum": [],
+                    },
+                ),
+                submit("reflect-warrior", {"claims": []}),
+                submit("reflect-judge", {"claims": []}),
+                submit("reflect-prosecutor", {"claims": []}),
+                submit("council", {"proposal": None, "agenda": []}),
+                submit("forged", {"task_specs": [reserved_spec]}),
+                submit("forged", {"task_specs": [fresh_spec]}),
+            ]
+            gateway = FakeGateway(actions)
+            artifacts = ContentAddressedArtifactStore(root / "artifacts")
+            common = dict(
+                sandbox=WritingFakeSandboxBackend(),
+                research=FakeResearch(),
+                knowledge=None,
+                skills=None,
+                pdf_extractor=None,
+                role_configs=role_configs(),
+                limits=RuntimeLimits(max_steps=20),
+                artifacts=artifacts,
+                dynamic=dynamic,
+                forge=TaskForge(dynamic),
+                runner=runner,
+                curriculum=curriculum,
+                roles=roles,
+                data_dir=root,
+                campaign_id="cli",
+            )
+            try:
+                result = run_v2_cycle(gateway=gateway, **common)
+                self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
+                forged = json.loads(artifacts.get(result.forged_tasks).decode("utf-8"))
+                self.assertEqual(forged["authoring_attempt"], 2)
+                validation = json.loads(
+                    artifacts.get(result.task_validation).decode("utf-8")
+                )
+                self.assertEqual(validation["status"], "registered")
+                self.assertEqual(validation["registered_count"], 1)
+                self.assertEqual(validation["learning_outcome"], "progressed")
+                dynamic_records = [
+                    record
+                    for record in dynamic.records()
+                    if record.origin is DynamicTaskOrigin.DYNAMIC
+                ]
+                self.assertEqual(len(dynamic_records), 1)
+                self.assertEqual(dynamic_records[0].artifact.task_id, "dynamic-next")
+            finally:
+                dynamic.close()
+                store.close()
+
     def test_environment_candidate_build_activates_and_binds_runtime_image(self) -> None:
         """An environment candidate is built by the environment builder, its
         receipt is materialized, the shadow arm runs on the new image, and the
