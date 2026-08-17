@@ -84,15 +84,18 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 
 真实 relay 模型（deepseek-v4-flash）按以下约定可稳定产出合法 JSON action：
 
-**网关凭据与协议要求（deepseek-v4-flash / cf.api.fan）**
+**网关凭据与协议要求（deepseek-v4-flash）**
 
-- `AEGIS_OPENAI_BASE_URL=https://cf.api.fan/v1`（必需）
+- `AEGIS_OPENAI_BASE_URL=https://cf.api.fan/v1`（或
+  `https://opencode.ai/zen/go/v1`，均验证可用）
 - `AEGIS_OPENAI_API_KEY=<sk-...>`（必需）
+- `AEGIS_OPENAI_USER_AGENT`（可选）：Cloudflare 前置 relay 会按浏览器签名
+  拦截默认 UA，网关默认发送 Chrome 风格 UA，可经该变量覆盖
 - 协议固定为官方原生 Responses API：网关只调用 `{base_url}/responses`，
   载荷 `text.format` 一律为 `{"type":"json_object"}`；不保留 chat 兼容
   格式、plain 或 json_schema。`AEGIS_OPENAI_PROTOCOL` 与
   `AEGIS_OPENAI_STRUCTURED_FORMAT` 已废弃，设置后会被忽略。base_url
-  可指向官方 `https://api.deepseek.com` 或当前 relay `https://cf.api.fan/v1`。
+  可指向官方 `https://api.deepseek.com` 或上述 relay。
 - `AEGIS_OPENAI_TIMEOUT_SECONDS`（可选，默认 900）
 - campaign 配置三角色 `model: "deepseek-v4-flash"` 且
   `reasoning_effort: "max"`（配置与网关请求均接受 `max`）
@@ -202,6 +205,22 @@ WSL/Podman 沙箱连续运行两代 `evolution-cycle --run`，
   （3）模型流量经系统代理（Clash 上游节点随机停滞）。分别以截断显式化、
   先读管道再收尾、显式直连/代理开关解决。
 
+### 声明式锻造全真验收记录（2026-08-17，campaign `e2e-forge-20260817`）
+
+采用 `deepseek-v4-flash`（`reasoning_effort=max`、`max_output_tokens=393216`）、
+base_url `https://opencode.ai/zen/go/v1`、WSL 沙箱与 `--no-candidate-eval`
+跑完整一轮 `evolution-cycle --run`，`state: completed`、无 repair/rollback：
+
+- Judge 经声明式 `task_specs` 协议锻造出全新任务 `python-interval-overlap`
+  （闭区间重叠/反向边界/相切/负数边界），authoring_attempt=2（首次因
+  mutant 命名非法被预检拒绝，第二次自愈），25 次模型请求；
+- 控制面 TaskPackBuilder 物化布局/manifest/content_hash 并在真实 WSL 沙箱
+  验证：reference 通过 public+hidden、defect 被 hidden 检出、hidden 杀死
+  mutant；task-validation 结果 `status=registered`、
+  `learning_outcome=progressed`、`registered_count=1`、`rejected=[]`；
+- 动态任务库以 `origin=dynamic` 注册该任务（holdout 1 代），周期
+  `outcome_class=task-outcome`；全程无预算耗尽、无维护接管事件。
+
 ## 5. 信任边界
 
 - 模型不能修改权限、预算、隐藏测试、评分、沙箱或晋升门。
@@ -212,8 +231,9 @@ WSL/Podman 沙箱连续运行两代 `evolution-cycle --run`，
 
 ## 6. 边界与后续项
 
-- 评委直接产出可执行 task-pack 归档依赖模型输出 base64 tar；否则走声明式
-  proposal，由可信构建器后续物化。
+- 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面
+  TaskPackBuilder 负责布局、manifest、content_hash、task_id 预检、白名单、
+  dry-run 与原子入库；模型不再输出 base64 tar。
 - 跨 cycle 角色对比被归因模型如实判为 confounded；完整因果归因需要同 cohort
   的冠军/候选配对实验。
 - `RecoverySupervisor` 的发布器在未配置 `public_repo_url` 时使用确定性 CAS
