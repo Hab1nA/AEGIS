@@ -26,6 +26,7 @@ env/
 .tmp/
 .smoke-r*/
 .smoke-data*/
+.smoke-judge*/
 .coverage
 htmlcov/
 
