@@ -221,6 +221,39 @@ base_url `https://opencode.ai/zen/go/v1`、WSL 沙箱与 `--no-candidate-eval`
 - 动态任务库以 `origin=dynamic` 注册该任务（holdout 1 代），周期
   `outcome_class=task-outcome`；全程无预算耗尽、无维护接管事件。
 
+### Judge 证据链全真验收记录（2026-08-17/18，campaign `e2e-judge-20260817b`）
+
+采用 `deepseek-v4-flash`（`reasoning_effort=max`）、base_url `https://cf.api.fan/v1`、
+WSL 沙箱、`max_agent_steps=24`（运行时 `role_max_steps=24`，与 campaign 一致）跑
+完整一轮 `evolution-cycle --run`（候选评测开启，未使用 `--no-candidate-eval`），
+78 次网关调用，`state: completed`：
+
+- 冻结工作区证据链：Warrior solve 持久化 `submission_artifact_id` 并绑定
+  `FrozenSubmissionEvidence`；Judge review 只读挂载同一 workspace，
+  `workspace_staged=true` 且 `forecast.verified_workspace_binding=true`；
+- Judge 预测与校准分离：review 产出 `forecast`（per-task 失败概率、
+  `hidden_data_disclosed=false`），quality-lock 只保留 locked quality；
+  post-seal `judge-calibration` 记录 brier=0.01297、ece=0.1167、fp=0、fn=0；
+- 分层反馈：三角色 reflection 仅收到 diagnostic 脱敏摘要，artifact 全文无
+  hidden 通过数/用例泄漏（`hidden_results_disclosed=false`）；
+- Council token 语义：消息 `token_usage` 为内容 token（256-404），
+  `generation_usage` 单独记录 provider input/output/reasoning 用量；
+- 归因真值：attribution 从 quality-lock 读取 `integrity_passed=true`、
+  `safety_passed=true`，成本 1843242 为三角色 artifact 用量合计，不再取
+  Prosecutor 自报字段；
+- 阶段断点：21 个 `stage_checkpoint_v2` 事件覆盖 submission 至 post-reflection
+  全部阶段，中断恢复可复用已提交 artifact 不重复模型调用；
+- 结果语义：forge 产出 `python-clamp-numeric` 因 mutant 命名非法被预检拒绝，
+  task-validation 如实报告 `status=no_valid_task`、`learning_outcome=blocked_by_supply`、
+  remediation obligation 生成；cycle summary 以四维 `dimensions` +
+  `outcome_class=learning-degraded` 收尾，三个角色 post-reflection 均点名
+  `task-supply:blocked_by_supply` 义务；候选评测 `enabled=true` 并收集/校验
+  1 个 Warrior 策略候选；
+- 诚实负结果：本轮未产生合法 Fresh task，故未执行 Fresh holdout/晋级；
+  成功锻造路径由 `tests/test_judge_evidence_chain.py` 确定性覆盖，此前
+  `e2e-forge-20260817` 亦已验证成功注册。重试全真运行时 relay 返回
+  “无效的令牌”（HTTP 401），需刷新 `AEGIS_OPENAI_API_KEY` 后重跑。
+
 ## 5. 信任边界
 
 - 模型不能修改权限、预算、隐藏测试、评分、沙箱或晋升门。
