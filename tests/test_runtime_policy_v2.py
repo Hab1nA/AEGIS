@@ -355,9 +355,6 @@ class DynamicDispatcher:
         del role
         if action.name == "research.search":
             self.research_calls += 1
-            if self.research_calls == 1:
-                self.policy["role_max_steps"]["warrior"] = 4
-                self.policy["role_research_action_budgets"]["warrior"] = 2
             return {"results": []}
         return {"summary": "done", "payload": {"research_calls": self.research_calls}}
 
@@ -377,25 +374,26 @@ class ActionGateway:
         )
 
 
-def test_role_runtime_uses_fixed_safety_bounds_not_policy_budgets() -> None:
+def test_role_runtime_uses_policy_step_budget_and_fixed_research_budget() -> None:
     policy = values_v2()
-    policy["role_max_steps"]["warrior"] = 3
+    policy["role_max_steps"]["warrior"] = 4
     policy["role_research_action_budgets"]["warrior"] = 1
     dispatcher = DynamicDispatcher(policy)
     runtime = RoleAgentRuntime(
         ActionGateway(),
         dispatcher,  # type: ignore[arg-type]
         "model",
-        limits=RuntimeLimits(max_steps=3),
+        limits=RuntimeLimits(max_steps=4),
         policy_provider=lambda _role: policy,
     )
     result = runtime.run(GatewayRole.WARRIOR, objective="test", context={})
     assert result.submission == {"research_calls": 2}
     assert dispatcher.research_calls == 2
     assert len(result.observations) == 3
-    # Role-level step and research budgets are fixed safety constants, so the
-    # policy-provided values (3 steps / 1 research action) are ignored.
-    assert runtime.limits.max_steps == FIXED_ROLE_MAX_STEPS
+    # The campaign step budget is now the execution upper limit (the policy
+    # value replaces FIXED_ROLE_MAX_STEPS); research-action budgets remain
+    # fixed safety constants and ignore the policy-provided value.
+    assert runtime.limits.max_steps == 4
     assert runtime.research_action_budget == FIXED_ROLE_RESEARCH_ACTION_BUDGET
 
 

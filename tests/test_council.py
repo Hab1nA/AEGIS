@@ -214,3 +214,45 @@ def test_council_outcome_is_strict_and_shadow_history_is_snapshot_keyed() -> Non
     malformed["unknown"] = True
     with pytest.raises(CouncilProtocolError, match="missing or unknown"):
         CouncilOutcome.from_mapping(malformed)
+
+
+def test_content_token_estimate_is_deterministic_and_bounded() -> None:
+    from aegis.council import estimate_content_tokens
+
+    first = estimate_content_tokens("short summary", ())
+    second = estimate_content_tokens("short summary", ())
+    assert first == second
+    assert first > 0
+    long_summary = "x" * 4000
+    assert estimate_content_tokens(long_summary, ()) < estimate_content_tokens(long_summary * 2, ())
+
+
+def test_council_message_generation_usage_round_trip() -> None:
+    from aegis.council import CouncilGenerationUsage
+
+    item = CouncilGenerationUsage(input_tokens=10, output_tokens=20, reasoning_tokens=5)
+    payload = item.to_mapping()
+    assert CouncilGenerationUsage.from_mapping(payload) == item
+    with pytest.raises(CouncilProtocolError):
+        CouncilGenerationUsage.from_mapping({"input_tokens": -1, "output_tokens": 0, "reasoning_tokens": 0})
+
+
+def test_council_message_mapping_preserves_generation_usage_and_accepts_legacy() -> None:
+    from aegis.council import CouncilGenerationUsage
+
+    msg = message(Role.WARRIOR, CouncilMessageType.REFLECTION)
+    with_generation = CouncilMessage(
+        msg.cycle_id,
+        msg.sender,
+        msg.message_type,
+        msg.claims,
+        msg.summary,
+        token_usage=12,
+        generation_usage=CouncilGenerationUsage(input_tokens=3, output_tokens=4, reasoning_tokens=1),
+    )
+    mapping = with_generation.to_mapping()
+    restored = CouncilMessage.from_mapping(mapping)
+    assert restored.generation_usage == with_generation.generation_usage
+    legacy = dict(mapping)
+    legacy.pop("generation_usage")
+    assert CouncilMessage.from_mapping(legacy).generation_usage is None

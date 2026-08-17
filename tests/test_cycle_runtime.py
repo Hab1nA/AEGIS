@@ -48,6 +48,15 @@ class Ports:
         self.order.append("judge")
         return {"findings": ["bounded review"]}
 
+    def calibrate(self, snapshot, judge_review, quality_lock):
+        self.order.append("calibrate")
+        return {
+            "brier": 0.1,
+            "ece": 0.05,
+            "false_negatives": 0,
+            "false_positives": 0,
+        }
+
     def lock_quality(self, snapshot, cohort, submission, judge_review):
         self.order.append("quality")
         return {"score": 0.8, "locked": True}
@@ -67,6 +76,26 @@ class Ports:
     def reflect(self, role, snapshot, submission, judge_review, quality_lock, prosecutor_audit):
         self.order.append(f"reflect:{role.value}")
         return {"role": role.value, "claims": []}
+
+    def reflect_post(
+        self,
+        role,
+        snapshot,
+        submission,
+        quality_lock,
+        prosecutor_audit,
+        judge_calibration,
+        task_validation,
+        candidate_evaluation,
+        attribution,
+        activation,
+    ):
+        self.order.append(f"post-reflect:{role.value}")
+        return {
+            "role": role.value,
+            "claims": [],
+            "proposals": [],
+        }
 
     def deliberate(
         self, snapshot, reflections, submission, judge_review, prosecutor_audit
@@ -192,6 +221,20 @@ def setup_runtime(root: Path):
     return event_store, registry, snapshot, ports, controller
 
 
+def assert_summary_shape(controller, result) -> None:
+    import json
+
+    assert result.judge_calibration is not None
+    assert result.post_reflection_index is not None
+    payload = json.loads(
+        controller._artifacts.get(result.cycle_summary).decode("utf-8")
+    )
+    assert payload["dimensions"]["candidate"] == "pending"
+    assert payload["dimensions"]["activation"] == "not_attempted"
+    assert "post_reflection_index" in payload
+    assert "judge_calibration" in payload
+
+
 def test_full_cycle_locks_quality_before_audit_and_council_before_next_tasks() -> None:
     with tempfile.TemporaryDirectory() as directory:
         store, registry, snapshot, ports, controller = setup_runtime(Path(directory))
@@ -202,6 +245,7 @@ def test_full_cycle_locks_quality_before_audit_and_council_before_next_tasks() -
                 "warrior",
                 "judge",
                 "quality",
+                "calibrate",
                 "curriculum-evidence",
                 "prosecutor",
                 "reflect:warrior",
@@ -216,8 +260,12 @@ def test_full_cycle_locks_quality_before_audit_and_council_before_next_tasks() -
                     "attribution",
                 "qualify",
                 "activate",
+                "post-reflect:warrior",
+                "post-reflect:judge",
+                "post-reflect:prosecutor",
             ]
             assert result.cycle_summary.artifact_id.startswith("cycle-summary-sha256:")
+            assert_summary_shape(controller, result)
             transition_events = [
                 event for event in store.read("campaign") if event.event_type == "cycle_state_changed_v2"
             ]
@@ -239,6 +287,69 @@ def test_forbidden_private_reasoning_fails_closed_and_persists_failed_state() ->
                 controller.run(snapshot, target_generation=2)
             assert registry.projection.cycle_state is CycleState.FAILED
             assert "chain_of_thought" not in str(store.read("campaign"))
+        finally:
+            store.close()
+
+
+
+def test_interrupted_cycle_resumes_without_rerunning_checkpointed_stages() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        store, registry, snapshot, ports, _ = setup_runtime(root)
+        try:
+            checkpoints: dict[str, ArtifactRef] = {}
+            controller = EvolutionCycleController(
+                registry,
+                FakeCohorts(
+                    DynamicTaskCohort.create(
+                        2,
+                        (
+                            CohortMember(
+                                "dynamic-task-sha256:" + "1" * 64,
+                                CohortTier.FRESH_HOLDOUT,
+                                1,
+                                "2" * 64,
+                            ),
+                        ),
+                    )
+                ),
+                ContentAddressedArtifactStore(root / "artifacts"),
+                CyclePorts(ports, ports, ports, ports, ports, ports),
+                checkpoint=lambda key, ref: checkpoints.update({key: ref}),
+            )
+            original_eval = ports.evaluate_candidates
+
+            def failing_eval(*args, **kwargs):
+                raise RuntimeError("candidate eval failed once")
+
+            ports.evaluate_candidates = failing_eval
+            try:
+                with pytest.raises(RuntimeError, match="failed once"):
+                    controller.run(snapshot, target_generation=2)
+                assert registry.projection.cycle_state is CycleState.FAILED
+                assert "submission" in checkpoints
+                assert "judge-review" in checkpoints
+                assert "reflection:judge" in checkpoints
+            finally:
+                ports.evaluate_candidates = original_eval
+
+            registry.transition_cycle(
+                "retry", reason="control-plane restart after interrupted cycle"
+            )
+            ports.order.clear()
+            result = controller.run(
+                snapshot,
+                target_generation=2,
+                retry=True,
+                resume_evidence=checkpoints,
+            )
+            assert registry.projection.cycle_state is CycleState.COMPLETED
+            assert "warrior" not in ports.order
+            assert "judge" not in ports.order
+            assert "quality" not in ports.order
+            assert "candidate-eval" in ports.order
+            assert "holdout-commit" in ports.order
+            assert result.cycle_summary.artifact_id.startswith("cycle-summary-sha256:")
         finally:
             store.close()
 
@@ -285,5 +396,6 @@ def test_failed_cycle_can_retry_the_same_snapshot_after_control_plane_retry() ->
             result = controller.run(snapshot, target_generation=2, retry=True)
             assert registry.projection.cycle_state is CycleState.COMPLETED
             assert result.cycle_summary.artifact_id.startswith("cycle-summary-sha256:")
+            assert_summary_shape(controller, result)
         finally:
             store.close()

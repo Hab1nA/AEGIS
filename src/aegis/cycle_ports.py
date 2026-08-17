@@ -65,6 +65,8 @@ from aegis.connectors import (
     checkpoint_generation,
 )
 from aegis.council import (
+    CouncilGenerationUsage,
+    estimate_content_tokens,
     CouncilMessage,
     CouncilMessageType,
     CouncilOutcome,
@@ -158,6 +160,16 @@ from aegis.evolution.surfaces import (
 )
 from aegis.gateway.protocols import Role as GatewayRole
 from aegis.gateway.types import TokenUsage
+from aegis.judge import (
+    EvidenceKind,
+    FrozenSubmissionEvidence,
+    JudgeCalibration,
+    JudgeForecast,
+    TaskFailureForecast,
+    compute_calibration,
+    estimate_message_tokens,
+    sanitize_diagnostic_quality,
+)
 from aegis.mcp import (
     McpBridge,
     McpBridgeError,
@@ -293,6 +305,20 @@ def _read(artifacts: ContentAddressedArtifactStore, ref: ArtifactRef) -> Mapping
     return cast(Mapping[str, Any], _strip_forbidden(payload))
 
 
+def _ref_from_artifact_id(artifact_id: str) -> ArtifactRef | None:
+    """Best-effort typed content address -> ArtifactRef (size is not needed to read)."""
+    if not isinstance(artifact_id, str) or "-sha256:" not in artifact_id:
+        return None
+    kind = artifact_id.split("-sha256:", 1)[0]
+    digest = artifact_id.rsplit(":", 1)[1]
+    if len(digest) != 64:
+        return None
+    try:
+        return ArtifactRef(kind, artifact_id, 0)
+    except ValueError:
+        return None
+
+
 def _read_artifact_id(
     artifacts: ContentAddressedArtifactStore, artifact_id: str
 ) -> Mapping[str, Any]:
@@ -357,6 +383,52 @@ def _validate_runtime_policy_council_decisions(
             "council must decide every pending runtime-policy amendment exactly once"
         )
     return [by_id[amendment_id] for amendment_id in sorted(pending)]
+
+
+def _observation_receipts(observations: Sequence[Any]) -> list[Mapping[str, Any]]:
+    """Bounded audit receipts: action, outcome, exit code, output digest and kind.
+
+    Full tool outputs stay in the short-lived sandbox; the long-lived artifact
+    keeps only a digest plus a small summary so claims can be traced without
+    leaking sensitive content.  Conclusions without an observed receipt
+    degrade to hypothesis or self-reported evidence.
+    """
+    receipts: list[Mapping[str, Any]] = []
+    for item in observations:
+        result = item.result if isinstance(item.result, Mapping) else {}
+        try:
+            result_digest = hashlib.sha256(
+                canonical_json(result).encode("utf-8")
+            ).hexdigest()
+        except (TypeError, ValueError):
+            result_digest = hashlib.sha256(
+                json.dumps(result, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+        accepted = result.get("accepted", True)
+        outcome = "accepted" if accepted is not False else "rejected"
+        exit_code = result.get("exit_code")
+        summary_parts: list[str] = []
+        for key in ("message", "output", "stdout", "error"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                summary_parts.append(f"{key}={value.strip()[:512]}")
+        observed_markers = {"accepted", "exit_code", "output_digest", "action_receipt", "elapsed_seconds"}
+        if observed_markers & set(result):
+            evidence_kind = EvidenceKind.OBSERVED
+        else:
+            evidence_kind = EvidenceKind.SELF_REPORTED
+        receipts.append(
+            {
+                "step": int(item.step),
+                "action": str(item.action),
+                "outcome": outcome,
+                "exit_code": int(exit_code) if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None,
+                "result_digest": result_digest,
+                "result_summary": "; ".join(summary_parts)[:2048],
+                "evidence_kind": evidence_kind.value,
+            }
+        )
+    return receipts
 
 
 def _usage_summary(usages: Sequence[TokenUsage]) -> Mapping[str, int]:
@@ -691,6 +763,8 @@ class ModelCyclePorts:
         objective_governance: ObjectiveGovernanceRegistry | None = None,
         runtime_ledger: RuntimeGatewayAttemptObserver | None = None,
         require_warrior_strategy_proposal: bool = False,
+        judge_heterogeneous_model: str | None = None,
+        judge_heterogeneous_fraction: float = 0.0,
     ) -> None:
         self._gateway = gateway
         self._sandbox = sandbox
@@ -724,9 +798,13 @@ class ModelCyclePorts:
         self._council_max_messages = council_max_messages
         self._council_max_tokens = council_max_tokens
         self._require_warrior_strategy_proposal = require_warrior_strategy_proposal
+        self._judge_heterogeneous_model = judge_heterogeneous_model
+        self._judge_heterogeneous_fraction = judge_heterogeneous_fraction
         self._objective_history_path = data_dir / "objective_history.jsonl"
         self._campaign_event_store = history_store or activation_store
         self._attribution_ledger = data_dir / "attribution_arms.jsonl"
+        self._frozen_submissions: dict[str, FrozenSubmissionEvidence] = {}
+        self._frozen_workspace_bytes: dict[str, bytes] = {}
         self._environment_id = type(sandbox).__name__
         self._evolution = evolution
         self._environment_builder = environment_builder
@@ -1027,6 +1105,7 @@ class ModelCyclePorts:
         required_action_groups: tuple[frozenset[str], ...] = (),
         freeze_max_bytes: int | None = None,
         restrict_actions: frozenset[str] | None = None,
+        role_config: RoleConfig | None = None,
     ) -> Mapping[str, Any]:
         with self._sandbox_lock:
             self._sandbox_sequence += 1
@@ -1038,8 +1117,8 @@ class ModelCyclePorts:
         boundary = RuntimeStageBoundary(
             self._runtime_policy_cycle, stage_ordinal, f"stage:{stage_ordinal}"
         )
-        cfg = self._role_configs[role.value]
-        policy_max_steps = FIXED_ROLE_MAX_STEPS
+        cfg = role_config if role_config is not None else self._role_configs[role.value]
+        policy_max_steps = self._limits.max_steps
         policy_timeout = self._limits.max_timeout_seconds
         if self._runtime_policy_registry is not None:
             stage_policy = (
@@ -1054,6 +1133,11 @@ class ModelCyclePorts:
                 Mapping[str, Any], stage_policy.values["role_max_output_tokens"]
             )
             cfg = replace(cfg, max_output_tokens=int(outputs[role.value]))
+            configured_steps = int(
+                cast(Mapping[str, Any], stage_policy.values["role_max_steps"])[role.value]
+            )
+            if configured_steps > 0:
+                policy_max_steps = configured_steps
         step_limit = policy_max_steps if max_steps is None else min(max_steps, policy_max_steps)
         binding = runtime_binding if runtime_binding is not None else self._bindings[role]
         image = binding.runtime_image
@@ -1237,10 +1321,17 @@ class ModelCyclePorts:
                 "submission": _strip_forbidden(result.submission),
                 "usage": _usage_summary(result.usages),
                 "usage_verified": result.usage_verified,
-                "observations": [
-                    {"step": item.step, "action": item.action}
-                    for item in result.observations[:100]
-                ],
+                "observations": _observation_receipts(result.observations[:100]),
+                "submit_digest": hashlib.sha256(
+                    canonical_json(result.submission).encode("utf-8")
+                ).hexdigest(),
+                "submit_attempts": sum(
+                    1 for item in result.observations if item.action == "submit"
+                ),
+                "duplicate_submits": max(
+                    0,
+                    sum(1 for item in result.observations if item.action == "submit") - 1,
+                ),
             }
             if self._runtime_policy_registry is not None:
                 evidence["runtime_policy_id"] = (
@@ -1393,9 +1484,55 @@ class ModelCyclePorts:
 
     def solve(self, snapshot: CurriculumSnapshot, cohort: DynamicTaskCohort) -> Mapping[str, Any]:
         tasks = _sealed_tasks(self._dynamic, cohort)
-        return self._solve_arm(
+        evidence = self._solve_arm(
             snapshot, cohort, tasks, self._bindings[Role.WARRIOR], arm_label="champion"
         )
+        # Persist the submission artifact up front so the control-plane frozen
+        # binding can reference its typed content address (idempotent: the
+        # cycle runtime records the same bytes and receives the same address).
+        submission_ref = self._artifacts.put_json("submission", evidence)
+        evidence = dict(evidence)
+        evidence["submission_artifact_id"] = submission_ref.artifact_id
+        self._bind_frozen_submission(snapshot, cohort, evidence)
+        return evidence
+
+    def _bind_frozen_submission(
+        self,
+        snapshot: CurriculumSnapshot,
+        cohort: DynamicTaskCohort,
+        evidence: Mapping[str, Any],
+    ) -> None:
+        """Create the single control-plane FrozenSubmissionEvidence object.
+
+        Judge, Prosecutor and the sealed evaluator all derive their mounts from
+        this object; model self-reports never override it.
+        """
+        artifact_id = evidence.get("workspace_artifact_id")
+        size = evidence.get("workspace_size_bytes")
+        digest = evidence.get("workspace_digest")
+        if (
+            not isinstance(artifact_id, str)
+            or not isinstance(size, int)
+            or not isinstance(digest, str)
+        ):
+            raise RuntimeError("champion solve did not freeze a workspace")
+        active = self._roles.projection.current_active_set
+        if active is None:
+            raise RuntimeError("role genesis must precede submission freeze")
+        frozen = FrozenSubmissionEvidence.create(
+            submission_artifact_id=evidence["submission_artifact_id"],
+            workspace_artifact_id=artifact_id,
+            workspace_digest=digest,
+            workspace_size_bytes=size,
+            producer_role_version_id=active.for_role(Role.WARRIOR).role_version_id,
+            snapshot_id=snapshot.snapshot_id,
+            cohort_id=cohort.cohort_id,
+        )
+        workspace = self._arm_workspaces.get("champion")
+        if workspace is None:
+            workspace = self._artifacts.get(ArtifactRef("arm-workspace", artifact_id, size))
+        self._frozen_submissions["champion"] = frozen
+        self._frozen_workspace_bytes["champion"] = workspace
 
     def _solve_arm(
         self,
@@ -1483,25 +1620,185 @@ class ModelCyclePorts:
         }
 
     def review(self, snapshot: CurriculumSnapshot, submission: ArtifactRef) -> Mapping[str, Any]:
+        submission_data = _read(self._artifacts, submission)
+        artifact_id = submission_data.get("workspace_artifact_id")
+        size = submission_data.get("workspace_size_bytes")
+        digest = submission_data.get("workspace_digest")
+        workspace: bytes | None = None
+        if (
+            isinstance(artifact_id, str)
+            and isinstance(size, int)
+            and size > 0
+            and isinstance(digest, str)
+        ):
+            try:
+                workspace = self._artifacts.get(
+                    ArtifactRef("arm-workspace", artifact_id, size)
+                )
+            except Exception:
+                workspace = None
         evidence = self._run_role(
             Role.JUDGE,
             objective=(
-                "Review the Warrior submission against the sealed cohort.  Assess correctness, "
-                "quality, hidden-failure risk and the cost of the next experiment.  Submit one "
-                "payload with bounded findings and a quality_score in [0,1].  For every staged MCP "
-                "candidate, include mcp_decisions[{candidate_id,decision,rationale}], where decision "
-                "is approve, reject, or abstain; approval only admits an isolated experiment."
+                "Review the Warrior submission against the sealed cohort.  The frozen Warrior "
+                "workspace is mounted read-only; first verify its digest matches workspace_digest, "
+                "then inspect the real sources.  Assess correctness, quality, hidden-failure risk "
+                "and the cost of the next experiment.  Submit one payload with bounded findings, "
+                "quality_score in [0,1], and forecast{forecasts:[{task_artifact_id, "
+                "failure_probability, confidence, evidence_coverage}], probes_run:[...], "
+                "hidden_data_disclosed:false, workspace_binding:{workspace_digest, verified}}.  "
+                "If the workspace cannot be inspected, set workspace_binding.verified=false and "
+                "all evidence_coverage=0; never guess the source.  For every staged MCP candidate, "
+                "include mcp_decisions[{candidate_id,decision,rationale}], where decision is "
+                "approve, reject, or abstain; approval only admits an isolated experiment."
+            ),
+            stage_workspace=workspace,
+            role_config=self._judge_role_config(
+                snapshot.cycle_number, submission.artifact_id
             ),
             context={
                 "snapshot": _truncate(snapshot.to_mapping()),
                 "submission": _brief(self._artifacts, submission),
+                "workspace_digest": digest,
+                "task_artifact_ids": list(
+                    submission_data.get("task_ids", [])
+                    if isinstance(submission_data.get("task_ids"), list)
+                    else []
+                ),
             },
         )
+        forecast = self._judge_forecast(evidence, digest)
         return {
             **evidence,
+            "forecast": forecast,
             "quality_score": _score(
                 evidence.get("submission", {}).get("quality_score")
             ),
+        }
+
+    def _judge_forecast(
+        self, evidence: Mapping[str, Any], expected_digest: str | None
+    ) -> Mapping[str, Any]:
+        sub = evidence.get("submission")
+        raw = sub.get("forecast") if isinstance(sub, Mapping) else None
+        raw = raw if isinstance(raw, Mapping) else {}
+        parsed: JudgeForecast | None = None
+        try:
+            parsed = JudgeForecast.from_mapping(
+                {
+                    key: raw[key]
+                    for key in ("forecasts", "probes_run", "hidden_data_disclosed")
+                    if key in raw
+                }
+            )
+        except Exception:
+            parsed = None
+        binding = raw.get("workspace_binding")
+        binding = binding if isinstance(binding, Mapping) else {}
+        claimed_verified = bool(binding.get("verified", False))
+        claimed_digest = binding.get("workspace_digest")
+        verified = (
+            claimed_verified
+            and isinstance(claimed_digest, str)
+            and isinstance(expected_digest, str)
+            and claimed_digest == expected_digest
+        )
+        per_task: dict[str, float] = {}
+        confidence = 0.5
+        coverage = 0.0
+        probes: list[str] = []
+        if parsed is not None:
+            forecasts = parsed.forecasts
+            per_task = {
+                item.task_artifact_id: _score(item.failure_probability)
+                for item in forecasts
+            }
+            if forecasts:
+                confidence = _score(
+                    sum(float(item.confidence) for item in forecasts) / len(forecasts)
+                )
+                coverage = _score(
+                    sum(float(item.evidence_coverage) for item in forecasts)
+                    / len(forecasts)
+                )
+            probes = list(parsed.probes_run)
+        return {
+            "per_task_failure_probability": per_task,
+            "confidence": confidence,
+            "evidence_coverage": coverage if verified else 0.0,
+            "probes": probes,
+            "verified_workspace_binding": verified,
+            "workspace_digest": expected_digest,
+            "hidden_data_disclosed": bool(parsed.hidden_data_disclosed if parsed else False),
+        }
+
+    def _judge_role_config(self, cycle: int, evidence_id: str | None = None) -> RoleConfig:
+        cfg = self._role_configs["judge"]
+        if not self._judge_heterogeneous_model or self._judge_heterogeneous_fraction <= 0:
+            return cfg
+        digest_input = f"{cycle}:{evidence_id or ''}:judge-heterogeneous"
+        sample = (
+            int(hashlib.sha256(digest_input.encode("utf-8")).hexdigest(), 16) % 1000
+        ) / 1000.0
+        if sample < self._judge_heterogeneous_fraction:
+            return replace(cfg, model=self._judge_heterogeneous_model)
+        return cfg
+
+    def calibrate(
+        self,
+        snapshot: CurriculumSnapshot,
+        judge_review: ArtifactRef,
+        quality_lock: ArtifactRef,
+    ) -> Mapping[str, Any]:
+        """Post-seal forecast calibration: Brier/ECE and false-positive/negative counts."""
+        review = _read(self._artifacts, judge_review)
+        lock = _read(self._artifacts, quality_lock)
+        forecast = review.get("forecast") or {}
+        probabilities = forecast.get("per_task_failure_probability") or {}
+        tasks = (lock.get("evaluation") or {}).get("tasks") or []
+        forecasts: list[TaskFailureForecast] = []
+        outcomes: list[bool] = []
+        predictions: list[Mapping[str, Any]] = []
+        for task in tasks:
+            artifact_id = str(task.get("artifact_id", ""))
+            predicted = _score(probabilities.get(artifact_id, 0.5))
+            score = float(task.get("score", 0.0))
+            failed = score < 1.0
+            outcomes.append(failed)
+            try:
+                forecasts.append(
+                    TaskFailureForecast(
+                        artifact_id,
+                        predicted,
+                        forecast.get("confidence", 0.5),
+                        forecast.get("evidence_coverage", 0.0),
+                    )
+                )
+            except Exception:
+                continue
+            predictions.append(
+                {
+                    "task_id": str(task.get("task_id", artifact_id)),
+                    "artifact_id": artifact_id,
+                    "tier": task.get("tier"),
+                    "predicted_failure_probability": round(predicted, 6),
+                    "actual_failed": failed,
+                    "correct": (predicted >= 0.5) == failed,
+                }
+            )
+        if not forecasts:
+            calibration = JudgeCalibration(0, 0.0, 0.0, 0, 0)
+        else:
+            calibration = compute_calibration(
+                tuple(forecasts),
+                tuple(outcomes[: len(forecasts)]),
+            )
+        return {
+            **calibration.to_mapping(),
+            "sample_count": len(forecasts),
+            "workspace_verified": bool(forecast.get("verified_workspace_binding")),
+            "per_task": predictions,
+            "basis": [judge_review.artifact_id, quality_lock.artifact_id],
         }
 
     def audit(
@@ -1511,33 +1808,66 @@ class ModelCyclePorts:
         judge_review: ArtifactRef,
         quality_lock: ArtifactRef,
     ) -> Mapping[str, Any]:
+        frozen = self._frozen_submissions.get("champion")
+        workspace: bytes | None = None
+        expected_digest: str | None = None
+        if frozen is not None:
+            expected_digest = frozen.workspace_digest
+            workspace = self._frozen_workspace_bytes.get("champion")
+            if workspace is None:
+                try:
+                    workspace = self._artifacts.get(
+                        ArtifactRef(
+                            "arm-workspace",
+                            frozen.workspace_artifact_id,
+                            frozen.workspace_size_bytes,
+                        )
+                    )
+                except Exception:
+                    workspace = None
         evidence = self._run_role(
             Role.PROSECUTOR,
             objective=(
-                "Audit token consumption, evidence integrity and risk for this cycle.  Submit one "
-                "payload with usage_verified, risk findings, and a structured curriculum "
-                "hypothesis list for the next cycle.  Independently decide every staged MCP candidate "
-                "using mcp_decisions[{candidate_id,decision,rationale}]; use reject as a veto."
+                "Audit token consumption, evidence integrity and risk for this cycle.  The frozen "
+                "Warrior workspace is mounted read-only; verify its digest matches the bound "
+                "workspace_digest before drawing evidence conclusions.  Submit one payload with "
+                "usage_verified, risk findings, and a structured curriculum hypothesis list for "
+                "the next cycle.  Independently decide every staged MCP candidate using "
+                "mcp_decisions[{candidate_id,decision,rationale}]; use reject as a veto."
             ),
+            stage_workspace=workspace,
             context={
                 "snapshot": _truncate(snapshot.to_mapping()),
                 "submission": _brief(self._artifacts, submission),
                 "judge_review": _brief(self._artifacts, judge_review),
                 "quality_lock": _brief(self._artifacts, quality_lock),
+                "workspace_digest": expected_digest,
             },
+        )
+        sub = evidence.get("submission", {})
+        claimed_binding = bool(sub.get("verified_workspace_binding", False))
+        claimed_digest = sub.get("workspace_digest")
+        verified = (
+            claimed_binding
+            and isinstance(claimed_digest, str)
+            and isinstance(expected_digest, str)
+            and claimed_digest == expected_digest
         )
         return {
             **evidence,
-            "curriculum": _strip_forbidden(
-                evidence.get("submission", {}).get("curriculum", [])
-            ),
-            "role_candidates": _strip_forbidden(
-                evidence.get("submission", {}).get("role_candidates", {})
-            ),
-            "usage_verified": bool(
-                evidence.get("submission", {}).get("usage_verified", False)
-            ),
+            "verified_workspace_binding": verified,
+            "workspace_digest": expected_digest,
+            "curriculum": _strip_forbidden(sub.get("curriculum", [])),
+            "role_candidates": _strip_forbidden(sub.get("role_candidates", {})),
+            "usage_verified": bool(sub.get("usage_verified", False)),
         }
+    def _diagnostic_brief(self, quality_lock: ArtifactRef) -> Mapping[str, Any]:
+        """Sanitized sealed feedback: categories only, never per-case pass counts."""
+        lock = _brief(self._artifacts, quality_lock)
+        evaluation = lock.get("evaluation") or {}
+        normalized = dict(lock)
+        normalized["tasks"] = evaluation.get("tasks") or []
+        return sanitize_diagnostic_quality(normalized)
 
     def reflect(
         self,
@@ -1566,7 +1896,7 @@ class ModelCyclePorts:
                 "snapshot": _truncate(snapshot.to_mapping()),
                 "submission": _brief(self._artifacts, submission),
                 "judge_review": _brief(self._artifacts, judge_review),
-                "quality_lock": _brief(self._artifacts, quality_lock),
+                "quality_lock": self._diagnostic_brief(quality_lock),
                 "prosecutor_audit": _brief(self._artifacts, prosecutor_audit),
             },
         )
@@ -1589,14 +1919,19 @@ class ModelCyclePorts:
             confidence=_score(evidence.get("submission", {}).get("confidence", 0.5)),
         )
         usage = evidence.get("usage", {})
+        generation_usage = CouncilGenerationUsage(
+            input_tokens=int(usage.get("input_tokens", 0)),
+            output_tokens=int(usage.get("output_tokens", 0)),
+            reasoning_tokens=int(usage.get("reasoning_tokens", 0)),
+        )
         message = CouncilMessage(
             cycle_id=f"cycle:{snapshot.cycle_number}",
             sender=role,
             message_type=CouncilMessageType.REFLECTION,
             claims=(claim,),
             summary=summary,
-            token_usage=int(usage.get("input_tokens", 0))
-            + int(usage.get("output_tokens", 0)),
+            token_usage=estimate_content_tokens(summary, (claim,)),
+            generation_usage=generation_usage,
         )
         requests = evidence.get("submission", {}).get("runtime_policy_requests", [])
         valid_requests: list[Mapping[str, Any]] = []
@@ -1614,11 +1949,111 @@ class ModelCyclePorts:
                     and all(isinstance(ref, str) and ref.strip() for ref in item["evidence_refs"])
                 ):
                     valid_requests.append(dict(item))
+        proposals = evidence.get("submission", {}).get("proposals", [])
+        valid_proposals: list[Mapping[str, Any]] = []
+        if isinstance(proposals, list):
+            for item in proposals:
+                if not isinstance(item, Mapping):
+                    continue
+                if not isinstance(item.get("proposal_id"), str) or not item["proposal_id"].strip():
+                    continue
+                if not isinstance(item.get("target_role"), str):
+                    continue
+                if not isinstance(item.get("content"), Mapping) or not item["content"]:
+                    continue
+                valid_proposals.append(
+                    {
+                        "proposal_id": item["proposal_id"][:256],
+                        "target_role": item["target_role"],
+                        "content": dict(item["content"]),
+                        "rationale": str(item.get("rationale", ""))[:2000],
+                        "expected_metric": str(item.get("expected_metric", ""))[:512],
+                        "falsifier": str(item.get("falsifier", ""))[:1024],
+                    }
+                )
         return {
             **evidence,
             "role": role.value,
             "message": message.to_mapping(),
             "runtime_policy_requests": valid_requests,
+            "proposals": valid_proposals,
+        }
+
+    def reflect_post(
+        self,
+        role: Role,
+        snapshot: CurriculumSnapshot,
+        submission: ArtifactRef,
+        quality_lock: ArtifactRef,
+        prosecutor_audit: ArtifactRef,
+        judge_calibration: ArtifactRef,
+        task_validation: ArtifactRef,
+        candidate_evaluation: ArtifactRef,
+        attribution: ArtifactRef,
+        activation: ArtifactRef,
+    ) -> Mapping[str, Any]:
+        """Deterministic post-cycle postmortem derived from the full artifact graph.
+
+        Postmortem runs after activation so it can name the real obligations:
+        task supply, candidate evaluation, qualification and activation.  It is
+        control-plane derived (no extra model call) and reuses the pre-cycle
+        reflection claim id for recurrence linkage.
+        """
+        validation = _brief(self._artifacts, task_validation)
+        candidates = _brief(self._artifacts, candidate_evaluation)
+        qualification = _brief(self._artifacts, attribution)
+        activation_data = _brief(self._artifacts, activation)
+        failed_obligations: list[str] = []
+        learning = validation.get("learning_outcome")
+        if isinstance(learning, str) and learning in {"degraded", "blocked_by_supply"}:
+            failed_obligations.append(f"task-supply:{learning}")
+        if candidates.get("enabled") is False:
+            failed_obligations.append("candidate-evaluation:skipped")
+        elif candidates.get("qualification_pending") is None and candidates.get("rejection_pending") is None:
+            failed_obligations.append("candidate-evaluation:no-qualified-candidate")
+        if activation_data.get("unchanged") is True:
+            failed_obligations.append("activation:unchanged")
+        elif activation_data.get("intent_id") is None:
+            failed_obligations.append("activation:not-attempted")
+        if not failed_obligations:
+            failed_obligations.append("none")
+        statement = (
+            f"Post-cycle postmortem for {role.value}: obligations "
+            + ", ".join(failed_obligations)
+            + "."
+        )
+        claim = EvidenceClaim(
+            claim_id=f"{role.value}-postmortem-{snapshot.cycle_number}",
+            statement=statement,
+            evidence_refs=tuple(
+                "sha256:" + ref.artifact_id.rsplit(":", 1)[1]
+                for ref in (
+                    submission,
+                    quality_lock,
+                    prosecutor_audit,
+                    judge_calibration,
+                    task_validation,
+                    candidate_evaluation,
+                    attribution,
+                    activation,
+                )
+            ),
+            falsifier="A replay of the same artifact graph contradicts this postmortem.",
+            confidence=0.9,
+        )
+        return {
+            "role": role.value,
+            "claims": [claim.to_dict()],
+            "proposals": [],
+            "problem_id": claim.claim_id,
+            "prior_problem_id": f"{role.value}-reflection-{snapshot.cycle_number}",
+            "evidence_kind": EvidenceKind.OBSERVED.value,
+            "evidence_refs": list(claim.evidence_refs),
+            "failed_stage_or_obligation": failed_obligations,
+            "proposed_change_id": None,
+            "success_metric": "next cycle closes every named obligation",
+            "confidence": 0.9,
+            "falsifier": claim.falsifier,
         }
 
     def deliberate(
@@ -1638,6 +2073,13 @@ class ModelCyclePorts:
             max_tokens=council_max_tokens,
         )
         reflection_payloads = [_read(self._artifacts, ref) for ref in reflections]
+        reflection_proposals: list[Mapping[str, Any]] = []
+        for payload in reflection_payloads:
+            raw_proposals = payload.get("proposals", []) if isinstance(payload, Mapping) else []
+            if isinstance(raw_proposals, list):
+                for item in raw_proposals:
+                    if isinstance(item, Mapping):
+                        reflection_proposals.append(dict(item))
         for payload in reflection_payloads:
             transcript.append(CouncilMessage.from_mapping(payload["message"]))
         chair = self._run_role(
@@ -1741,6 +2183,7 @@ class ModelCyclePorts:
                 "amendment": None,
                 "mcp_decisions": mcp_decisions,
                 "runtime_policy_decisions": runtime_policy_decisions,
+                "reflection_proposals": reflection_proposals,
             }
         repair: Mapping[str, Any] | None = None
         try:
@@ -1769,6 +2212,7 @@ class ModelCyclePorts:
                     "amendment": None,
                     "mcp_decisions": mcp_decisions,
                     "runtime_policy_decisions": runtime_policy_decisions,
+                    "reflection_proposals": reflection_proposals,
                 }
             if not isinstance(repaired_payload, Mapping):
                 raise ValueError("repaired objective amendment must be an object or null")
@@ -1778,6 +2222,7 @@ class ModelCyclePorts:
         proposal_summary = (
             amendment.rationale.strip() or "objective amendment proposed"
         )
+        proposal_usage = chair.get("usage", {})
         proposal_message = CouncilMessage(
             cycle_id,
             Role.PROSECUTOR,
@@ -1786,6 +2231,12 @@ class ModelCyclePorts:
             proposal_summary,
             proposal_id=proposal_id,
             proposal_kind=CouncilProposalKind.OBJECTIVE_AMENDMENT,
+            token_usage=estimate_content_tokens(proposal_summary, ()),
+            generation_usage=CouncilGenerationUsage(
+                input_tokens=int(proposal_usage.get("input_tokens", 0)),
+                output_tokens=int(proposal_usage.get("output_tokens", 0)),
+                reasoning_tokens=int(proposal_usage.get("reasoning_tokens", 0)),
+            ),
         )
         transcript.append(proposal_message)
         critiques: list[CouncilMessage] = []
@@ -1803,6 +2254,7 @@ class ModelCyclePorts:
                 },
             )
             summary = str(evidence.get("summary", "")).strip() or "critique recorded"
+            critique_usage = evidence.get("usage", {})
             critique = CouncilMessage(
                 cycle_id,
                 role,
@@ -1811,6 +2263,12 @@ class ModelCyclePorts:
                 summary,
                 proposal_id=proposal_id,
                 parent_message_id=proposal_message.message_id,
+                token_usage=estimate_content_tokens(summary, ()),
+                generation_usage=CouncilGenerationUsage(
+                    input_tokens=int(critique_usage.get("input_tokens", 0)),
+                    output_tokens=int(critique_usage.get("output_tokens", 0)),
+                    reasoning_tokens=int(critique_usage.get("reasoning_tokens", 0)),
+                ),
             )
             transcript.append(critique)
             critiques.append(critique)
@@ -1833,6 +2291,7 @@ class ModelCyclePorts:
             vote_summary = (
                 str(vote_evidence.get("summary", "")).strip() or "vote recorded"
             )
+            vote_usage = vote_evidence.get("usage", {})
             vote = CouncilMessage(
                 cycle_id,
                 role,
@@ -1841,6 +2300,12 @@ class ModelCyclePorts:
                 vote_summary,
                 proposal_id=proposal_id,
                 support=decision,
+                token_usage=estimate_content_tokens(vote_summary, ()),
+                generation_usage=CouncilGenerationUsage(
+                    input_tokens=int(vote_usage.get("input_tokens", 0)),
+                    output_tokens=int(vote_usage.get("output_tokens", 0)),
+                    reasoning_tokens=int(vote_usage.get("reasoning_tokens", 0)),
+                ),
             )
             transcript.append(vote)
         return {
@@ -1850,6 +2315,7 @@ class ModelCyclePorts:
             "amendment": amendment.to_mapping(),
             "mcp_decisions": mcp_decisions,
             "runtime_policy_decisions": runtime_policy_decisions,
+            "reflection_proposals": reflection_proposals,
         }
 
     @staticmethod
@@ -2338,12 +2804,21 @@ class ModelCyclePorts:
         for attempt in range(1, authoring_attempts + 1):
             evidence = self._run_role(
                 Role.JUDGE,
+                role_config=self._judge_role_config(
+                    snapshot.cycle_number, submission.artifact_id
+                ),
                 objective=(
                     "Declare at least one complete executable Python task-pack spec in the "
                     "final submit payload under task_specs. Every spec declares: task_id (a "
                     "new slug not present in reserved_task_ids), prompt, public_cases, "
                     "public_test (pytest source), hidden_cases, reference_solution, "
-                    "defect_solution and mutants (name + solution). All content is plain "
+                    "defect_solution and mutants (name + solution). Every spec also declares "
+                    "public contract clauses and binds each case to them: clauses=[{clause_id, "
+                    "statement, input_partition, expected_outcome, security_relevant}], each "
+                    "public/hidden case carries clause_ids, and defect_clause_ids lists the "
+                    "clauses the defect violates. Hidden cases must never introduce semantics "
+                    "absent from the declared clauses; the control plane rejects undeclared "
+                    "hidden obligations. All content is plain "
                     "text or JSON; do not embed archives or base64. The control plane "
                     "materializes manifest, layout and content_hash, then validates that "
                     "the reference passes public and hidden suites, the defect is "
@@ -2367,9 +2842,11 @@ class ModelCyclePorts:
                         "spec_schema": {
                             "task_id": "python-<new-slug>",
                             "prompt": "markdown task description",
-                            "public_cases": {"version": 1, "cases": [{"name": "case-name", "steps": [{"op": "call", "symbol": "fn", "args": [1, 2], "expect": 3}]}]},
+                            "public_cases": {"version": 1, "cases": [{"name": "case-name", "clause_ids": ["FUNC.ARITHMETIC"], "steps": [{"op": "call", "symbol": "fn", "args": [1, 2], "expect": 3}]}]},
                             "public_test": "pytest source text",
-                            "hidden_cases": {"version": 1, "cases": [{"name": "case-name", "steps": [{"op": "call", "symbol": "fn", "args": [1, 2], "expect": 3}]}]},
+                            "hidden_cases": {"version": 1, "cases": [{"name": "case-name", "clause_ids": ["FUNC.ARITHMETIC"], "steps": [{"op": "call", "symbol": "fn", "args": [1, 2], "expect": 3}]}]},
+                            "clauses": [{"clause_id": "FUNC.ARITHMETIC", "statement": "fn(a,b) returns the arithmetic result", "input_partition": "positive/zero/negative", "expected_outcome": "return", "security_relevant": False}],
+                            "defect_clause_ids": ["FUNC.ARITHMETIC"],
                             "reference_solution": "python source text",
                             "defect_solution": "python source text with a known defect",
                             "mutants": [{"name": "slug", "solution": "python source text"}],
@@ -2640,7 +3117,10 @@ class ModelCyclePorts:
                     }
                 )
             else:
-                registered.append(record.artifact.to_mapping())
+                registered.append({
+                    **record.artifact.to_mapping(),
+                    "clause_coverage": spec.clause_summary(),
+                })
         return self._task_validation_result(
             registered, rejected, required_fresh, no_specs=False
         )
@@ -2818,6 +3298,9 @@ class ModelCyclePorts:
         result["rollbacks"] = [
             self._execute_rollback_order(order) for order in rollback_orders
         ]
+        council_reflection_proposals = council_data.get("reflection_proposals")
+        if not isinstance(council_reflection_proposals, list):
+            council_reflection_proposals = []
         consumed = consume_cycle_proposals(
             registry=self._evolution,
             artifacts=self._artifacts,
@@ -2826,6 +3309,7 @@ class ModelCyclePorts:
             objective_id=snapshot.objective.objective_id,
             collection_evidence_id=collection_evidence_id,
             meta_evolution_enabled=self._meta_evolution_enabled,
+            reflections=[{"proposals": council_reflection_proposals}],
         )
         result["collected"] = [
             item.to_mapping() for item in consumed if item.collected
@@ -4332,8 +4816,31 @@ class ModelCyclePorts:
                 key=lambda item: item.role,
             )
         )
-        usage = audit.get("usage", {})
-        cost = int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
+        evaluation = quality.get("evaluation") or {}
+        safety_passed = not bool(evaluation.get("safety_violations"))
+        integrity_passed = bool(evaluation.get("integrity_passed", False))
+        if self._runtime_ledger is not None:
+            cost = int(self._runtime_ledger.consumed().total_tokens)
+        else:
+            cost = int(self._runtime_consumed.get("max_total_tokens", 0))
+        if cost <= 0:
+            basis = quality.get("basis")
+            basis_ids = basis if isinstance(basis, list) else []
+            for artifact_id in basis_ids:
+                if not isinstance(artifact_id, str):
+                    continue
+                try:
+                    item = _read_artifact_id(self._artifacts, artifact_id)
+                except Exception:
+                    continue
+                item_usage = item.get("usage") or {}
+                cost += int(item_usage.get("input_tokens", 0)) + int(
+                    item_usage.get("output_tokens", 0)
+                )
+            audit_usage = audit.get("usage") or {}
+            cost += int(audit_usage.get("input_tokens", 0)) + int(
+                audit_usage.get("output_tokens", 0)
+            )
         binding = self._bindings[Role.WARRIOR]
         return EvaluationArm(
             cycle_id=f"cycle:{snapshot.cycle_number}",
@@ -4348,11 +4855,9 @@ class ModelCyclePorts:
             role_generations=role_generations,
             quality=_score(quality.get("score")),
             cost_units=cost,
-            usage_verified=bool(audit.get("usage_verified", False)),
-            safety_passed=bool(audit.get("submission", {}).get("safety_passed", False)),
-            integrity_passed=bool(
-                audit.get("submission", {}).get("integrity_passed", False)
-            ),
+            usage_verified=bool(audit.get("usage_verified", False)) and cost > 0,
+            safety_passed=safety_passed,
+            integrity_passed=integrity_passed,
             runtime_variant=binding.runtime_variant(),
             mcp_binding_ids=tuple(
                 sorted(item.binding.binding_id for item in binding.mcps)
@@ -4580,7 +5085,12 @@ def _runtime_policy_genesis_values(
         "role_token_shares": {
             name: float(config.budget_share) for name, config in role_configs.items()
         },
-        "role_max_steps": role_int(FIXED_ROLE_MAX_STEPS),
+        "role_max_steps": role_int(
+            min(
+                max(1, int(getattr(limits, "max_steps", 20) or 20)),
+                FIXED_ROLE_MAX_STEPS,
+            )
+        ),
         "role_max_output_tokens": {
             name: max(int(config.max_output_tokens), 393_216)
             for name, config in role_configs.items()
@@ -4617,8 +5127,8 @@ def _runtime_policy_genesis_values(
         "candidate_evaluations_per_cycle": 1,
         "candidate_max_steps": int(getattr(autonomy, "candidate_max_extra_steps", 12)),
         "population_max_cells": 128,
-        "council_max_messages": 200,
-        "council_max_tokens": 4_194_304,
+        "council_max_messages": int(getattr(autonomy, "council_max_messages", 200)),
+        "council_max_tokens": int(getattr(autonomy, "council_max_tokens", 4_194_304)),
         "task_holdout_delay_cycles": int(getattr(autonomy, "task_holdout_delay_cycles", 1)),
         "objective_history_window": int(getattr(autonomy, "objective_history_window", 3)),
         "objective_probation_cycles": int(getattr(autonomy, "objective_probation_cycles", 2)),
@@ -4771,7 +5281,9 @@ def run_v2_cycle(
         policy_hash = effective_policy.policy_id.rsplit(":", 1)[1]
         limits = replace(
             limits,
-            max_steps=FIXED_ROLE_MAX_STEPS,
+            max_steps=int(
+                cast(Mapping[str, Any], policy_values["role_max_steps"])[Role.WARRIOR.value]
+            ),
             max_timeout_seconds=float(
                 cast(Mapping[str, Any], policy_values["role_command_timeout_seconds"])[Role.WARRIOR.value]
             ),
@@ -4790,8 +5302,8 @@ def run_v2_cycle(
         subagent_timeout_seconds = float(
             cast(float | int, policy_values["subagent_timeout_seconds"])
         )
-        council_max_messages = 200
-        council_max_tokens = 4_194_304
+        council_max_messages = int(cast(int, policy_values["council_max_messages"]))
+        council_max_tokens = int(cast(int, policy_values["council_max_tokens"]))
         configured_cohort_limit = int(cast(int, policy_values["cohort_limit"]))
         cohort_limit = configured_cohort_limit
         holdout_delay = int(cast(int, policy_values["task_holdout_delay_cycles"]))
@@ -4927,6 +5439,12 @@ def run_v2_cycle(
         objective_governance=objective_governance,
         runtime_ledger=runtime_ledger,
         require_warrior_strategy_proposal=require_warrior_strategy_proposal,
+        judge_heterogeneous_model=getattr(
+            campaign_config, "judge_heterogeneous_model", None
+        ),
+        judge_heterogeneous_fraction=float(
+            getattr(campaign_config, "judge_heterogeneous_fraction", 0.0) or 0.0
+        ),
     )
     if effective_policy is not None and effective_policy.maintenance_only:
         maintenance = ports._run_role(
@@ -4970,9 +5488,25 @@ def run_v2_cycle(
         effective_policy = runtime_policy_registry.effective_for_stage(
             runtime_policy_registry.resume_stage_boundary(target)
         )
+    state = curriculum.projection.cycle_state
+    was_retry = state is CycleState.FAILED
+    resume_evidence: dict[str, ArtifactRef] = {}
+    checkpoint_campaign = f"{campaign_id}/stage-checkpoints"
+    if was_retry and isinstance(auxiliary_store, EventStore):
+        for event in auxiliary_store.read(checkpoint_campaign):
+            if event.event_type != "stage_checkpoint_v2":
+                continue
+            payload = event.payload
+            if payload.get("cycle") != target:
+                continue
+            stage = payload.get("stage")
+            artifact_id = payload.get("artifact_id")
+            if not isinstance(stage, str) or not isinstance(artifact_id, str):
+                continue
+            ref = _ref_from_artifact_id(artifact_id)
+            if ref is not None:
+                resume_evidence[stage] = ref
     try:
-        state = curriculum.projection.cycle_state
-        was_retry = state is CycleState.FAILED
         if state is CycleState.FAILED:
             curriculum.transition_cycle(
                 "retry",
@@ -4991,6 +5525,18 @@ def run_v2_cycle(
                 "retry",
                 reason="control-plane restart after an interrupted cycle",
             )
+        def stage_checkpoint(stage: str, ref: ArtifactRef) -> None:
+            if isinstance(auxiliary_store, EventStore):
+                auxiliary_store.append(
+                    checkpoint_campaign,
+                    "stage_checkpoint_v2",
+                    {
+                        "cycle": target,
+                        "stage": stage,
+                        "artifact_id": ref.artifact_id,
+                    },
+                )
+
         controller = EvolutionCycleController(
             curriculum,
             _RegistryCohortProvider(dynamic),
@@ -5003,12 +5549,14 @@ def run_v2_cycle(
                 council=ports,
                 evolution=ports,
             ),
+            checkpoint=stage_checkpoint,
         )
         return controller.run(
             snapshot,
             target_generation=target,
             cohort_limit=cohort_limit,
             retry=was_retry,
+            resume_evidence=resume_evidence or None,
         )
     except BaseException as exc:
         if not repair_on_failure or event_store is None:

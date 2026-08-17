@@ -2657,11 +2657,20 @@ class RoleAgentRuntime:
             return
         values = self.policy_provider(role)
         role_timeouts = cast(Mapping[str, Any], values["role_command_timeout_seconds"])
-        # Step, byte, search and research-action bounds are fixed safety
-        # constants, not tunable budget parameters.
+        # The step budget comes from the runtime policy (campaign max_agent_steps
+        # or a role-level amendment); FIXED_ROLE_MAX_STEPS is only the fallback
+        # when no policy value is present.  Byte, search and research-action
+        # bounds remain fixed safety constants, not tunable budget parameters.
+        raw_steps = cast(Mapping[str, Any], values.get("role_max_steps", {})).get(
+            role.value, FIXED_ROLE_MAX_STEPS
+        )
+        try:
+            max_steps = int(raw_steps)
+        except (TypeError, ValueError):
+            max_steps = FIXED_ROLE_MAX_STEPS
         self.limits = replace(
             self.limits,
-            max_steps=FIXED_ROLE_MAX_STEPS,
+            max_steps=max(1, max_steps),
             max_timeout_seconds=float(role_timeouts[role.value]),
             max_read_bytes=FIXED_ROLE_MAX_READ_BYTES,
             max_write_bytes=FIXED_ROLE_MAX_WRITE_BYTES,

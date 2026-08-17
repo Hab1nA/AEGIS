@@ -181,18 +181,44 @@ def task_spec_from_pack(task_id: str = "dynamic-next") -> dict[str, object]:
     source = sorted(
         load_builtin_python_taskpacks(), key=lambda item: item.manifest.task_id
     )[0]
+    public_cases = json.loads(
+        (source.root / "public" / "cases.json").read_text(encoding="utf-8")
+    )
+    hidden_cases = json.loads(
+        (source.root / "hidden" / "cases.json").read_text(encoding="utf-8")
+    )
+    hidden_names = [str(case["name"]) for case in hidden_cases["cases"]]
+    clauses = [
+        {
+            "clause_id": "CONTRACT.GENERAL",
+            "statement": "the implementation must satisfy the declared public contract",
+            "input_partition": "all documented inputs",
+            "expected_outcome": "documented result",
+            "security_relevant": False,
+        }
+    ]
+    clauses.extend(
+        {
+            "clause_id": f"CONTRACT.{index}",
+            "statement": f"hidden contract {name}",
+            "input_partition": str(name),
+            "expected_outcome": "no violation",
+            "security_relevant": False,
+        }
+        for index, name in enumerate(hidden_names, start=1)
+    )
+    for case in public_cases["cases"]:
+        case["clause_ids"] = ["CONTRACT.GENERAL"]
+    for index, case in enumerate(hidden_cases["cases"]):
+        case["clause_ids"] = [f"CONTRACT.{index + 1}"]
     return {
         "task_id": task_id,
         "prompt": (source.root / "prompt.md").read_text(encoding="utf-8"),
-        "public_cases": json.loads(
-            (source.root / "public" / "cases.json").read_text(encoding="utf-8")
-        ),
+        "public_cases": public_cases,
         "public_test": (source.root / "public" / "test_solution.py").read_text(
             encoding="utf-8"
         ),
-        "hidden_cases": json.loads(
-            (source.root / "hidden" / "cases.json").read_text(encoding="utf-8")
-        ),
+        "hidden_cases": hidden_cases,
         "reference_solution": (source.root / "reference" / "solution.py").read_text(
             encoding="utf-8"
         ),
@@ -203,9 +229,12 @@ def task_spec_from_pack(task_id: str = "dynamic-next") -> dict[str, object]:
             {
                 "name": path.parent.name,
                 "solution": path.read_text(encoding="utf-8"),
+                "clause_ids": ["CONTRACT.GENERAL"],
             }
             for path in sorted((source.root / "mutants").glob("*/solution.py"))
         ],
+        "clauses": clauses,
+        "defect_clause_ids": ["CONTRACT.GENERAL"],
     }
 
 
@@ -764,7 +793,7 @@ class CyclePortsTests(unittest.TestCase):
                 self.assertEqual(validation["registered_count"], 1)
                 self.assertEqual(validation["learning_outcome"], "progressed")
                 summary = json.loads(artifacts.get(result.cycle_summary).decode("utf-8"))
-                self.assertEqual(summary["outcome_class"], "task-outcome")
+                self.assertEqual(summary["outcome_class"], "evaluation-skipped")
             finally:
                 dynamic.close()
                 store.close()
@@ -1511,6 +1540,84 @@ class CyclePortsTests(unittest.TestCase):
                 )
             )
 
+
+    def test_full_cycle_produces_trusted_judge_forecast_and_calibration(self) -> None:
+        """Judge forecast, calibration, sanitized reflection and trusted attribution."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = EventStore(root / "events.sqlite3")
+            dynamic = DynamicTaskRegistry(root / "tasks.sqlite3")
+            runner = AnchorRunner()
+            GenesisSeeder(dynamic, TaskForge(dynamic)).seed(runner)
+            curriculum = CurriculumRegistry(store, "cli")
+            roles = RoleRegistry(store, "cli")
+            archive = forge_archive(root)
+            artifacts = ContentAddressedArtifactStore(root / "artifacts")
+            actions = gateway_actions(archive)
+            # Script the Judge to declare a verified workspace binding that does
+            # not match the control-plane digest; the binding must fail closed.
+            actions[1] = submit(
+                "reviewed",
+                {
+                    "findings": ["bounded review"],
+                    "quality_score": 0.8,
+                    "forecast": {
+                        "per_task_failure_probability": {"python-clamp-range": 0.4},
+                        "confidence": 0.6,
+                        "evidence_coverage": 0.9,
+                        "verified_workspace_binding": True,
+                        "workspace_digest": "f" * 64,
+                        "probes": ["workspace.read"],
+                    },
+                },
+            )
+            gateway = FakeGateway(actions)
+            try:
+                result = run_v2_cycle(
+                    gateway=gateway,
+                    sandbox=WritingFakeSandboxBackend(),
+                    research=FakeResearch(),
+                    knowledge=None,
+                    skills=None,
+                    pdf_extractor=None,
+                    role_configs=role_configs(),
+                    limits=RuntimeLimits(max_steps=20),
+                    artifacts=artifacts,
+                    dynamic=dynamic,
+                    forge=TaskForge(dynamic),
+                    runner=runner,
+                    curriculum=curriculum,
+                    roles=roles,
+                    data_dir=root,
+                    campaign_id="cli",
+                )
+                self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
+                review = json.loads(artifacts.get(result.judge_review).decode("utf-8"))
+                forecast = review["forecast"]
+                self.assertIn("per_task_failure_probability", forecast)
+                self.assertIs(forecast["verified_workspace_binding"], False)
+                self.assertIsInstance(forecast["workspace_digest"], str)
+                self.assertEqual(forecast["evidence_coverage"], 0.0)
+                calibration = json.loads(
+                    artifacts.get(result.judge_calibration).decode("utf-8")
+                )
+                self.assertIn("brier_score", calibration)
+                self.assertIn("sample_count", calibration)
+                self.assertEqual(calibration["sample_count"], 12)
+                summary = json.loads(artifacts.get(result.cycle_summary).decode("utf-8"))
+                self.assertIn("dimensions", summary)
+                self.assertEqual(summary["dimensions"]["candidate"], "skipped")
+                self.assertIn("post_reflection_index", summary)
+                attribution = json.loads(artifacts.get(result.attribution).decode("utf-8"))
+                arm = attribution["arm"]
+                self.assertTrue(arm["integrity_passed"])
+                self.assertTrue(arm["safety_passed"])
+                validation = json.loads(artifacts.get(result.task_validation).decode("utf-8"))
+                self.assertEqual(validation["registered_count"], 1)
+                self.assertIn("clause_coverage", validation["registered"][0])
+            finally:
+                dynamic.close()
+                store.close()
 
 if __name__ == "__main__":
     unittest.main()

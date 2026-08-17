@@ -216,18 +216,44 @@ def task_spec_from_pack(task_id: str = "dynamic-next") -> dict[str, object]:
     source = sorted(
         load_builtin_python_taskpacks(), key=lambda item: item.manifest.task_id
     )[0]
+    public_cases = json.loads(
+        (source.root / "public" / "cases.json").read_text(encoding="utf-8")
+    )
+    hidden_cases = json.loads(
+        (source.root / "hidden" / "cases.json").read_text(encoding="utf-8")
+    )
+    hidden_names = [str(case["name"]) for case in hidden_cases["cases"]]
+    clauses = [
+        {
+            "clause_id": "CONTRACT.GENERAL",
+            "statement": "the implementation must satisfy the declared public contract",
+            "input_partition": "all documented inputs",
+            "expected_outcome": "documented result",
+            "security_relevant": False,
+        }
+    ]
+    clauses.extend(
+        {
+            "clause_id": f"CONTRACT.{index}",
+            "statement": f"hidden contract {name}",
+            "input_partition": str(name),
+            "expected_outcome": "no violation",
+            "security_relevant": False,
+        }
+        for index, name in enumerate(hidden_names, start=1)
+    )
+    for case in public_cases["cases"]:
+        case["clause_ids"] = ["CONTRACT.GENERAL"]
+    for index, case in enumerate(hidden_cases["cases"]):
+        case["clause_ids"] = [f"CONTRACT.{index + 1}"]
     return {
         "task_id": task_id,
         "prompt": (source.root / "prompt.md").read_text(encoding="utf-8"),
-        "public_cases": json.loads(
-            (source.root / "public" / "cases.json").read_text(encoding="utf-8")
-        ),
+        "public_cases": public_cases,
         "public_test": (source.root / "public" / "test_solution.py").read_text(
             encoding="utf-8"
         ),
-        "hidden_cases": json.loads(
-            (source.root / "hidden" / "cases.json").read_text(encoding="utf-8")
-        ),
+        "hidden_cases": hidden_cases,
         "reference_solution": (source.root / "reference" / "solution.py").read_text(
             encoding="utf-8"
         ),
@@ -235,9 +261,15 @@ def task_spec_from_pack(task_id: str = "dynamic-next") -> dict[str, object]:
             encoding="utf-8"
         ),
         "mutants": [
-            {"name": path.parent.name, "solution": path.read_text(encoding="utf-8")}
+            {
+                "name": path.parent.name,
+                "solution": path.read_text(encoding="utf-8"),
+                "clause_ids": ["CONTRACT.GENERAL"],
+            }
             for path in sorted((source.root / "mutants").glob("*/solution.py"))
         ],
+        "clauses": clauses,
+        "defect_clause_ids": ["CONTRACT.GENERAL"],
     }
 
 
@@ -274,6 +306,9 @@ def plain_actions(archive: bytes | None = None) -> list[dict[str, object]]:
         submit("council", {"proposal": None, "agenda": ["x"]}),
     ]
     actions.append(submit("forged", {"task_specs": [task_spec_from_pack()]}))
+    actions.append(submit("post-reflect-warrior", {"claims": ["post-cycle warrior"]}))
+    actions.append(submit("post-reflect-judge", {"claims": ["post-cycle judge"]}))
+    actions.append(submit("post-reflect-prosecutor", {"claims": ["post-cycle prosecutor"]}))
     return actions
 
 

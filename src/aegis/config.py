@@ -500,6 +500,8 @@ class CampaignConfig:
     acceptance_profile: str | None = None
     autonomy_v2: AutonomyV2Config | None = None
     objective: str | None = None
+    judge_heterogeneous_model: str | None = None
+    judge_heterogeneous_fraction: float = 0.0
 
     _FIELDS = frozenset(
         {
@@ -519,6 +521,8 @@ class CampaignConfig:
             "acceptance_profile",
             "autonomy_v2",
             "objective",
+            "judge_heterogeneous_model",
+            "judge_heterogeneous_fraction",
         }
     )
     _REQUIRED = frozenset(
@@ -636,6 +640,18 @@ class CampaignConfig:
         objective = raw.get("objective")
         if objective is not None and (not isinstance(objective, str) or not objective.strip()):
             raise ConfigError("objective must be a non-empty string or null")
+        judge_model = raw.get("judge_heterogeneous_model")
+        if judge_model is not None and (
+            not isinstance(judge_model, str) or not judge_model.strip()
+        ):
+            raise ConfigError("judge_heterogeneous_model must be a non-empty string or null")
+        judge_fraction = raw.get("judge_heterogeneous_fraction", 0.0)
+        if (
+            isinstance(judge_fraction, bool)
+            or not isinstance(judge_fraction, (int, float))
+            or not 0.0 <= float(judge_fraction) <= 1.0
+        ):
+            raise ConfigError("judge_heterogeneous_fraction must be a number in [0,1]")
         return cls(
             campaign_id,
             _positive_int(raw["max_rounds"], "max_rounds"),
@@ -653,6 +669,12 @@ class CampaignConfig:
             acceptance_profile,
             autonomy_v2,
             objective,
+            (
+                judge_model.strip()
+                if isinstance(judge_model, str) and judge_model.strip()
+                else None
+            ),
+            float(judge_fraction),
         )
 
     @classmethod
@@ -681,6 +703,8 @@ class CampaignConfig:
             "demo_mode": self.demo_mode,
             "sandbox_backend": self.sandbox_backend,
             "acceptance_profile": self.acceptance_profile,
+            "judge_heterogeneous_model": self.judge_heterogeneous_model,
+            "judge_heterogeneous_fraction": self.judge_heterogeneous_fraction,
         }
         if self.objective is not None:
             payload["objective"] = self.objective

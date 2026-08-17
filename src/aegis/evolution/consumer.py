@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from aegis.artifacts import ContentAddressedArtifactStore
 from aegis.models import Role
@@ -258,6 +258,112 @@ def _consume_proposal(
     )
 
 
+def _consume_reflection_proposals(
+    *,
+    registry: EvolutionRegistry,
+    artifacts: ContentAddressedArtifactStore,
+    reflections: Sequence[Mapping[str, Any]],
+    objective_id: str,
+    collection_evidence_id: str,
+) -> tuple[ConsumedCandidate, ...]:
+    """Consume structured workflow proposals produced by the three role reflections.
+
+    Reflections are advisory; only a proposal with a declared target role and a
+    schema-valid workflow body becomes a candidate.  Invalid proposals are
+    recorded as rejected so the inbox is visible instead of silently dropped.
+    """
+    consumed: list[ConsumedCandidate] = []
+    seen: set[tuple[str, str]] = set()
+    for payload in reflections:
+        if not isinstance(payload, Mapping):
+            continue
+        raw_proposals = payload.get("proposals")
+        if not isinstance(raw_proposals, list):
+            continue
+        for raw in raw_proposals:
+            if not isinstance(raw, Mapping):
+                continue
+            proposal_id = raw.get("proposal_id")
+            target_text = raw.get("target_role")
+            content = raw.get("content")
+            rationale = str(raw.get("rationale", ""))[:2000]
+            if not isinstance(proposal_id, str) or not proposal_id.strip():
+                continue
+            if not isinstance(target_text, str):
+                continue
+            try:
+                target_role = Role(target_text)
+            except ValueError:
+                consumed.append(
+                    ConsumedCandidate(
+                        EvolutionSurface.WORKFLOW,
+                        Role.WARRIOR,
+                        "",
+                        "",
+                        "reflection",
+                        proposal_id,
+                        rationale,
+                        collected=False,
+                        validated=False,
+                        error=f"reflection proposal has an invalid target_role {target_text!r}",
+                    )
+                )
+                continue
+            dedupe_key = (proposal_id, target_role.value)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            if not isinstance(content, Mapping) or not content:
+                consumed.append(
+                    ConsumedCandidate(
+                        EvolutionSurface.WORKFLOW,
+                        target_role,
+                        "",
+                        "",
+                        "reflection",
+                        proposal_id,
+                        rationale,
+                        collected=False,
+                        validated=False,
+                        error="reflection proposal content is required",
+                    )
+                )
+                continue
+            try:
+                workflow = validate_workflow_content(content)
+            except EvolutionSurfaceError as exc:
+                consumed.append(
+                    ConsumedCandidate(
+                        EvolutionSurface.WORKFLOW,
+                        target_role,
+                        "",
+                        "",
+                        "reflection",
+                        proposal_id,
+                        rationale,
+                        collected=False,
+                        validated=False,
+                        error=str(exc),
+                    )
+                )
+                continue
+            consumed.append(
+                _record_candidate(
+                    registry=registry,
+                    artifacts=artifacts,
+                    surface=EvolutionSurface.WORKFLOW,
+                    target_role=target_role,
+                    content_json=workflow,
+                    objective_id=objective_id,
+                    collection_evidence_id=collection_evidence_id,
+                    source="reflection",
+                    proposal_id=proposal_id,
+                    rationale=rationale,
+                )
+            )
+    return tuple(consumed)
+
+
 def consume_cycle_proposals(
     *,
     registry: EvolutionRegistry,
@@ -267,9 +373,20 @@ def consume_cycle_proposals(
     objective_id: str,
     collection_evidence_id: str,
     meta_evolution_enabled: bool = False,
+    reflections: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[ConsumedCandidate, ...]:
     """Scan one cycle's evidence and collect every valid evolution candidate."""
     consumed: list[ConsumedCandidate] = []
+    if reflections:
+        consumed.extend(
+            _consume_reflection_proposals(
+                registry=registry,
+                artifacts=artifacts,
+                reflections=reflections,
+                objective_id=objective_id,
+                collection_evidence_id=collection_evidence_id,
+            )
+        )
     submitter_role: Role | None = None
     raw_role = submission.get("role")
     if isinstance(raw_role, str):

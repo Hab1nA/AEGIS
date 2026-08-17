@@ -12,7 +12,7 @@ import hashlib
 import math
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from aegis.curriculum.models import ObjectiveVersion
 from aegis.models import Role, canonical_json
@@ -128,6 +128,62 @@ class EvidenceClaim:
         return cls(data["claim_id"], data["statement"], tuple(refs), data["falsifier"], data["confidence"])
 
 
+
+@dataclass(frozen=True, slots=True)
+class CouncilGenerationUsage:
+    """Provider-billed generation tokens, kept separate from message content.
+
+    ``token_usage`` on a council message is a deterministic content-length
+    estimate used for protocol bounding; these fields record the actual
+    relay/provider usage as metadata and never influence protocol limits.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("input_tokens", "output_tokens", "reasoning_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise CouncilProtocolError(f"{name} must be a non-negative integer")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "CouncilGenerationUsage":
+        if not isinstance(value, Mapping) or set(value) != {
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+        }:
+            raise CouncilProtocolError("council generation usage has an invalid schema")
+        return cls(
+            input_tokens=int(value["input_tokens"]),
+            output_tokens=int(value["output_tokens"]),
+            reasoning_tokens=int(value["reasoning_tokens"]),
+        )
+
+
+def estimate_content_tokens(summary: str, claims: Sequence[Any]) -> int:
+    """Deterministic, conservative message-content token estimate.
+
+    Uses ceil(utf-8 bytes / 4) per field plus a small per-message overhead, so
+    protocol bounding is stable across providers and relays and does not depend
+    on provider billing tokenizers.
+    """
+    total = 0
+    for field in (summary, *(claim.statement for claim in claims if hasattr(claim, "statement"))):
+        if isinstance(field, str):
+            total += math.ceil(len(field.encode("utf-8")) / 4)
+    return int(total + 8)
+
+
 @dataclass(frozen=True, slots=True)
 class CouncilMessage:
     cycle_id: str
@@ -140,6 +196,7 @@ class CouncilMessage:
     proposal_kind: CouncilProposalKind | None = None
     support: SupportDecision | None = None
     token_usage: int = 0
+    generation_usage: CouncilGenerationUsage | None = None
     message_id: str = ""
 
     def __post_init__(self) -> None:
@@ -157,6 +214,10 @@ class CouncilMessage:
             raise CouncilProtocolError("token_usage must be an integer")
         if self.token_usage < 0:
             raise CouncilProtocolError("token_usage must be non-negative")
+        if self.generation_usage is not None and not isinstance(
+            self.generation_usage, CouncilGenerationUsage
+        ):
+            raise CouncilProtocolError("generation_usage must be a CouncilGenerationUsage or null")
 
         if self.message_type is CouncilMessageType.REFLECTION:
             if any(
@@ -207,18 +268,23 @@ class CouncilMessage:
         }
 
     def to_mapping(self) -> dict[str, object]:
-        return {**self._identity_payload(), "message_id": self.message_id}
+        payload = {**self._identity_payload(), "message_id": self.message_id}
+        if self.generation_usage is not None:
+            payload["generation_usage"] = self.generation_usage.to_mapping()
+        return payload
 
     @classmethod
     def from_mapping(cls, value: object) -> CouncilMessage:
-        data = _strict_mapping(
-            value,
-            {
-                "cycle_id", "sender", "message_type", "claims", "summary", "proposal_id",
-                "parent_message_id", "proposal_kind", "support", "token_usage", "message_id",
-            },
-            "council message",
-        )
+        expected_fields = {
+            "cycle_id", "sender", "message_type", "claims", "summary", "proposal_id",
+            "parent_message_id", "proposal_kind", "support", "token_usage", "message_id",
+        }
+        if isinstance(value, Mapping) and "generation_usage" in value:
+            expected_fields.add("generation_usage")
+        data = _strict_mapping(value, expected_fields, "council message")
+        generation_usage = data.get("generation_usage")
+        if generation_usage is not None and not isinstance(generation_usage, Mapping):
+            raise CouncilProtocolError("generation_usage must be an object or null")
         claims = data["claims"]
         if not isinstance(claims, (list, tuple)):
             raise CouncilProtocolError("claims must be an array")
@@ -235,7 +301,13 @@ class CouncilMessage:
                     else CouncilProposalKind(data["proposal_kind"])
                 ),
                 support=(None if data["support"] is None else SupportDecision(data["support"])),
-                token_usage=data["token_usage"], message_id=data["message_id"],
+                token_usage=data["token_usage"],
+                generation_usage=(
+                    None
+                    if generation_usage is None
+                    else CouncilGenerationUsage.from_mapping(generation_usage)
+                ),
+                message_id=data["message_id"],
             )
         except (TypeError, ValueError) as exc:
             raise CouncilProtocolError("council message has invalid enum fields") from exc
