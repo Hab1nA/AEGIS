@@ -32,7 +32,7 @@ flowchart TD
 | 能力 | 实现 | 主要源码 | 主要测试 |
 |---|---|---|---|
 | 动态任务冷启动 | 空库时注册 12 个内置锚点，动态任务可用后锚点退出 | `dynamic_tasks/seed.py`、`registry.py` | `test_dynamic_seed.py` |
-| 评委自主出题 | 模型端口产出 proposal 或 base64 tar 归档，经 TaskForge 变异验证入库 | `cycle_ports.py`、`dynamic_tasks/forge.py` | `test_cycle_ports.py` |
+| 评委自主出题 | Judge 在 submit payload 声明 task_specs（纯文本/JSON），控制面 TaskPackBuilder 生成布局/manifest/content_hash、预检 task_id、dry-run 校验并原子入库 | `cycle_ports.py`、`dynamic_tasks/builder.py`、`dynamic_tasks/forge.py` | `test_taskpack_builder.py`、`test_cycle_ports.py` |
 | 模型驱动全循环 | Warrior/Judge/Prosecutor 经 RoleAgentRuntime 运行，逐阶段落盘 | `cycle_runtime.py`、`cycle_ports.py` | `test_cycle_runtime.py`、`test_cycle_ports.py` |
 | 三方协商 | 三个独立反思 + 集体裁决 | `cycle_ports.py` | `test_cycle_ports.py` |
 | Git checkpoint | journaled connector + GitPublisher CAS candidate ref（需配置 public_repo_url） | `connectors/`、`publishing/` | `test_git_checkpoint_connector.py` |
@@ -149,6 +149,12 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 - **最高推理强度**：角色配置 `reasoning_effort: "max"`。该 relay 的
   `deepseek-v4-flash` 是隐藏推理模型，medium/未设置时曾出现长时间挂起或把
   输出预算全部花在 `reasoning_content` 上；max 在实测中稳定返回。
+- **声明式任务锻造**：Judge 只声明任务内容（task_id、prompt、public/hidden
+  cases、public_test、reference/defect/mutant 源码），控制面 TaskPackBuilder
+  负责固定布局、manifest 与 content_hash、task_id 预留/冲突预检、文件白名单
+  与 dry-run；模型不再写入草稿文件，缓存文件污染 sealed 套件的问题从结构上
+  消除。task-validation 结果带 `status/registered_count/learning_outcome`，
+  零注册周期标记 `learning-degraded`，不再以普通 task-outcome 静默完成。
 - **输出 token 上限**：deepseek-v4-flash 支持 1M 上下文与最高 384K 输出
   （即 393,216 token）；角色 `max_output_tokens` 默认直接对齐该能力上限
   （393,216），保证 max 推理与最终 JSON 内容都有充足余量，显著降低

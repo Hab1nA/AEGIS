@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import json
 import shutil
-import tarfile
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -73,7 +71,7 @@ class AnchorRunner:
 
 class FakeGateway:
     def __init__(self, actions: list[dict[str, object]]) -> None:
-        self.actions = _materialize_legacy_forge_actions(actions)
+        self.actions = list(actions)
         self.requests = []
 
     def complete(self, request, *, cancel=None):
@@ -178,27 +176,37 @@ def forge_archive(root: Path, *, task_id: str = "dynamic-next") -> bytes:
     return canonical_taskpack_archive(TaskPack.load(copied))
 
 
-def task_authoring_actions(archive: bytes, task_id: str) -> list[dict[str, object]]:
-    """Translate a test fixture pack into the actions a real Judge would take."""
-
-    actions: list[dict[str, object]] = []
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as source:
-        for member in source.getmembers():
-            if not member.isfile():
-                continue
-            extracted = source.extractfile(member)
-            assert extracted is not None
-            actions.append(
-                {
-                    "action": "workspace.write",
-                    "arguments": {
-                        "path": f"drafts/{task_id}/{member.name}",
-                        "content_base64": base64.b64encode(extracted.read()).decode("ascii"),
-                    },
-                }
-            )
-    actions.append(submit("forged", {"draft_paths": [f"drafts/{task_id}"]}))
-    return actions
+def task_spec_from_pack(task_id: str = "dynamic-next") -> dict[str, object]:
+    """Translate the first built-in pack into a declarative Judge task spec."""
+    source = sorted(
+        load_builtin_python_taskpacks(), key=lambda item: item.manifest.task_id
+    )[0]
+    return {
+        "task_id": task_id,
+        "prompt": (source.root / "prompt.md").read_text(encoding="utf-8"),
+        "public_cases": json.loads(
+            (source.root / "public" / "cases.json").read_text(encoding="utf-8")
+        ),
+        "public_test": (source.root / "public" / "test_solution.py").read_text(
+            encoding="utf-8"
+        ),
+        "hidden_cases": json.loads(
+            (source.root / "hidden" / "cases.json").read_text(encoding="utf-8")
+        ),
+        "reference_solution": (source.root / "reference" / "solution.py").read_text(
+            encoding="utf-8"
+        ),
+        "defect_solution": (source.root / "defect" / "solution.py").read_text(
+            encoding="utf-8"
+        ),
+        "mutants": [
+            {
+                "name": path.parent.name,
+                "solution": path.read_text(encoding="utf-8"),
+            }
+            for path in sorted((source.root / "mutants").glob("*/solution.py"))
+        ],
+    }
 
 
 def paired_candidate_actions(path: str, solution: bytes) -> list[dict[str, object]]:
@@ -224,11 +232,6 @@ def paired_candidate_actions(path: str, solution: bytes) -> list[dict[str, objec
         write(solution),
         solved,
     ]
-
-
-def _fixture_archive(task_id: str) -> bytes:
-    with tempfile.TemporaryDirectory() as directory:
-        return forge_archive(Path(directory), task_id=task_id)
 
 
 def seed_fresh_candidate_probe(
@@ -261,38 +264,11 @@ def run_candidate_cycle(**kwargs):
         return run_v2_cycle(**kwargs)
 
 
-def _materialize_legacy_forge_actions(
-    actions: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    """Keep hand-written scenarios concise while exercising workspace authoring."""
-
-    materialized: list[dict[str, object]] = []
-    for action in actions:
-        arguments = action.get("arguments")
-        if not isinstance(arguments, dict) or arguments.get("summary") != "forged":
-            materialized.append(action)
-            continue
-        payload = arguments.get("payload")
-        if not isinstance(payload, dict):
-            materialized.append(action)
-            continue
-        proposals = payload.get("proposals")
-        proposal = proposals[0] if isinstance(proposals, list) and proposals else {}
-        task_id = proposal.get("task_id") if isinstance(proposal, dict) else None
-        if not isinstance(task_id, str):
-            task_id = "dynamic-next"
-        archive: bytes | None = None
-        archives = payload.get("archives")
-        if isinstance(archives, list) and archives and isinstance(archives[0], dict):
-            encoded = archives[0].get("archive_base64")
-            if isinstance(encoded, str):
-                archive = base64.b64decode(encoded, validate=True)
-        materialized.extend(task_authoring_actions(archive or _fixture_archive(task_id), task_id))
-    return materialized
-
-
 def gateway_actions(
-    archive: bytes, *, propose_candidate: bool = True
+    archive: bytes | None = None,
+    *,
+    propose_candidate: bool = True,
+    task_id: str = "dynamic-next",
 ) -> list[dict[str, object]]:
     audit_payload: dict[str, object] = {
         "usage_verified": True,
@@ -321,21 +297,7 @@ def gateway_actions(
         submit(
             "forged",
             {
-                "proposals": [
-                    {
-                        "task_id": "dynamic-next",
-                        "difficulty": 2,
-                        "capability_tags": ["python"],
-                        "cost_units": 10,
-                        "stop_conditions": ["pass the sealed suite"],
-                    }
-                ],
-                "archives": [
-                    {
-                        "task_id": "dynamic-next",
-                        "archive_base64": base64.b64encode(archive).decode("ascii"),
-                    }
-                ],
+                "task_specs": [task_spec_from_pack(task_id)],
             },
         ),
     ]
@@ -463,7 +425,9 @@ class CyclePortsTests(unittest.TestCase):
                 )
             return rows
 
-        def cycle_actions(*, propose: bool) -> list[dict[str, object]]:
+        def cycle_actions(
+            *, propose: bool, task_id: str = "dynamic-next"
+        ) -> list[dict[str, object]]:
             prefix: list[dict[str, object]] = []
             if propose:
                 prefix.append(
@@ -522,7 +486,7 @@ class CyclePortsTests(unittest.TestCase):
                 submit("reflect-judge", {"claims": []}),
                 submit("reflect-prosecutor", {"claims": []}),
                 submit("council", {"proposal": None, "agenda": []}),
-                submit("forged", {"proposals": [], "archives": []}),
+                submit("forged", {"task_specs": [task_spec_from_pack(task_id)]}),
                 *paired_actions(),
             ]
 
@@ -588,7 +552,8 @@ class CyclePortsTests(unittest.TestCase):
                     self.assertEqual(bridge.names(), ())
 
                     second = run_candidate_cycle(
-                        gateway=FakeGateway(cycle_actions(propose=False)), **common
+                        gateway=FakeGateway(cycle_actions(propose=False, task_id="dynamic-next-2")),
+                        **common
                     )
                     self.assertEqual(roles.projection.current_active_set.for_role(Role.WARRIOR).version, 2)
                     self.assertEqual(bridge.names(), ("calculator",))
@@ -687,7 +652,9 @@ class CyclePortsTests(unittest.TestCase):
             archive = forge_archive(root)
             artifacts = ContentAddressedArtifactStore(root / "artifacts")
             first = FakeGateway(gateway_actions(archive, propose_candidate=True))
-            second = FakeGateway(gateway_actions(archive, propose_candidate=False))
+            second = FakeGateway(
+                gateway_actions(propose_candidate=False, task_id="dynamic-next-2")
+            )
             common = dict(
                 sandbox=WritingFakeSandboxBackend(),
                 research=FakeResearch(),
@@ -730,8 +697,8 @@ class CyclePortsTests(unittest.TestCase):
                 dynamic.close()
                 store.close()
 
-    def test_task_authoring_ignores_legacy_empty_archives_and_uses_workspace(self) -> None:
-        """Task registration is driven by the frozen Judge workspace, not archives."""
+    def test_declarative_task_authoring_registers_specs(self) -> None:
+        """Judge task specs are materialized and registered by the control plane."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = EventStore(root / "events.sqlite3")
@@ -756,23 +723,10 @@ class CyclePortsTests(unittest.TestCase):
                 submit("reflect-judge", {"claims": []}),
                 submit("reflect-prosecutor", {"claims": []}),
                 submit("council", {"proposal": None, "agenda": []}),
-                submit(
-                    "forged",
-                    {
-                        "proposals": [
-                            {
-                                "task_id": "dynamic-next",
-                                "difficulty": 2,
-                                "capability_tags": ["python"],
-                                "cost_units": 10,
-                                "stop_conditions": ["pass the sealed suite"],
-                            }
-                        ],
-                        "archives": {},
-                    },
-                ),
+                submit("forged", {"task_specs": [task_spec_from_pack()]}),
             ]
             gateway = FakeGateway(actions)
+            artifacts = ContentAddressedArtifactStore(root / "artifacts")
             common = dict(
                 sandbox=WritingFakeSandboxBackend(),
                 research=FakeResearch(),
@@ -781,7 +735,7 @@ class CyclePortsTests(unittest.TestCase):
                 pdf_extractor=None,
                 role_configs=role_configs(),
                 limits=RuntimeLimits(max_steps=20),
-                artifacts=ContentAddressedArtifactStore(root / "artifacts"),
+                artifacts=artifacts,
                 dynamic=dynamic,
                 forge=TaskForge(dynamic),
                 runner=runner,
@@ -803,6 +757,78 @@ class CyclePortsTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(dynamic_records), 1)
                 self.assertIs(dynamic_records[0].status, DynamicTaskStatus.QUARANTINED)
+                validation = json.loads(
+                    artifacts.get(result.task_validation).decode("utf-8")
+                )
+                self.assertEqual(validation["status"], "registered")
+                self.assertEqual(validation["registered_count"], 1)
+                self.assertEqual(validation["learning_outcome"], "progressed")
+                summary = json.loads(artifacts.get(result.cycle_summary).decode("utf-8"))
+                self.assertEqual(summary["outcome_class"], "task-outcome")
+            finally:
+                dynamic.close()
+                store.close()
+
+    def test_task_authoring_without_specs_marks_cycle_learning_degraded(self) -> None:
+        """A cycle that declares no task specs is not a silent success."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = EventStore(root / "events.sqlite3")
+            dynamic = DynamicTaskRegistry(root / "tasks.sqlite3")
+            runner = AnchorRunner()
+            GenesisSeeder(dynamic, TaskForge(dynamic)).seed(runner)
+            curriculum = CurriculumRegistry(store, "cli")
+            roles = RoleRegistry(store, "cli")
+            forged = {"proposals": [], "archives": []}
+            actions: list[dict[str, object]] = [
+                submit("solved", {"task_ids": [], "results": []}),
+                submit("reviewed", {"findings": [], "quality_score": 0.5}),
+                submit(
+                    "audited",
+                    {
+                        "usage_verified": True,
+                        "safety_passed": True,
+                        "integrity_passed": True,
+                        "curriculum": [],
+                    },
+                ),
+                submit("reflect-warrior", {"claims": []}),
+                submit("reflect-judge", {"claims": []}),
+                submit("reflect-prosecutor", {"claims": []}),
+                submit("council", {"proposal": None, "agenda": []}),
+                submit("forged", forged),
+                submit("forged", forged),
+            ]
+            gateway = FakeGateway(actions)
+            artifacts = ContentAddressedArtifactStore(root / "artifacts")
+            common = dict(
+                sandbox=WritingFakeSandboxBackend(),
+                research=FakeResearch(),
+                knowledge=None,
+                skills=None,
+                pdf_extractor=None,
+                role_configs=role_configs(),
+                limits=RuntimeLimits(max_steps=20),
+                artifacts=artifacts,
+                dynamic=dynamic,
+                forge=TaskForge(dynamic),
+                runner=runner,
+                curriculum=curriculum,
+                roles=roles,
+                data_dir=root,
+                campaign_id="cli",
+            )
+            try:
+                result = run_v2_cycle(gateway=gateway, **common)
+                self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
+                validation = json.loads(
+                    artifacts.get(result.task_validation).decode("utf-8")
+                )
+                self.assertFalse(validation["valid"])
+                self.assertEqual(validation["status"], "no_valid_task")
+                self.assertEqual(validation["learning_outcome"], "degraded")
+                summary = json.loads(artifacts.get(result.cycle_summary).decode("utf-8"))
+                self.assertEqual(summary["outcome_class"], "learning-degraded")
             finally:
                 dynamic.close()
                 store.close()
@@ -905,21 +931,7 @@ class CyclePortsTests(unittest.TestCase):
             submit("reflect-judge", {"claims": []}),
             submit("reflect-prosecutor", {"claims": []}),
             submit("council", {"proposal": None, "agenda": []}),
-            submit(
-                "forged",
-                {
-                    "proposals": [
-                        {
-                            "task_id": "dynamic-next",
-                            "difficulty": 2,
-                            "capability_tags": ["python"],
-                            "cost_units": 10,
-                            "stop_conditions": ["pass the sealed suite"],
-                        }
-                    ],
-                    "archives": [],
-                },
-            ),
+            submit("forged", {"task_specs": [task_spec_from_pack()]}),
             *paired_candidate_actions(
                 "tasks/candidate-fresh-probe/solution.py", fixed_solution
             ),
@@ -986,7 +998,9 @@ class CyclePortsTests(unittest.TestCase):
                 self.assertEqual(warrior_manifest["runtime_image"], output_image)
                 self.assertNotEqual(result.qualification.artifact_id, "")
 
-                second_gateway = FakeGateway(gateway_actions(b"", propose_candidate=False))
+                second_gateway = FakeGateway(
+                    gateway_actions(propose_candidate=False, task_id="dynamic-next-2")
+                )
                 result2 = run_v2_cycle(gateway=second_gateway, **common)
                 self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
                 self.assertIn(output_image, sandbox.images.values())
@@ -1098,21 +1112,7 @@ class CyclePortsTests(unittest.TestCase):
             submit("reflect-judge", {"claims": []}),
             submit("reflect-prosecutor", {"claims": []}),
             submit("council", {"proposal": None, "agenda": []}),
-            submit(
-                "forged",
-                {
-                    "proposals": [
-                        {
-                            "task_id": "dynamic-next",
-                            "difficulty": 2,
-                            "capability_tags": ["python"],
-                            "cost_units": 10,
-                            "stop_conditions": ["pass the sealed suite"],
-                        }
-                    ],
-                    "archives": [],
-                },
-            ),
+            submit("forged", {"task_specs": [task_spec_from_pack()]}),
             *paired_candidate_actions(
                 "tasks/candidate-fresh-probe/solution.py", fixed_solution
             ),
@@ -1183,7 +1183,9 @@ class CyclePortsTests(unittest.TestCase):
                     [0, 0, 0, 0, 1, 1, 1, 1],
                 )
 
-                second_gateway = FakeGateway(gateway_actions(b"", propose_candidate=False))
+                second_gateway = FakeGateway(
+                    gateway_actions(propose_candidate=False, task_id="dynamic-next-2")
+                )
                 result2 = run_v2_cycle(gateway=second_gateway, **common)
                 self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
                 envelope = json.loads(second_gateway.requests[0].messages[1].content)
@@ -1315,21 +1317,7 @@ class CyclePortsTests(unittest.TestCase):
             submit("reflect-judge", {"claims": []}),
             submit("reflect-prosecutor", {"claims": []}),
             submit("council", {"proposal": None, "agenda": []}),
-            submit(
-                "forged",
-                {
-                    "proposals": [
-                        {
-                            "task_id": "dynamic-next",
-                            "difficulty": 2,
-                            "capability_tags": ["python"],
-                            "cost_units": 10,
-                            "stop_conditions": ["pass the sealed suite"],
-                        }
-                    ],
-                    "archives": [],
-                },
-            ),
+            submit("forged", {"task_specs": [task_spec_from_pack()]}),
             *paired_candidate_actions(
                 "tasks/candidate-fresh-probe/solution.py", fixed_solution
             ),
@@ -1388,7 +1376,9 @@ class CyclePortsTests(unittest.TestCase):
 
                 # A second cycle must rebuild the plugin-bearing broker from
                 # the activated champion binding (typed ids -> raw contract).
-                second_gateway = FakeGateway(gateway_actions(b"", propose_candidate=False))
+                second_gateway = FakeGateway(
+                    gateway_actions(propose_candidate=False, task_id="dynamic-next-2")
+                )
                 result2 = run_v2_cycle(gateway=second_gateway, **common)
                 self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
                 self.assertNotEqual(result2.activation.artifact_id, "")

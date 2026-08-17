@@ -98,6 +98,7 @@ from aegis.dynamic_tasks import (
     DynamicTaskStatus,
     TaskForge,
 )
+from aegis.dynamic_tasks.builder import TaskPackBuilder, TaskSpec, TaskSpecError
 from aegis.environments.runtime import EnvironmentBuilder
 from aegis.event_store import EventStore
 from aegis.evolution.arm_evaluation import (
@@ -444,20 +445,6 @@ def _sealed_tasks(
     return tuple(tasks)
 
 
-def _extract_frozen_workspace(payload: bytes, destination: Path) -> None:
-    """Extract a model-owned frozen workspace without trusting member paths."""
-    try:
-        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
-            members = archive.getmembers()
-            if len(members) > 4096:
-                raise ValueError("task-authoring workspace has an invalid file count")
-            if sum(max(0, item.size) for item in members) > 128 * 1024 * 1024:
-                raise ValueError("task-authoring workspace exceeds the expanded size limit")
-            archive.extractall(destination, filter="data")
-    except (tarfile.TarError, OSError) as exc:
-        raise ValueError("task-authoring workspace is not a valid archive") from exc
-
-
 def _repair_taskpack_content_hash(root: Path) -> bool:
     """Recompute the derived content hash a model cannot reliably predict.
 
@@ -499,17 +486,6 @@ def _repair_taskpack_content_hash(root: Path) -> bool:
     except OSError:
         return False
     return True
-
-
-def _draft_taskpack_roots(root: Path) -> tuple[Path, ...]:
-    drafts = root / "drafts"
-    if not drafts.is_dir() or drafts.is_symlink():
-        return ()
-    return tuple(
-        path.parent
-        for path in sorted(drafts.glob("*/manifest.json"), key=lambda item: item.as_posix())
-        if path.is_file() and not path.is_symlink()
-    )
 
 
 def _task_authoring_seed_workspace() -> bytes:
@@ -2355,6 +2331,7 @@ class ModelCyclePorts:
         repair_feedback: list[str] = []
         evidence: Mapping[str, Any] | None = None
         drafts: list[Mapping[str, Any]] = []
+        builder = TaskPackBuilder(self._forge.registry, self._runner)
         authoring_attempts = int(
             self._policy_value("task_authoring_attempts", _TASK_AUTHORING_ATTEMPTS)
         )
@@ -2362,20 +2339,19 @@ class ModelCyclePorts:
             evidence = self._run_role(
                 Role.JUDGE,
                 objective=(
-                    "Author at least one complete executable Python task-pack directly under "
-                    "drafts/<task_id>/.  Every pack must contain manifest.json, prompt.md, "
-                    "separate public and hidden pytest suites, a passing reference solution, "
-                    "a known-defect solution and at least one mutant.  Run the public checks you "
-                    "can inspect, then submit a summary listing the written draft paths.  "
-                    "You MUST materialize every file in the sandbox workspace using the "
-                    "workspace.write action with path and base64 content; a description of the "
-                    "files in the response is not acceptable. Write manifest.json exactly "
-                    "per the provided manifest_schema (the control plane recomputes "
-                    "content_hash), and lay out files per the provided layout. The workspace "
-                    "contains a complete working template under templates/example-task/; read "
-                    "it with workspace.read, then copy and adapt that exact structure to "
-                    "drafts/<task_id>/ with workspace.write. Do not embed archives or source "
-                    "files in the response."
+                    "Declare at least one complete executable Python task-pack spec in the "
+                    "final submit payload under task_specs. Every spec declares: task_id (a "
+                    "new slug not present in reserved_task_ids), prompt, public_cases, "
+                    "public_test (pytest source), hidden_cases, reference_solution, "
+                    "defect_solution and mutants (name + solution). All content is plain "
+                    "text or JSON; do not embed archives or base64. The control plane "
+                    "materializes manifest, layout and content_hash, then validates that "
+                    "the reference passes public and hidden suites, the defect is "
+                    "detected, and the hidden suite kills every mutant. Read the workspace "
+                    "template under templates/example-task/ for the expected structure and "
+                    "semantics; you may run scratch checks with sandbox.exec, but the "
+                    "authoritative deliverable is the task_specs array in your submit "
+                    "payload."
                 ),
                 context={
                     "snapshot": _truncate(snapshot.to_mapping()),
@@ -2388,51 +2364,36 @@ class ModelCyclePorts:
                     "previous_validation_errors": repair_feedback[:32],
                     "taskpack_contract": {
                         "language": "python",
-                        "root": "drafts/<task_id>",
-                        "layout": [
-                            "manifest.json",
-                            "prompt.md",
-                            "public/cases.json",
-                            "public/test_solution.py",
-                            "hidden/cases.json",
-                            "reference/solution.py",
-                            "defect/solution.py",
-                            "mutants/<name>/solution.py",
-                        ],
-                        "manifest_schema": {
-                            "task_id": "python-<slug>",
-                            "version": 1,
-                            "language": "python",
-                            "public_dir": "public",
-                            "hidden_dir": "hidden",
-                            "reference_dir": "reference",
-                            "defect_dir": "defect",
-                            "mutant_dirs": ["mutants/<name>"],
-                            "content_hash": "<sha256 hex computed over every file except manifest.json>",
+                        "deliverable": "submit payload task_specs",
+                        "reserved_task_ids": sorted(builder.reserved_task_ids()),
+                        "spec_schema": {
+                            "task_id": "python-<new-slug>",
+                            "prompt": "markdown task description",
+                            "public_cases": {"version": 1, "cases": [{"name": "case-name", "steps": [{"op": "call", "symbol": "fn", "args": [1, 2], "expect": 3}]}]},
+                            "public_test": "pytest source text",
+                            "hidden_cases": {"version": 1, "cases": [{"name": "case-name", "steps": [{"op": "call", "symbol": "fn", "args": [1, 2], "expect": 3}]}]},
+                            "reference_solution": "python source text",
+                            "defect_solution": "python source text with a known defect",
+                            "mutants": [{"name": "slug", "solution": "python source text"}],
                         },
-                        "required": [
-                            "manifest.json",
-                            "prompt.md",
-                            "public suite",
-                            "hidden suite",
-                            "reference implementation",
-                            "defect implementation",
-                            "mutant implementation",
+                        "validation_contract": [
+                            "reference passes public and hidden suites",
+                            "defect is detected by at least one suite",
+                            "hidden suite kills every mutant",
                         ],
                     },
                 },
                 freeze_workspace=True,
-                extra_actions=frozenset({"workspace.write"}),
                 freeze_max_bytes=128 * 1024 * 1024,
                 stage_workspace=_task_authoring_seed_workspace(),
             )
-            drafts, repair_feedback = self._inspect_authored_tasks(evidence)
+            drafts, repair_feedback = self._inspect_task_specs(evidence)
             if any(bool(item.get("valid")) for item in drafts):
                 return {
                     **evidence,
                     "authoring_attempt": attempt,
                     "drafts": drafts,
-                    "declarative_only": False,
+                    "declarative_only": True,
                 }
         if evidence is None:  # pragma: no cover - loop is statically non-empty
             raise RuntimeError("task authoring did not run")
@@ -2441,48 +2402,37 @@ class ModelCyclePorts:
             "authoring_attempt": authoring_attempts,
             "drafts": drafts,
             "authoring_errors": repair_feedback[:32],
-            "declarative_only": False,
+            "declarative_only": True,
         }
 
-    def _inspect_authored_tasks(
+    def _inspect_task_specs(
         self, evidence: Mapping[str, Any]
     ) -> tuple[list[Mapping[str, Any]], list[str]]:
-        artifact_id = evidence.get("workspace_artifact_id")
-        size = evidence.get("workspace_size_bytes")
-        if not isinstance(artifact_id, str) or not isinstance(size, int) or size <= 0:
-            return [], ["Judge did not freeze a task-authoring workspace"]
-        payload = self._artifacts.get(ArtifactRef("arm-workspace", artifact_id, size))
+        submission = evidence.get("submission")
+        raw = submission.get("task_specs") if isinstance(submission, Mapping) else None
+        if not isinstance(raw, list) or not raw:
+            return [], [
+                "submit payload task_specs is missing or empty: declare at least one task spec"
+            ]
+        builder = TaskPackBuilder(self._forge.registry, self._runner)
         drafts: list[Mapping[str, Any]] = []
         errors: list[str] = []
-        with tempfile.TemporaryDirectory(prefix="aegis-task-authoring-inspect-") as directory:
-            root = Path(directory).resolve(strict=True)
-            _extract_frozen_workspace(payload, root)
-            roots = _draft_taskpack_roots(root)
-            if not roots:
-                return [], ["no drafts/<task_id>/manifest.json was written"]
-            proposal_limit = int(
-                self._policy_value("task_proposals_per_cycle", _MAX_PROPOSALS)
-            )
-            for draft_root in roots[:proposal_limit]:
-                try:
-                    _repair_taskpack_content_hash(draft_root)
-                    pack = TaskPack.load(draft_root)
-                    report = validate_taskpack(pack, self._runner)
-                    item = {
-                        "task_id": pack.manifest.task_id,
-                        "path": draft_root.relative_to(root).as_posix(),
-                        "valid": report.valid,
-                        "reasons": list(report.reasons),
-                    }
-                    drafts.append(item)
-                    errors.extend(
-                        f"{pack.manifest.task_id}: {reason}" for reason in report.reasons
-                    )
-                except Exception as exc:
-                    relative = draft_root.relative_to(root).as_posix()
-                    reason = f"{relative}: {type(exc).__name__}: {exc}"[:2048]
-                    drafts.append({"task_id": draft_root.name, "path": relative, "valid": False, "reasons": [reason]})
-                    errors.append(reason)
+        for item in raw:
+            label = str(item.get("task_id")) if isinstance(item, Mapping) else "?"
+            try:
+                spec = TaskSpec.from_mapping(item)
+            except TaskSpecError as exc:
+                drafts.append({"task_id": label, "valid": False, "reasons": [str(exc)]})
+                errors.append(f"{label}: {exc}")
+                continue
+            try:
+                valid, reasons = builder.dry_run(spec)
+            except TaskSpecError as exc:
+                valid, reasons = False, (str(exc),)
+            except Exception as exc:
+                valid, reasons = False, (f"{type(exc).__name__}: {exc}",)
+            drafts.append({"task_id": spec.task_id, "valid": valid, "reasons": list(reasons)})
+            errors.extend(f"{spec.task_id}: {reason}" for reason in reasons)
         return drafts, errors
 
     # -- control-plane ports -------------------------------------------------
@@ -2653,77 +2603,86 @@ class ModelCyclePorts:
         self, snapshot: CurriculumSnapshot, forged_tasks: ArtifactRef
     ) -> Mapping[str, Any]:
         forged = _read(self._artifacts, forged_tasks)
-        artifact_id = forged.get("workspace_artifact_id")
-        size = forged.get("workspace_size_bytes")
-        if not isinstance(artifact_id, str) or not isinstance(size, int) or size <= 0:
-            raise ValueError("Judge task authoring produced no frozen workspace")
-        payload = self._artifacts.get(ArtifactRef("arm-workspace", artifact_id, size))
+        submission = forged.get("submission")
+        raw = submission.get("task_specs") if isinstance(submission, Mapping) else None
+        required_fresh = 1
+        if not isinstance(raw, list) or not raw:
+            return self._task_validation_result((), (), required_fresh, no_specs=True)
+        builder = TaskPackBuilder(self._forge.registry, self._runner)
         registered: list[Mapping[str, Any]] = []
         rejected: list[Mapping[str, Any]] = []
-        with tempfile.TemporaryDirectory(prefix="aegis-task-authoring-commit-") as directory:
-            root = Path(directory).resolve(strict=True)
-            _extract_frozen_workspace(payload, root)
-            draft_roots = _draft_taskpack_roots(root)
-            if not draft_roots:
-                return {
-                    "valid": True,
-                    "registered": [],
-                    "rejected": [],
-                    "declarative_only": False,
-                    "no_tasks_authored": True,
-                }
-            proposal_limit = int(
-                self._policy_value("task_proposals_per_cycle", _MAX_PROPOSALS)
-            )
-            for draft_root in draft_roots[:proposal_limit]:
-                try:
-                    _repair_taskpack_content_hash(draft_root)
-                    pack = TaskPack.load(draft_root)
-                    record = self._forge.forge(
-                        pack,
-                        self._runner,
-                        creator_generation=snapshot.cycle_number,
-                        source_spec_id=f"judge:{forged_tasks.artifact_id}",
-                        source_evidence_ids=tuple(
-                            sorted((forged_tasks.artifact_id, snapshot.snapshot_id))
-                        ),
-                        holdout_delay=int(self._policy_value("task_holdout_delay_cycles", self._holdout_delay)),
-                    )
-                    if record.status is DynamicTaskStatus.REJECTED:
-                        rejected.append(
-                            {
-                                "task_id": pack.manifest.task_id,
-                                "reasons": list(record.validation.reasons),
-                            }
-                        )
-                    else:
-                        registered.append(record.artifact.to_mapping())
-                except Exception as exc:
-                    rejected.append(
-                        {
-                            "task_id": draft_root.name,
-                            "reasons": [f"{type(exc).__name__}: {exc}"[:2048]],
-                        }
-                    )
-        if not registered:
-            reasons = "; ".join(
-                str(reason)
-                for item in rejected
-                for reason in cast(Sequence[object], item.get("reasons", ()))
-            )
-            return {
-                "valid": True,
-                "registered": [],
-                "rejected": rejected,
-                "declarative_only": False,
-                "no_tasks_authored": True,
-                "authoring_reasons": reasons[:4096],
-            }
+        proposal_limit = int(self._policy_value("task_proposals_per_cycle", _MAX_PROPOSALS))
+        for item in raw[:proposal_limit]:
+            try:
+                spec = TaskSpec.from_mapping(item)
+                record = builder.commit(
+                    spec,
+                    creator_generation=snapshot.cycle_number,
+                    source_spec_id=f"judge:{forged_tasks.artifact_id}",
+                    source_evidence_ids=(forged_tasks.artifact_id, snapshot.snapshot_id),
+                    holdout_delay=int(
+                        self._policy_value("task_holdout_delay_cycles", self._holdout_delay)
+                    ),
+                )
+            except TaskSpecError as exc:
+                label = str(item.get("task_id")) if isinstance(item, Mapping) else "?"
+                rejected.append({"task_id": label, "reasons": [str(exc)]})
+                continue
+            except Exception as exc:
+                label = str(item.get("task_id")) if isinstance(item, Mapping) else "?"
+                rejected.append(
+                    {"task_id": label, "reasons": [f"{type(exc).__name__}: {exc}"[:2048]]}
+                )
+                continue
+            if record.status is DynamicTaskStatus.REJECTED:
+                rejected.append(
+                    {
+                        "task_id": record.artifact.task_id,
+                        "reasons": list(record.validation.reasons),
+                    }
+                )
+            else:
+                registered.append(record.artifact.to_mapping())
+        return self._task_validation_result(
+            registered, rejected, required_fresh, no_specs=False
+        )
+
+    def _task_validation_result(
+        self,
+        registered: Sequence[Mapping[str, Any]],
+        rejected: Sequence[Mapping[str, Any]],
+        required_fresh_count: int,
+        *,
+        no_specs: bool,
+    ) -> Mapping[str, Any]:
+        """Classify the task-validation outcome without hiding supply failures."""
+        registered_count = len(registered)
+        rejected_count = len(rejected)
+        if registered_count:
+            status = "partially_registered" if rejected_count else "registered"
+            learning_outcome = "progressed"
+        elif no_specs:
+            status = "no_valid_task"
+            learning_outcome = "degraded"
+        else:
+            status = "no_valid_task"
+            learning_outcome = "blocked_by_supply"
         return {
-            "valid": True,
-            "registered": registered,
-            "rejected": rejected,
-            "declarative_only": False,
+            "valid": registered_count > 0,
+            "status": status,
+            "registered": list(registered),
+            "rejected": list(rejected),
+            "declarative_only": True,
+            "no_tasks_authored": registered_count == 0,
+            "registered_count": registered_count,
+            "rejected_count": rejected_count,
+            "required_fresh_count": required_fresh_count,
+            "learning_outcome": learning_outcome,
+            "remediation_obligations": (
+                ["forge at least one Fresh task in the next cycle"]
+                if registered_count == 0
+                else []
+            ),
         }
 
     def _candidate_gate_cohort(

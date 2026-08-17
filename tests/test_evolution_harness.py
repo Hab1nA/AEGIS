@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import json
 import shutil
 import subprocess
-import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -213,6 +211,36 @@ def forge_archive(root: Path, *, task_id: str = "dynamic-next") -> bytes:
     return canonical_taskpack_archive(TaskPack.load(copied))
 
 
+def task_spec_from_pack(task_id: str = "dynamic-next") -> dict[str, object]:
+    """Translate the first built-in pack into a declarative Judge task spec."""
+    source = sorted(
+        load_builtin_python_taskpacks(), key=lambda item: item.manifest.task_id
+    )[0]
+    return {
+        "task_id": task_id,
+        "prompt": (source.root / "prompt.md").read_text(encoding="utf-8"),
+        "public_cases": json.loads(
+            (source.root / "public" / "cases.json").read_text(encoding="utf-8")
+        ),
+        "public_test": (source.root / "public" / "test_solution.py").read_text(
+            encoding="utf-8"
+        ),
+        "hidden_cases": json.loads(
+            (source.root / "hidden" / "cases.json").read_text(encoding="utf-8")
+        ),
+        "reference_solution": (source.root / "reference" / "solution.py").read_text(
+            encoding="utf-8"
+        ),
+        "defect_solution": (source.root / "defect" / "solution.py").read_text(
+            encoding="utf-8"
+        ),
+        "mutants": [
+            {"name": path.parent.name, "solution": path.read_text(encoding="utf-8")}
+            for path in sorted((source.root / "mutants").glob("*/solution.py"))
+        ],
+    }
+
+
 def role_configs() -> dict[str, RoleConfig]:
     return {
         "warrior": RoleConfig("w", 0.60, 1024),
@@ -221,7 +249,7 @@ def role_configs() -> dict[str, RoleConfig]:
     }
 
 
-def plain_actions(archive: bytes) -> list[dict[str, object]]:
+def plain_actions(archive: bytes | None = None) -> list[dict[str, object]]:
     actions = [
         submit(
             "solved",
@@ -245,24 +273,7 @@ def plain_actions(archive: bytes) -> list[dict[str, object]]:
         submit("reflect-prosecutor", {"claims": ["watch token drift"]}),
         submit("council", {"proposal": None, "agenda": ["x"]}),
     ]
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as source:
-        for member in source.getmembers():
-            if not member.isfile():
-                continue
-            extracted = source.extractfile(member)
-            assert extracted is not None
-            actions.append(
-                {
-                    "action": "workspace.write",
-                    "arguments": {
-                        "path": f"drafts/dynamic-next/{member.name}",
-                        "content_base64": base64.b64encode(extracted.read()).decode(
-                            "ascii"
-                        ),
-                    },
-                }
-            )
-    actions.append(submit("authored", {"draft_paths": ["drafts/dynamic-next"]}))
+    actions.append(submit("forged", {"task_specs": [task_spec_from_pack()]}))
     return actions
 
 

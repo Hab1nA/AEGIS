@@ -456,6 +456,7 @@ class EvolutionCycleController:
                 self._artifact_mapping(candidate_evaluation),
                 self._artifact_mapping(qualification),
                 self._artifact_mapping(activation),
+                self._artifact_mapping(task_validation),
             )
             summary = self._record(
                 "cycle-summary",
