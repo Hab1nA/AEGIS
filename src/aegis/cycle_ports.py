@@ -2351,15 +2351,13 @@ class ModelCyclePorts:
                     "template under templates/example-task/ for the expected structure and "
                     "semantics; you may run scratch checks with sandbox.exec, but the "
                     "authoritative deliverable is the task_specs array in your submit "
-                    "payload."
+                    "payload. Keep the spec compact: at most 6 cases per suite, one "
+                    "mutant, and each source file under 40 lines. Adapt the template to "
+                    "the target function; do not restate unrelated context. Produce the "
+                    "spec directly in your final message; do not narrate your plan."
                 ),
                 context={
                     "snapshot": _truncate(snapshot.to_mapping()),
-                    "submission": _brief(self._artifacts, submission),
-                    "judge_review": _brief(self._artifacts, judge_review),
-                    "quality_lock": _brief(self._artifacts, quality_lock),
-                    "prosecutor_audit": _brief(self._artifacts, prosecutor_audit),
-                    "council": _brief(self._artifacts, council),
                     "attempt": attempt,
                     "previous_validation_errors": repair_feedback[:32],
                     "taskpack_contract": {
