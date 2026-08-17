@@ -296,6 +296,21 @@ class TaskSpec:
             raise TaskSpecError("defect_clause_ids must trace the defect to at least one clause")
         _validate_case_clauses(public_cases, declared, "public_cases")
         _validate_case_clauses(hidden_cases, declared, "hidden_cases")
+        referenced: set[str] = set()
+        for cases_file in (public_cases, hidden_cases):
+            for case in cases_file.get("cases", []):
+                if isinstance(case, Mapping):
+                    referenced.update(
+                        str(item)
+                        for item in case.get("clause_ids", [])
+                        if isinstance(item, str)
+                    )
+        unreferenced = sorted(declared - referenced)
+        if unreferenced:
+            raise TaskSpecError(
+                "clause declared but never referenced by any public or hidden case: "
+                + ", ".join(unreferenced)
+            )
         hidden_covered: set[str] = set()
         for case in hidden_cases.get("cases", []):
             if isinstance(case, Mapping):

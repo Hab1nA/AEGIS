@@ -137,6 +137,20 @@ class TaskPackBuilderTests(unittest.TestCase):
         with self.assertRaises(TaskSpecError):
             TaskSpec.from_mapping(spec)
 
+    def test_spec_rejects_declared_but_unreferenced_clause(self) -> None:
+        spec = sample_spec()
+        spec["clauses"].append(
+            {
+                "clause_id": "CONTRACT.UNUSED",
+                "statement": "never exercised by any case",
+                "input_partition": "unused",
+                "expected_outcome": "return",
+                "security_relevant": False,
+            }
+        )
+        with self.assertRaisesRegex(TaskSpecError, "never referenced"):
+            TaskSpec.from_mapping(spec)
+
     def test_spec_clause_summary_reports_full_coverage(self) -> None:
         spec = TaskSpec.from_mapping(sample_spec())
         summary = spec.clause_summary()
