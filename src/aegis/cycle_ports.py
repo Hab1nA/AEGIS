@@ -305,8 +305,10 @@ def _read(artifacts: ContentAddressedArtifactStore, ref: ArtifactRef) -> Mapping
     return cast(Mapping[str, Any], _strip_forbidden(payload))
 
 
-def _ref_from_artifact_id(artifact_id: str) -> ArtifactRef | None:
-    """Best-effort typed content address -> ArtifactRef (size is not needed to read)."""
+def _ref_from_artifact_id(
+    artifact_id: str, artifacts: ContentAddressedArtifactStore
+) -> ArtifactRef | None:
+    """Typed content address -> ArtifactRef, resolving the real size from CAS."""
     if not isinstance(artifact_id, str) or "-sha256:" not in artifact_id:
         return None
     kind = artifact_id.split("-sha256:", 1)[0]
@@ -314,8 +316,9 @@ def _ref_from_artifact_id(artifact_id: str) -> ArtifactRef | None:
     if len(digest) != 64:
         return None
     try:
-        return ArtifactRef(kind, artifact_id, 0)
-    except ValueError:
+        size = (artifacts.root / kind / digest).stat().st_size
+        return ArtifactRef(kind, artifact_id, size)
+    except (ValueError, OSError):
         return None
 
 
@@ -408,10 +411,18 @@ def _observation_receipts(observations: Sequence[Any]) -> list[Mapping[str, Any]
         outcome = "accepted" if accepted is not False else "rejected"
         exit_code = result.get("exit_code")
         summary_parts: list[str] = []
-        for key in ("message", "output", "stdout", "error"):
+        for key in ("message", "output", "stdout", "error", "reason"):
             value = result.get(key)
             if isinstance(value, str) and value.strip():
                 summary_parts.append(f"{key}={value.strip()[:512]}")
+        nested_error = result.get("error")
+        if isinstance(nested_error, Mapping):
+            error_type = nested_error.get("type")
+            error_message = nested_error.get("message")
+            if isinstance(error_type, str) and error_type.strip():
+                summary_parts.append(f"error_type={error_type.strip()[:256]}")
+            if isinstance(error_message, str) and error_message.strip():
+                summary_parts.append(f"error_message={error_message.strip()[:512]}")
         observed_markers = {"accepted", "exit_code", "output_digest", "action_receipt", "elapsed_seconds"}
         if observed_markers & set(result):
             evidence_kind = EvidenceKind.OBSERVED
@@ -5492,7 +5503,8 @@ def run_v2_cycle(
     was_retry = state is CycleState.FAILED
     resume_evidence: dict[str, ArtifactRef] = {}
     checkpoint_campaign = f"{campaign_id}/stage-checkpoints"
-    if was_retry and isinstance(auxiliary_store, EventStore):
+    resume_needed = state not in {CycleState.CREATED, CycleState.COMPLETED}
+    if resume_needed and isinstance(auxiliary_store, EventStore):
         for event in auxiliary_store.read(checkpoint_campaign):
             if event.event_type != "stage_checkpoint_v2":
                 continue
@@ -5503,7 +5515,7 @@ def run_v2_cycle(
             artifact_id = payload.get("artifact_id")
             if not isinstance(stage, str) or not isinstance(artifact_id, str):
                 continue
-            ref = _ref_from_artifact_id(artifact_id)
+            ref = _ref_from_artifact_id(artifact_id, artifacts)
             if ref is not None:
                 resume_evidence[stage] = ref
     try:
@@ -5661,6 +5673,7 @@ def run_v2_cycle(
                         target_generation=target,
                         cohort_limit=cohort_limit,
                         retry=was_retry,
+                        resume_evidence=resume_evidence or None,
                     )
                 except BaseException as retry_exc:
                     cycle_error = f"{cycle_error} | budget-repair retry failed: {retry_exc}"

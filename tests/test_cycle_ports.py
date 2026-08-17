@@ -669,6 +669,74 @@ class CyclePortsTests(unittest.TestCase):
                 dynamic.close()
                 store.close()
 
+    def test_interrupted_cycle_resumes_from_stage_checkpoints(self) -> None:
+        """A crashed (non-FAILED) cycle resumes from stage checkpoints on restart."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = EventStore(root / "events.sqlite3")
+            dynamic = DynamicTaskRegistry(root / "tasks.sqlite3")
+            runner = AnchorRunner()
+            seeder = GenesisSeeder(dynamic, TaskForge(dynamic))
+            seeder.seed(runner)
+            curriculum = CurriculumRegistry(store, "cli")
+            roles = RoleRegistry(store, "cli")
+            archive = forge_archive(root)
+            full_actions = gateway_actions(archive)
+            common = dict(
+                sandbox=WritingFakeSandboxBackend(),
+                research=FakeResearch(),
+                knowledge=None,
+                skills=None,
+                pdf_extractor=None,
+                role_configs=role_configs(),
+                limits=RuntimeLimits(max_steps=20),
+                artifacts=ContentAddressedArtifactStore(root / "artifacts"),
+                dynamic=dynamic,
+                forge=TaskForge(dynamic),
+                runner=runner,
+                curriculum=curriculum,
+                roles=roles,
+                data_dir=root,
+                campaign_id="cli",
+            )
+            try:
+                # Attempt 1: the scripted queue runs dry right after judge review,
+                # leaving the cycle mid-flight (interrupted, not failed).
+                with self.assertRaises(IndexError):
+                    run_v2_cycle(
+                        gateway=FakeGateway(list(full_actions[:2])), **common
+                    )
+                self.assertIsNot(curriculum.projection.cycle_state, CycleState.COMPLETED)
+                checkpoints = {
+                    event.payload["stage"]
+                    for event in store.read("cli/stage-checkpoints")
+                    if event.event_type == "stage_checkpoint_v2"
+                }
+                self.assertIn("submission", checkpoints)
+                self.assertIn("judge-review", checkpoints)
+                # Attempt 2 restarts from the checkpoints: warrior and judge
+                # actions must remain unconsumed.
+                gateway = FakeGateway(list(full_actions[2:]))
+                result = run_v2_cycle(gateway=gateway, **common)
+                self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
+                self.assertTrue(
+                    result.cycle_summary.artifact_id.startswith("cycle-summary-sha256:")
+                )
+                # The second run resumed the frozen stages, so every scripted
+                # action was consumed and the first model call is the audit,
+                # not the Warrior solve or Judge review.
+                self.assertEqual(gateway.actions, [])
+                self.assertTrue(
+                    any(
+                        "Audit token consumption" in message.content
+                        for message in gateway.requests[0].messages
+                    ),
+                    "the first resumed model call must be the Prosecutor audit",
+                )
+            finally:
+                dynamic.close()
+                store.close()
+
     def test_second_cycle_records_paired_attribution_and_keeps_provisional_roles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
