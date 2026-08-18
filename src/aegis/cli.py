@@ -26,6 +26,7 @@ from aegis.dynamic_tasks import (
     GenesisSeeder,
     TaskForge,
 )
+from aegis.envfile import load_aegis_env
 from aegis.event_store import EventStore
 from aegis.evolution.harness_backend import HarnessBackend, WslHarnessBackend
 from aegis.evolution.registry import EvolutionRegistry
@@ -957,6 +958,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     global _DATA_DIR_OVERRIDE
+    # Project-scoped relay config (.aegis.env next to the working directory);
+    # never touches machine/user-wide environment, so other tools are unaffected.
+    load_aegis_env()
     args = build_parser().parse_args(argv)
     _DATA_DIR_OVERRIDE = args.data_dir.expanduser().resolve() if args.data_dir is not None else None
     try:

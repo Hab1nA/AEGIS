@@ -88,8 +88,10 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 
 - `AEGIS_OPENAI_BASE_URL=https://opencode.ai/zen/go/v1`（当前默认 relay；
   `https://cf.api.fan/v1` 曾可用，其旧 key 已失效，不再作为默认）
-- `AEGIS_OPENAI_API_KEY=<sk-...>`（必需；环境变量须在 Windows 用户级
-  持久化，或在启动进程前显式 `$env:AEGIS_OPENAI_API_KEY=...` 注入）
+- `AEGIS_OPENAI_API_KEY=<sk-...>`（必需）。配置采用**项目级**方式：在
+  仓库根目录创建 git-ignored 的 `.aegis.env`（键值即上述两个变量名），
+  AEGIS CLI 启动时仅从该文件加载；不写入 Windows 用户/机器级环境变量，
+  因此不影响 Codex 等其它软件。显式 `$env:AEGIS_OPENAI_*` 仍优先于文件。
 - relay 规则：`text.format={"type":"json_object"}` 要求输入消息中出现
   “json” 字样，否则返回 400 `invalid_request_error`
 - `AEGIS_OPENAI_USER_AGENT`（可选）：Cloudflare 前置 relay 会按浏览器签名

@@ -23,17 +23,21 @@ python -m pip install -e ".[dev]"
 python -m pytest
 ```
 
-Set secrets only in the host process; they are never copied into WSL:
+Set secrets only in the host process; they are never copied into WSL.
+Project-scoped config: create a git-ignored `.aegis.env` in the repository root
+(loaded only by the AEGIS CLI, never by Codex or other tools):
 
 ```powershell
-$env:AEGIS_OPENAI_API_KEY = "..."
-$env:AEGIS_OPENAI_BASE_URL = "https://relay.example/v1"
-$env:AEGIS_OPENAI_PROTOCOL = "auto"
+AEGIS_OPENAI_API_KEY = "sk-..."
+AEGIS_OPENAI_BASE_URL = "https://opencode.ai/zen/go/v1"
 # Prefer response_format {"type":"json_object"} for structured role requests
 # (DeepSeek JSON Output mode; see docs/autonomous-evolution.md).
-$env:AEGIS_OPENAI_STRUCTURED_FORMAT = "json_object"
+AEGIS_OPENAI_STRUCTURED_FORMAT = "json_object"
 # Hidden-reasoning relays can be slow; give each model call a generous deadline.
-$env:AEGIS_OPENAI_TIMEOUT_SECONDS = "3600"
+AEGIS_OPENAI_TIMEOUT_SECONDS = "3600"
+```
+
+An explicit `$env:AEGIS_OPENAI_*` set in the host process still overrides the file.
 # Optional model-gateway proxy; empty means direct (system proxy is bypassed).
 $env:AEGIS_OPENAI_HTTPS_PROXY = ""
 $env:AEGIS_SEARCH_BASE_URL = "http://127.0.0.1:8888"
