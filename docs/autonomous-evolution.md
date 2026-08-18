@@ -86,9 +86,12 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
 
 **网关凭据与协议要求（deepseek-v4-flash）**
 
-- `AEGIS_OPENAI_BASE_URL=https://cf.api.fan/v1`（或
-  `https://opencode.ai/zen/go/v1`，均验证可用）
-- `AEGIS_OPENAI_API_KEY=<sk-...>`（必需）
+- `AEGIS_OPENAI_BASE_URL=https://opencode.ai/zen/go/v1`（当前默认 relay；
+  `https://cf.api.fan/v1` 曾可用，其旧 key 已失效，不再作为默认）
+- `AEGIS_OPENAI_API_KEY=<sk-...>`（必需；环境变量须在 Windows 用户级
+  持久化，或在启动进程前显式 `$env:AEGIS_OPENAI_API_KEY=...` 注入）
+- relay 规则：`text.format={"type":"json_object"}` 要求输入消息中出现
+  “json” 字样，否则返回 400 `invalid_request_error`
 - `AEGIS_OPENAI_USER_AGENT`（可选）：Cloudflare 前置 relay 会按浏览器签名
   拦截默认 UA，网关默认发送 Chrome 风格 UA，可经该变量覆盖
 - 协议固定为官方原生 Responses API：网关只调用 `{base_url}/responses`，
@@ -223,7 +226,7 @@ base_url `https://opencode.ai/zen/go/v1`、WSL 沙箱与 `--no-candidate-eval`
 
 ### Judge 证据链全真验收记录（2026-08-17/18，campaign `e2e-judge-20260817b`）
 
-采用 `deepseek-v4-flash`（`reasoning_effort=max`）、base_url `https://cf.api.fan/v1`、
+采用 `deepseek-v4-flash`（`reasoning_effort=max`）、base_url `https://cf.api.fan/v1`（该 relay 现已切换为 `https://opencode.ai/zen/go/v1`）、
 WSL 沙箱、`max_agent_steps=24`（运行时 `role_max_steps=24`，与 campaign 一致）跑
 完整一轮 `evolution-cycle --run`（候选评测开启，未使用 `--no-candidate-eval`），
 78 次网关调用，`state: completed`：
