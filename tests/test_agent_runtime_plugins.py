@@ -5,10 +5,10 @@ from typing import Any
 
 import pytest
 
-from aegis.agent_runtime import Action, ActionError, RoleAgentRuntime, RuntimeLimits, ToolDispatcher
+from aegis.agent_runtime import Action, ActionError, RoleAgentRuntime, RuntimeLimits, SandboxPluginExecutor, ToolDispatcher
 from aegis.gateway.protocols import Role
 from aegis.gateway.types import GatewayRequest, GatewayResponse, TokenUsage
-from aegis.models import Role as GenerationRole
+from aegis.models import Role as GenerationRole, canonical_json
 from aegis.plugins import (
     ActionSpec,
     EffectClass,
@@ -17,12 +17,14 @@ from aegis.plugins import (
     PluginCapabilities,
     PluginManifest,
     PluginPolicy,
+    PluginSource,
     ToolBroker,
     WorkspaceGrant,
     WorkspaceMode,
 )
 from aegis.roles import GenerationBundle, RoleGeneration
 from aegis.sandbox.fake import FakeSandboxBackend
+from aegis.sandbox.types import CommandResult, CommandSpec
 
 INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",

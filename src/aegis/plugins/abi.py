@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import re
 from dataclasses import dataclass
@@ -17,6 +19,9 @@ _PLUGIN_ID = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?/[a-z0-9][a-z0-9
 _ACTION = re.compile(r"[a-z][a-z0-9_]{0,63}(?:\.[a-z][a-z0-9_]{0,63})+")
 _ENTRY = re.compile(r"[^\x00\s]{1,1024}")
 _SECRET = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
+_MAX_SOURCE_BYTES = 64 * 1024
+_MAX_SOURCES = 8
+_MAX_SOURCES_TOTAL_BYTES = 192 * 1024
 
 
 def _digest(value: object, name: str) -> str:
@@ -191,6 +196,45 @@ class PluginCapabilities:
 
 
 @dataclass(frozen=True, slots=True)
+class PluginSource:
+    """One Python source file embedded in a source-driven plugin manifest.
+
+    Source plugins carry their code inside the content-addressed manifest so
+    the manifest digest covers the code itself; the executor stages these
+    files into the sandbox and dispatches declared actions to them.
+    """
+
+    path: str
+    content_base64: str
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        _safe_relative(self.path, "plugin source path")
+        if not self.path.endswith(".py"):
+            raise ValueError("plugin source path must end with .py")
+        if not isinstance(self.content_base64, str):
+            raise TypeError("plugin source content_base64 must be a string")
+        try:
+            content = base64.b64decode(self.content_base64.encode("ascii"), validate=True)
+        except (ValueError, UnicodeEncodeError, binascii.Error) as exc:
+            raise ValueError("plugin source content_base64 is invalid") from exc
+        if not content:
+            raise ValueError("plugin source content must not be empty")
+        if len(content) > _MAX_SOURCE_BYTES:
+            raise ValueError("plugin source content exceeds the 64KiB per-file limit")
+        _digest(self.content_sha256, "plugin source content_sha256")
+        if self.content_sha256 != hashlib.sha256(content).hexdigest():
+            raise ValueError("plugin source content_sha256 does not match its content")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "content_base64": self.content_base64,
+            "content_sha256": self.content_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PluginManifest:
     artifact_id: str
     plugin_id: str
@@ -202,6 +246,7 @@ class PluginManifest:
     actions: tuple[ActionSpec, ...]
     capabilities: PluginCapabilities
     provenance_sha256: str
+    sources: tuple[PluginSource, ...] = ()
 
     def __post_init__(self) -> None:
         _artifact_id(self.artifact_id, "artifact_id")
@@ -211,12 +256,36 @@ class PluginManifest:
             raise ValueError("version must use strict major.minor.patch syntax")
         if isinstance(self.abi_version, bool) or not isinstance(self.abi_version, int) or not 1 <= self.abi_version <= 1000:
             raise ValueError("abi_version must be a positive bounded integer")
-        if not isinstance(self.image_digest, str) or _OCI_DIGEST.fullmatch(self.image_digest) is None:
+        if not isinstance(self.image_digest, str):
+            raise ValueError("image_digest must be a string")
+        if self.sources:
+            if self.image_digest != "":
+                raise ValueError("source plugins must leave image_digest empty")
+        elif _OCI_DIGEST.fullmatch(self.image_digest) is None:
             raise ValueError("image_digest must be pinned by sha256")
+        if len(self.sources) > _MAX_SOURCES:
+            raise ValueError("source plugins may declare at most 8 source files")
+        if len({item.path for item in self.sources}) != len(self.sources):
+            raise ValueError("plugin source paths must be unique")
+        if (
+            sum(
+                len(base64.b64decode(item.content_base64.encode("ascii"), validate=True))
+                for item in self.sources
+            )
+            > _MAX_SOURCES_TOTAL_BYTES
+        ):
+            raise ValueError("plugin sources exceed the 192KiB total size limit")
         if not isinstance(self.entrypoint, tuple) or not 1 <= len(self.entrypoint) <= 32 or any(
             not isinstance(item, str) or _ENTRY.fullmatch(item) is None for item in self.entrypoint
         ):
             raise ValueError("entrypoint must be a bounded argv tuple")
+        if self.sources:
+            if len(self.entrypoint) != 2 or self.entrypoint[0] != "python3":
+                raise ValueError(
+                    "source plugins must use entrypoint ('python3', '<source path>')"
+                )
+            if self.entrypoint[1] not in {item.path for item in self.sources}:
+                raise ValueError("source plugin entrypoint must name a declared source file")
         if not isinstance(self.roles, tuple) or not self.roles or any(not isinstance(item, Role) for item in self.roles):
             raise TypeError("roles must be a non-empty tuple of Role values")
         if self.roles != tuple(role for role in Role if role in self.roles):
@@ -242,6 +311,7 @@ class PluginManifest:
             "actions": [item.to_dict() for item in self.actions],
             "capabilities": self.capabilities.to_dict(),
             "provenance_sha256": self.provenance_sha256,
+            "sources": [item.to_dict() for item in self.sources],
         }
 
     def compute_digest(self) -> str:
@@ -262,9 +332,18 @@ class PluginManifest:
             "actions": [item.to_dict() for item in values["actions"]],
             "capabilities": values["capabilities"].to_dict(),
             "provenance_sha256": values["provenance_sha256"],
+            "sources": [
+                item.to_dict() if isinstance(item, PluginSource) else dict(item)
+                for item in values.get("sources", ())
+            ],
         }
         digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
-        return cls(artifact_id="sha256:" + digest, **values)
+        create_values = dict(values)
+        create_values["sources"] = tuple(
+            item if isinstance(item, PluginSource) else PluginSource(**item)
+            for item in create_values.get("sources", ())
+        )
+        return cls(artifact_id="sha256:" + digest, **create_values)
 
 
 @dataclass(frozen=True, slots=True)

@@ -298,7 +298,13 @@ def validate_plugin_content(
     """Validate a plugin manifest and bind it to one role slot.
 
     Plugin candidates are sandbox-executed tools only: they may not declare
-    EXTERNAL effects, install permissions, or require a network.
+    EXTERNAL effects, install permissions, or require a network.  A plugin may
+    either reference a pinned OCI image or embed its Python sources directly
+    (``sources`` with base64 content, empty ``image_digest``); source plugins
+    must use entrypoint ``("python3", "<source path>")`` and expose a
+    ``handle(action, arguments)`` entry function in that file.  Actions run
+    inside the sandbox with the JSON arguments on stdin and one JSON object
+    printed on stdout.
     """
     if not isinstance(value, Mapping):
         raise EvolutionSurfaceError("plugin content must be an object")
@@ -333,8 +339,12 @@ def _plugin_manifest_from_mapping(value: Mapping[str, Any]) -> PluginManifest:
         "capabilities",
         "provenance_sha256",
     }
-    if set(value) not in (expected, expected | {"artifact_id"}):
-        raise ValueError("plugin manifest has missing or unknown fields")
+    optional = {"artifact_id", "sources"}
+    unknown = set(value) - expected - optional
+    if unknown:
+        raise ValueError(f"plugin manifest has unknown fields: {sorted(unknown)}")
+    if not expected <= set(value):
+        raise ValueError("plugin manifest has missing fields")
     roles = tuple(Role(item) for item in value["roles"])
     actions: list[ActionSpec] = []
     for raw in value["actions"]:
@@ -366,6 +376,9 @@ def _plugin_manifest_from_mapping(value: Mapping[str, Any]) -> PluginManifest:
         max_memory_bytes=capabilities_raw.get("max_memory_bytes", 512 * 1024 * 1024),
         max_pids=capabilities_raw.get("max_pids", 64),
     )
+    sources_raw = value.get("sources", [])
+    if not isinstance(sources_raw, list):
+        raise ValueError("plugin sources must be an array")
     manifest = PluginManifest.create(
         plugin_id=value["plugin_id"],
         version=value["version"],
@@ -376,6 +389,7 @@ def _plugin_manifest_from_mapping(value: Mapping[str, Any]) -> PluginManifest:
         actions=tuple(actions),
         capabilities=capabilities,
         provenance_sha256=value["provenance_sha256"],
+        sources=tuple(dict(item) for item in sources_raw),
     )
     declared = value.get("artifact_id")
     if declared is not None:
