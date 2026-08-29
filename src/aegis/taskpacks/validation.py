@@ -15,6 +15,7 @@ class ExecutionResult:
     exit_code: int
     timed_out: bool = False
     output_digest: str = ""
+    failure_summary: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.tests_run < 0:
@@ -38,6 +39,13 @@ class TaskPackValidation:
     mutant_hidden: tuple[ExecutionResult, ...]
 
 
+def _failure_detail(result: ExecutionResult, label: str) -> str:
+    """Render bounded per-case failure names into a validation reason."""
+    if not result.failure_summary:
+        return ""
+    return f" [{label}: {'; '.join(result.failure_summary[:5])}]"
+
+
 def validate_taskpack(pack: TaskPack, runner: TaskPackRunner) -> TaskPackValidation:
     """Require a solvable reference and hidden tests that kill defect/mutants."""
     reference_public = runner.run(pack, pack.manifest.reference_dir, "public")
@@ -47,7 +55,13 @@ def validate_taskpack(pack: TaskPack, runner: TaskPackRunner) -> TaskPackValidat
     mutant_hidden = tuple(runner.run(pack, mutant, "hidden") for mutant in pack.manifest.mutant_dirs)
     reasons: list[str] = []
     if not reference_public.passed or not reference_hidden.passed:
-        reasons.append("reference implementation does not pass all suites")
+        detail = _failure_detail(
+            reference_public if not reference_public.passed else reference_hidden,
+            "reference public" if not reference_public.passed else "reference hidden",
+        )
+        reasons.append(
+            "reference implementation does not pass all suites" + detail
+        )
     if reference_public.tests_run == 0 or reference_hidden.tests_run == 0:
         reasons.append("public and hidden suites must each execute at least one test")
     if defect_public.passed and defect_hidden.passed:

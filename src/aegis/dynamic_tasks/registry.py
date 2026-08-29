@@ -425,6 +425,36 @@ class DynamicTaskRegistry:
                 self._connection.execute("ROLLBACK")
                 raise
 
+    def _anchor_members(
+        self, target_generation: int, *, known: set[str]
+    ) -> list[CohortMember]:
+        with self._lock:
+            records = self._replay().values()
+
+        def _shuffle(anchor: CohortMember) -> bytes:
+            return hashlib.sha256(
+                f"dynamic cohort v1\0{target_generation}\0{anchor.artifact_id}".encode("ascii")
+            ).digest()
+
+        return sorted(
+            (
+                CohortMember(
+                    record.artifact.artifact_id,
+                    CohortTier.HALL_OF_FAME,
+                    record.creator_generation,
+                    record.revision,
+                )
+                for record in records
+                if (
+                    record.origin is DynamicTaskOrigin.FIXED_ANCHOR
+                    and record.status is DynamicTaskStatus.FIXED_ANCHOR
+                    and record.creator_generation < target_generation
+                    and record.artifact.artifact_id not in known
+                )
+            ),
+            key=_shuffle,
+        )
+
     def select_dynamic_cohort(
         self, target_generation: int, *, limit: int | None = None
     ) -> DynamicTaskCohort:
@@ -434,11 +464,17 @@ class DynamicTaskRegistry:
             raise ValueError("limit must be a positive integer or None")
         with self._lock:
             records = self._replay().values()
-        members: list[CohortMember] = []
-        # Dynamic tasks are the only long-term curriculum source.  Fixed anchors
-        # exist solely to cold-start the very first cycles while the Judge has
-        # not yet forged and validated any dynamic cohort.  Once any eligible
-        # dynamic task exists, anchors must not compete with it.
+
+        def _shuffle(member: CohortMember) -> bytes:
+            return hashlib.sha256(
+                f"dynamic cohort v1\0{target_generation}\0{member.artifact_id}".encode("ascii")
+            ).digest()
+
+        dynamic_members: list[CohortMember] = []
+        # Dynamic tasks are the long-term curriculum source.  Fresh holdout
+        # tasks are the newest Judge-authored curriculum: schedule them first
+        # so a forged task is adopted by the very next cycle instead of losing
+        # a hash lottery against veteran regression tasks.
         for record in records:
             if (
                 record.origin is not DynamicTaskOrigin.DYNAMIC
@@ -454,7 +490,7 @@ class DynamicTaskRegistry:
                 tier = CohortTier.FRESH_HOLDOUT
             else:
                 continue
-            members.append(
+            dynamic_members.append(
                 CohortMember(
                     record.artifact.artifact_id,
                     tier,
@@ -462,28 +498,29 @@ class DynamicTaskRegistry:
                     record.revision,
                 )
             )
-        if not members:
-            for record in records:
-                if (
-                    record.origin is not DynamicTaskOrigin.FIXED_ANCHOR
-                    or record.status is not DynamicTaskStatus.FIXED_ANCHOR
-                    or record.creator_generation >= target_generation
-                ):
-                    continue
-                members.append(
-                    CohortMember(
-                        record.artifact.artifact_id,
-                        CohortTier.HALL_OF_FAME,
-                        record.creator_generation,
-                        record.revision,
-                    )
-                )
-        members.sort(
-            key=lambda member: hashlib.sha256(
-                f"dynamic cohort v1\0{target_generation}\0{member.artifact_id}".encode("ascii")
-            ).digest()
+        fresh = sorted(
+            (member for member in dynamic_members if member.tier is CohortTier.FRESH_HOLDOUT),
+            key=_shuffle,
         )
-        selected = tuple(members if limit is None else members[:limit])
+        regression = sorted(
+            (member for member in dynamic_members if member.tier is not CohortTier.FRESH_HOLDOUT),
+            key=_shuffle,
+        )
+        members = fresh + regression
+        # Anchors retire gradually: they only backfill the slots the dynamic
+        # bank cannot fill yet, instead of vanishing the moment one dynamic
+        # task exists (which would collapse the cohort to a single task).
+        if limit is None:
+            if not members:
+                members = self._anchor_members(target_generation, known=set())
+        else:
+            members = members[:limit]
+            if len(members) < limit:
+                members = members + self._anchor_members(
+                    target_generation,
+                    known={member.artifact_id for member in members},
+                )[: limit - len(members)]
+        selected = tuple(members)
         return DynamicTaskCohort.create(target_generation, selected)
 
     def archive(self, artifact_id: str) -> bytes:

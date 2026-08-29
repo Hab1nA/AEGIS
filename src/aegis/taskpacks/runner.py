@@ -96,6 +96,12 @@ class SandboxTaskPackRunner:
                     )
                 ).encode("utf-8")
             ).hexdigest()
+            failures = sealed.failures if isinstance(sealed.failures, list) else []
+            summary = tuple(
+                item[:200]
+                for item in failures[:8]
+                if isinstance(item, str) and item.strip()
+            )
             return ExecutionResult(
                 passed=(
                     not sealed.timed_out and not sealed.safety_violations and sealed.passed == sealed.total
@@ -104,6 +110,7 @@ class SandboxTaskPackRunner:
                 exit_code=0 if sealed.passed == sealed.total and not sealed.safety_violations else 1,
                 timed_out=sealed.timed_out,
                 output_digest=output_digest,
+                failure_summary=summary,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             raise RuntimeError(

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from aegis.dynamic_tasks.forge import artifact_from_pack, canonical_taskpack_archive
-from aegis.dynamic_tasks.models import DynamicTaskOrigin, DynamicTaskRecord
+from aegis.dynamic_tasks.models import DynamicTaskOrigin, DynamicTaskRecord, DynamicTaskStatus
 from aegis.dynamic_tasks.registry import DynamicTaskRegistry
 from aegis.taskpacks.builtin import load_builtin_python_taskpacks
 from aegis.taskpacks.manifest import TaskPack, compute_tree_hash
@@ -144,7 +144,10 @@ class TaskClauseSpec:
 
     def __post_init__(self) -> None:
         if not isinstance(self.clause_id, str) or _CLAUSE_ID_RE.fullmatch(self.clause_id) is None:
-            raise TaskSpecError("clause_id must match ^[A-Z][A-Z0-9._-]{0,63}$")
+            raise TaskSpecError(
+                "clause_id must match ^[A-Z][A-Z0-9._-]{0,63}$ (uppercase); got "
+                f"{self.clause_id!r}"
+            )
         if not isinstance(self.statement, str) or not self.statement.strip():
             raise TaskSpecError("clause statement must be non-empty")
         if len(self.statement.encode("utf-8")) > 512:
@@ -277,7 +280,10 @@ class TaskSpec:
             raise TaskSpecError(f"task spec fields invalid: missing={missing} unknown={unknown}")
         task_id = data["task_id"]
         if not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id):
-            raise TaskSpecError("task_id must match ^[a-z][a-z0-9-]{1,127}$")
+            raise TaskSpecError(
+                "task_id must match ^[a-z][a-z0-9-]{1,127}$ (lowercase, hyphenated); got "
+                f"{task_id!r}"
+            )
         prompt = _bounded_text(data, "prompt", TASK_SPEC_MAX_PROMPT_BYTES)
         public_test = _python_source(data["public_test"], task_id, "public_test")
         reference = _python_source(data["reference_solution"], task_id, "reference_solution")
@@ -331,7 +337,10 @@ class TaskSpec:
                 raise TaskSpecError("mutant entries must contain exactly name, solution and clause_ids")
             name = raw["name"]
             if not isinstance(name, str) or not _MUTANT_NAME_RE.fullmatch(name):
-                raise TaskSpecError("mutant name must match ^[a-z][a-z0-9_]{0,63}$")
+                raise TaskSpecError(
+                    "mutant name must match ^[a-z][a-z0-9_]{0,63}$ (lowercase with "
+                    f"underscores, no hyphens); got {name!r}"
+                )
             solution = _python_source(raw["solution"], task_id, f"mutant:{name}")
             mutant_clauses = _clause_list(raw["clause_ids"], f"mutant:{name}:clause_ids", declared)
             if not mutant_clauses:
@@ -379,9 +388,18 @@ class TaskPackBuilder:
         self.runner = runner
 
     def reserved_task_ids(self) -> frozenset[str]:
-        """Every task id that a new spec must not reuse."""
+        """Every task id that a new spec must not reuse.
+
+        REJECTED records do not reserve their slug: a corrected resubmission
+        of the same task_id carries a different content hash and therefore a
+        fresh artifact identity, so validation failures stay repairable.
+        """
         reserved = {pack.manifest.task_id for pack in load_builtin_python_taskpacks()}
-        reserved.update(record.artifact.task_id for record in self.registry.records())
+        reserved.update(
+            record.artifact.task_id
+            for record in self.registry.records()
+            if record.status is not DynamicTaskStatus.REJECTED
+        )
         return frozenset(reserved)
 
     def preflight_task_id(self, task_id: str) -> None:
