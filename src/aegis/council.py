@@ -593,12 +593,20 @@ def evaluate_objective_amendment(
     if len({message.sender for message in relevant}) != len(relevant):
         return ObjectiveAdmissionDecision(False, "a role submitted multiple support decisions", None)
     del required_support
-    prosecutor_votes = tuple(
-        message for message in relevant if message.sender is Role.PROSECUTOR
-    )
-    if len(prosecutor_votes) != 1 or prosecutor_votes[0].support is not SupportDecision.SUPPORT:
+    supporters = {
+        message.sender
+        for message in relevant
+        if message.support is SupportDecision.SUPPORT
+    }
+    if Role.PROSECUTOR not in supporters:
         return ObjectiveAdmissionDecision(
             False, "Prosecutor did not issue the final approval", None
+        )
+    if len(supporters) < 2:
+        return ObjectiveAdmissionDecision(
+            False,
+            "objective amendments require a council majority of two supporting roles",
+            None,
         )
     if len(shadow_results) < required_history:
         return ObjectiveAdmissionDecision(False, "insufficient historical objective shadow coverage", None)

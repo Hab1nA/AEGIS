@@ -180,6 +180,57 @@ def test_unanimity_cannot_override_integrity_or_historical_regression() -> None:
     ).admitted
 
 
+def test_amendment_requires_two_rol_majority_including_prosecutor() -> None:
+    transcript = reflected_transcript()
+    proposal = message(Role.WARRIOR, CouncilMessageType.PROPOSAL, proposal_id="objective-2")
+    transcript.append(proposal)
+    parent, candidate = objectives()
+    amendment = ObjectiveAmendment(
+        "objective-2", parent.objective_id, candidate, 2,
+        "shift effort toward demonstrated quality",
+    )
+    passing = tuple(
+        ShadowObjectiveResult(candidate.objective_id, f"curriculum-snapshot-sha256:{char * 64}", 1.0, 1.0)
+        for char in "345"
+    )
+
+    # Prosecutor alone cannot admit an amendment any more.
+    transcript.append(
+        message(
+            Role.PROSECUTOR,
+            CouncilMessageType.SUPPORT,
+            proposal_id="objective-2",
+            support=SupportDecision.SUPPORT,
+        )
+    )
+    solo = evaluate_objective_amendment(
+        amendment,
+        transcript.messages,
+        passing,
+        current_cycle=1,
+        integrity_objection=False,
+    )
+    assert not solo.admitted
+    assert "majority of two supporting roles" in solo.reason
+
+    # Prosecutor plus one other role forms a majority.
+    transcript.append(
+        message(
+            Role.WARRIOR,
+            CouncilMessageType.SUPPORT,
+            proposal_id="objective-2",
+            support=SupportDecision.SUPPORT,
+        )
+    )
+    assert evaluate_objective_amendment(
+        amendment,
+        transcript.messages,
+        passing,
+        current_cycle=1,
+        integrity_objection=False,
+    ).admitted
+
+
 def test_objective_weights_are_normalized_and_delayed() -> None:
     parent, candidate = objectives()
     amendment = ObjectiveAmendment(

@@ -112,12 +112,20 @@ _POLICY_FIELDS_V2 = frozenset(
         *_V2_INTEGER_LIMITS, *_V2_NUMBER_LIMITS, "role_token_shares", "role_reasoning_effort",
     }
 )
-# The single external cost envelope: the only runtime-policy fields the
-# Prosecutor may adjust (with council ratification). Every other parameter is
-# a fixed safety constant or inert legacy value.
+# The external cost envelope plus a bounded set of cycle-flow parameters: the
+# runtime-policy fields the Prosecutor may adjust (with council ratification).
+# Flow bounds keep the adjustments inside sane operating ranges; everything
+# else remains a fixed safety constant or inert legacy value.
 _ENVELOPE_FIELDS = frozenset(
     {"max_total_tokens", "max_requests", "max_model_invocations", "max_active_runtime_seconds"}
 )
+_FLOW_FIELD_BOUNDS: Mapping[str, tuple[int, int]] = {
+    "cohort_limit": (1, 12),
+    "task_authoring_attempts": (1, 4),
+    "task_proposals_per_cycle": (1, 8),
+    "candidate_max_steps": (4, 128),
+    "council_max_messages": (2, 64),
+}
 # Backwards-compatible name used by the legacy amendment reader.
 _ALLOWED_FIELDS = _LEGACY_POLICY_FIELDS_V1
 _CUMULATIVE_LIMITS = _LEGACY_CUMULATIVE_LIMITS | _V2_CUMULATIVE_LIMITS
@@ -1145,11 +1153,18 @@ class RuntimePolicyRegistry:
             raise RuntimePolicyError("only the prosecutor may amend runtime policy")
         if not isinstance(patch, Mapping) or not patch:
             raise RuntimePolicyError("runtime policy patch must be a non-empty mapping")
-        unknown = set(patch) - _ENVELOPE_FIELDS
+        unknown = set(patch) - _ENVELOPE_FIELDS - set(_FLOW_FIELD_BOUNDS)
         if unknown:
             raise RuntimePolicyError(
                 f"runtime policy patch cannot modify fields: {', '.join(sorted(map(str, unknown)))}"
             )
+        for name, raw in patch.items():
+            if name in _FLOW_FIELD_BOUNDS:
+                bounds = _FLOW_FIELD_BOUNDS[name]
+                if isinstance(raw, bool) or not isinstance(raw, int) or not bounds[0] <= raw <= bounds[1]:
+                    raise RuntimePolicyError(
+                        f"{name} must be an integer in [{bounds[0]},{bounds[1]}]"
+                    )
         with self._lock:
             self._replay()
             duplicate = next((item for item in self._immediate_amendments if item.request_id == request_id), None)

@@ -15,7 +15,11 @@ AUTONOMY_MIN_AGENT_STEPS = 20
 AUTONOMY_MIN_OUTPUT_TOKENS = 4_096
 
 # v2 dynamic design: one cycle performs warrior solve, judge review/forge,
-# prosecutor audit/deliberate, and three role reflections (8 model calls).
+# prosecutor audit/deliberate, and three role reflections (8 model *stages*).
+# Each stage is a multi-step agent loop; real runs observe 100-300+ gateway
+# requests per cycle, so this contract is a floor for capacity sanity, not a
+# cycle-count forecast.  The runtime policy genesis additionally inflates the
+# operator envelope far above these minima to avoid stalling real runs.
 V2_CALLS_PER_CYCLE = 8
 V2_CYCLES = 2
 V2_ROLE_CALLS: Mapping[str, int] = {
