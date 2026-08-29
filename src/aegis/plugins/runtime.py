@@ -657,6 +657,11 @@ class ToolBroker:
         self._monotonic = monotonic
         self._issued: dict[str, CapabilityGrant] = {}
         self._consumed: set[str] = set()
+        self._executed_actions: dict[str, set[str]] = {}
+
+    def executed_actions(self) -> Mapping[str, frozenset[str]]:
+        """Plugin artifact ids mapped to the action names actually executed."""
+        return {key: frozenset(value) for key, value in self._executed_actions.items()}
 
     @property
     def generation_id(self) -> str:
@@ -732,6 +737,7 @@ class ToolBroker:
 
         # Consume before crossing the trust boundary.  Failure never restores it.
         self._consumed.add(grant.grant_id)
+        self._executed_actions.setdefault(grant.plugin_artifact_id, set()).add(request.action)
         start = self._monotonic()
         intent: ExternalIntent | None = None
         try:

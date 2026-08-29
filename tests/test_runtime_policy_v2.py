@@ -422,6 +422,46 @@ def test_immediate_patch_whitelist_rejects_non_envelope_fields(tmp_path: Path) -
     store.close()
 
 
+def test_prosecutor_flow_field_patches_are_bounded(tmp_path: Path) -> None:
+    store, policies = registry(tmp_path)
+    genesis = policies.genesis(values_v2(), provider_limits())
+    boundary = RuntimeStageBoundary(0, 1, "stage:1")
+    amended = policies.request_patch_immediately(
+        requested_by=Role.PROSECUTOR,
+        requested_at=boundary,
+        request_id="flow-ok",
+        base_policy_id=genesis.policy_id,
+        patch={
+            "cohort_limit": 4,
+            "task_authoring_attempts": 3,
+            "objective_history_window": 5,
+        },
+        consumed={},
+        reason="widen the probe budget",
+    )
+    assert amended.resulting_policy_id
+    blocked = (
+        {"cohort_limit": 13},
+        {"task_authoring_attempts": 0},
+        {"task_proposals_per_cycle": 9},
+        {"candidate_max_steps": 3},
+        {"council_max_messages": 65},
+        {"objective_history_window": 6},
+    )
+    for index, patch in enumerate(blocked):
+        with pytest.raises(RuntimePolicyError, match="must be an integer in"):
+            policies.request_patch_immediately(
+                requested_by=Role.PROSECUTOR,
+                requested_at=boundary,
+                request_id=f"flow-bad-{index}",
+                base_policy_id=amended.resulting_policy_id,
+                patch=patch,
+                consumed={},
+                reason="out of bounds",
+            )
+    store.close()
+
+
 def test_arm_maintenance_creates_maintenance_only_policy_and_survives_replay(
     tmp_path: Path,
 ) -> None:

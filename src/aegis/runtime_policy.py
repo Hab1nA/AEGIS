@@ -125,6 +125,7 @@ _FLOW_FIELD_BOUNDS: Mapping[str, tuple[int, int]] = {
     "task_proposals_per_cycle": (1, 8),
     "candidate_max_steps": (4, 128),
     "council_max_messages": (2, 64),
+    "objective_history_window": (1, 5),
 }
 # Backwards-compatible name used by the legacy amendment reader.
 _ALLOWED_FIELDS = _LEGACY_POLICY_FIELDS_V1

@@ -238,8 +238,24 @@ def task_spec_from_pack(task_id: str = "dynamic-next") -> dict[str, object]:
     }
 
 
-def paired_candidate_actions(path: str, solution: bytes) -> list[dict[str, object]]:
-    """Two seeds: baseline submit, candidate write+submit, repeated exactly."""
+def test_baseline_reuse_requires_full_evaluation_coverage() -> None:
+    reusable = ModelCyclePorts._baseline_reusable
+    main = frozenset({"task-a", "task-b"})
+    assert reusable(frozenset({"task-a"}), main)
+    assert reusable(frozenset({"task-a", "task-b"}), main)
+    assert not reusable(frozenset({"task-a", "task-c"}), main)
+    assert not reusable(frozenset({"task-a"}), None)
+    assert not reusable(frozenset(), main)
+
+
+def paired_candidate_actions(
+    path: str, solution: bytes, *, plugin_call: str | None = None
+) -> list[dict[str, object]]:
+    """Two seeds: baseline submit, candidate write+submit, repeated exactly.
+
+    With ``plugin_call`` the candidate arm invokes that plugin action before
+    submitting, exercising the plugin treatment-integrity requirement.
+    """
 
     def write(content: bytes) -> dict[str, object]:
         return {
@@ -251,13 +267,20 @@ def paired_candidate_actions(path: str, solution: bytes) -> list[dict[str, objec
     }
     solved = submit("solved", {"task_ids": [], "results": []})
     baseline = solution.replace(b"FIXED", b"BASELINE")
+    plugin_action = (
+        []
+        if plugin_call is None
+        else [{"action": plugin_call, "arguments": {"text": "format me"}}]
+    )
     return [
         write(baseline),
         solved,
+        *plugin_action,
         write(solution),
         solved,
         write(baseline),
         solved,
+        *plugin_action,
         write(solution),
         solved,
     ]
@@ -1284,7 +1307,9 @@ class CyclePortsTests(unittest.TestCase):
             submit("council", {"proposal": None, "agenda": []}),
             submit("forged", {"task_specs": [task_spec_from_pack()]}),
             *paired_candidate_actions(
-                "tasks/candidate-fresh-probe/solution.py", fixed_solution
+                "tasks/candidate-fresh-probe/solution.py",
+                fixed_solution,
+                plugin_call="experimental.format",
             ),
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -1348,9 +1373,13 @@ class CyclePortsTests(unittest.TestCase):
                 self.assertEqual(
                     candidate_evidence["candidate_gate"]["disposition"], "qualified"
                 )
+                self.assertIn(
+                    candidate_evidence["arms"]["pairs"][0]["baseline_source"],
+                    {"main-solve", "dedicated-arm"},
+                )
                 self.assertEqual(
                     [request.seed for request in gateway.requests][-8:],
-                    [0, 0, 0, 0, 1, 1, 1, 1],
+                    [0, 0, 0, 1, 1, 1, 1, 1],
                 )
 
                 second_gateway = FakeGateway(
@@ -1489,7 +1518,9 @@ class CyclePortsTests(unittest.TestCase):
             submit("council", {"proposal": None, "agenda": []}),
             submit("forged", {"task_specs": [task_spec_from_pack()]}),
             *paired_candidate_actions(
-                "tasks/candidate-fresh-probe/solution.py", fixed_solution
+                "tasks/candidate-fresh-probe/solution.py",
+                fixed_solution,
+                plugin_call="experimental.format",
             ),
         ]
         with tempfile.TemporaryDirectory() as directory:

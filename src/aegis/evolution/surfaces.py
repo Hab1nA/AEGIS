@@ -319,6 +319,16 @@ def validate_plugin_content(
             raise EvolutionSurfaceError(
                 f"plugin action {spec.name} has a forbidden effect {spec.effect.value}"
             )
+        if manifest.sources and spec.effect is EffectClass.WORKSPACE_WRITE:
+            # Source-plugin actions run inside the sandbox without broker-side
+            # workspace diff tracking; a WRITE action would be accepted at
+            # proposal time and then fail on every call.  Return data to the
+            # caller and let the model write it via workspace.write_* instead.
+            raise EvolutionSurfaceError(
+                f"source plugin action {spec.name} may not declare the "
+                "workspace_write effect; return the data and let the caller "
+                "write it via workspace.write_*"
+            )
     policy = PluginPolicy(allowed_effects=PLUGIN_ALLOWED_EFFECTS)
     try:
         validate_plugin_manifest(manifest, policy)

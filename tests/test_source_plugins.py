@@ -128,6 +128,35 @@ def test_source_manifest_rejects_digest_mismatch() -> None:
         PluginSource("tool.py", content, "0" * 64)
 
 
+def test_source_plugin_rejects_workspace_write_effect() -> None:
+    from aegis.evolution.surfaces import EvolutionSurfaceError, validate_plugin_content
+
+    manifest_one = source_manifest()
+    write_manifest = PluginManifest.create(
+        plugin_id=manifest_one.plugin_id,
+        version=manifest_one.version,
+        abi_version=manifest_one.abi_version,
+        image_digest="",
+        entrypoint=manifest_one.entrypoint,
+        roles=manifest_one.roles,
+        actions=(
+            ActionSpec(
+                "demo.write",
+                INPUT_SCHEMA,
+                OUTPUT_SCHEMA,
+                EffectClass.WORKSPACE_WRITE,
+                Idempotency.IDEMPOTENT,
+                requires_operation_id=True,
+            ),
+        ),
+        capabilities=manifest_one.capabilities,
+        provenance_sha256=manifest_one.provenance_sha256,
+        sources=manifest_one.sources,
+    )
+    with pytest.raises(EvolutionSurfaceError, match="workspace_write"):
+        validate_plugin_content(write_manifest.to_dict(), target_role=GenerationRole.WARRIOR)
+
+
 def test_source_manifest_requires_entrypoint_to_name_a_source() -> None:
     manifest_one = source_manifest()
     with pytest.raises(ValueError, match="entrypoint"):

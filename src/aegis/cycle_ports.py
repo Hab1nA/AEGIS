@@ -1038,6 +1038,20 @@ class ModelCyclePorts:
         policy = self._runtime_policy_registry.effective_for_stage(boundary)
         return policy.values.get(name, fallback)
 
+    @staticmethod
+    def _baseline_reusable(
+        evaluation_task_ids: frozenset[str],
+        main_task_ids: frozenset[str] | None,
+    ) -> bool:
+        """Seed-0 baseline reuse applies when the champion solve already
+        produced work for every evaluation task (subset, not equality: the
+        evaluation cohort may carry anchor backfill)."""
+        return bool(
+            main_task_ids
+            and evaluation_task_ids
+            and evaluation_task_ids <= main_task_ids
+        )
+
     def _warrior_step_budget(self) -> int:
         if self._runtime_policy_registry is not None:
             boundary = RuntimeStageBoundary(
@@ -1403,6 +1417,11 @@ class ModelCyclePorts:
                 evidence["mcp_call_receipts"] = [
                     item.to_mapping() for item in selected_mcp.receipts()
                 ]
+            if broker_tuple is not None:
+                evidence["plugin_calls"] = {
+                    key: sorted(actions)
+                    for key, actions in broker_tuple[2].executed_actions().items()
+                }
             return evidence
         finally:
             self._sandbox.destroy(sandbox_id)
@@ -1612,7 +1631,9 @@ class ModelCyclePorts:
                 "the public tests under tasks/<task_id>/tests/public, then submit one payload "
                 "binding per-task artifact_id, solution summary, and public-test results.  Partial "
                 "or imperfect solutions are acceptable and required to advance the cycle; never "
-                "exceed the step budget without submitting.  If you identify a concrete, minimal, "
+                "exceed the step budget without submitting.  If plugin_action_schemas are "
+                "advertised in your envelope, use those plugin actions where they genuinely "
+                "help the tasks.  If you identify a concrete, minimal, "
                 "safe improvement to the harness cycle code that would help future runs, call "
                 "aegis.propose_harness_change with base_commit and checkpoint_ref from the "
                 "snapshot harness source and a bounded changes array; a proposal is candidate-only "
@@ -1881,8 +1902,9 @@ class ModelCyclePorts:
                 "Audit token consumption, evidence integrity and risk for this cycle.  The frozen "
                 "Warrior workspace is mounted read-only; verify its digest matches the bound "
                 "workspace_digest before drawing evidence conclusions.  Submit one payload with "
-                "usage_verified, risk findings, and a structured curriculum hypothesis list for "
-                "the next cycle; the control plane feeds those hypotheses to the next task author. "
+                "usage_verified, risk findings, and curriculum_hypotheses (a list of "
+                "{hypothesis_id, summary, confidence} objects for the next cycle; the control "
+                "plane feeds them to the next task author under that exact key). "
                 "You may nominate one subject candidate per role by declaring role_candidates "
                 "as an object mapping a role name to {content:{content_markdown, rationale}}; "
                 "nominated candidates are collected and evaluated by the same gates as Warrior "
@@ -1912,7 +1934,9 @@ class ModelCyclePorts:
             **evidence,
             "verified_workspace_binding": verified,
             "workspace_digest": expected_digest,
-            "curriculum": _strip_forbidden(sub.get("curriculum", [])),
+            "curriculum": _strip_forbidden(
+                sub.get("curriculum") or sub.get("curriculum_hypotheses", [])
+            ),
             "role_candidates": _strip_forbidden(sub.get("role_candidates", {})),
             "usage_verified": bool(sub.get("usage_verified", False)),
         }
@@ -2140,7 +2164,10 @@ class ModelCyclePorts:
         chair = self._run_role(
             Role.PROSECUTOR,
             objective=(
-                "Act as council chair.  You may submit no objective amendment (proposal=null), "
+                "Act as council chair.  Default to no amendment, but when the cycle evidence "
+                "shows a persistent capability gap or a misweighted objective, propose exactly "
+                "one amendment instead of defaulting to null.  You may submit no objective "
+                "amendment (proposal=null), "
                 "or exactly one proposal with statement, success_criteria[{metric,minimum}], "
                 "capability_tags, capability_weights for efficiency/generalization/quality/retention, "
                 "and rationale.  The constitution cannot be changed. For every L2 MCP candidate, "
@@ -2340,9 +2367,31 @@ class ModelCyclePorts:
                     "messages": [item.to_mapping() for item in transcript.messages],
                 },
             )
-            decision = SupportDecision(
-                str(vote_evidence.get("submission", {}).get("decision", "abstain"))
-            )
+            try:
+                decision = SupportDecision(
+                    str(vote_evidence.get("submission", {}).get("decision", "abstain"))
+                )
+            except ValueError:
+                # One bounded repair: unlike proposals and policy decisions the
+                # vote had no retry, so a casing slip ("Support") crashed the
+                # whole cycle.
+                vote_evidence = self._run_role(
+                    role,
+                    objective=(
+                        "Your previous vote was rejected: decision must be exactly one "
+                        "of the lowercase strings support, oppose, or abstain.  Re-vote "
+                        "on the objective amendment with a corrected decision plus a "
+                        "short summary."
+                    ),
+                    context={
+                        "snapshot": _truncate(snapshot.to_mapping()),
+                        "amendment": amendment.to_mapping(),
+                        "previous_vote": _truncate(vote_evidence.get("submission", {})),
+                    },
+                )
+                decision = SupportDecision(
+                    str(vote_evidence.get("submission", {}).get("decision", "abstain"))
+                )
             vote_summary = (
                 str(vote_evidence.get("summary", "")).strip() or "vote recorded"
             )
@@ -2904,6 +2953,7 @@ class ModelCyclePorts:
         council: ArtifactRef,
     ) -> Mapping[str, Any]:
         repair_feedback: list[str] = []
+        authoring_errors: list[str] = []
         evidence: Mapping[str, Any] | None = None
         drafts: list[Mapping[str, Any]] = []
         builder = TaskPackBuilder(self._forge.registry, self._runner)
@@ -2979,11 +3029,16 @@ class ModelCyclePorts:
                 stage_workspace=_task_authoring_seed_workspace(),
             )
             drafts, repair_feedback = self._inspect_task_specs(evidence)
+            # Persist every attempt's validation failures (including earlier
+            # attempts) so spec-shape failure modes survive into the evidence
+            # and the next cycle's curriculum_direction.
+            authoring_errors.extend(repair_feedback)
             if any(bool(item.get("valid")) for item in drafts):
                 return {
                     **evidence,
                     "authoring_attempt": attempt,
                     "drafts": drafts,
+                    "authoring_errors": authoring_errors[:32],
                     "declarative_only": True,
                 }
         if evidence is None:  # pragma: no cover - loop is statically non-empty
@@ -2992,7 +3047,7 @@ class ModelCyclePorts:
             **evidence,
             "authoring_attempt": authoring_attempts,
             "drafts": drafts,
-            "authoring_errors": repair_feedback[:32],
+            "authoring_errors": authoring_errors[:32],
             "declarative_only": True,
         }
 
@@ -3154,16 +3209,30 @@ class ModelCyclePorts:
                 )
                 continue
             archive = self._dynamic.archive(member.artifact_id)
+            rerun_report = None
             with tempfile.TemporaryDirectory(prefix="aegis-holdout-commit-") as directory:
                 root = Path(directory).resolve(strict=True)
                 self._forge._extract_untrusted_archive(archive, root)
                 pack = TaskPack.load(root)
                 report = validate_taskpack(pack, self._runner)
+                if not report.valid:
+                    # One grace rerun: a transient sandbox failure (suite
+                    # timeout jitter) must not permanently kill a task whose
+                    # identical bytes passed validation at registration.
+                    rerun_report = validate_taskpack(pack, self._runner)
+                    if rerun_report.valid:
+                        report = rerun_report
             validation_ref = self._artifacts.put_json(
                 "holdout-validation",
                 {
                     "artifact_id": member.artifact_id,
                     "snapshot_id": snapshot.snapshot_id,
+                    "revalidated": rerun_report is not None,
+                    "rerun_validation": (
+                        None
+                        if rerun_report is None
+                        else _taskpack_validation_mapping(rerun_report)
+                    ),
                     "validation": _taskpack_validation_mapping(report),
                 },
             )
@@ -3183,6 +3252,7 @@ class ModelCyclePorts:
                     "artifact_id": member.artifact_id,
                     "status": held.status.value,
                     "replayed": False,
+                    "revalidated": rerun_report is not None,
                 }
             )
         return {
@@ -3405,7 +3475,9 @@ class ModelCyclePorts:
         assert self._evolution is not None
         submission_data = _brief(self._artifacts, submission)
         judge_data = _brief(self._artifacts, judge_review)
-        audit_data = _brief(self._artifacts, prosecutor_audit)
+        # Untruncated: role_candidates subject bodies and curriculum hypotheses
+        # must survive _truncate's 4096-char string cap.
+        audit_data = _read(self._artifacts, prosecutor_audit)
         council_data = _brief(self._artifacts, council)
         collection_evidence_id = f"cycle:{snapshot.cycle_number}:candidate-evaluation"
         rollback_orders = tuple(consume_rollback_orders(submission_data)) + tuple(
@@ -3922,7 +3994,9 @@ class ModelCyclePorts:
                     str(item.get("artifact_id", "")) for item in tasks
                 )
                 if (
-                    self._main_solve_task_ids == evaluation_task_ids
+                    self._baseline_reusable(
+                        evaluation_task_ids, self._main_solve_task_ids
+                    )
                     and isinstance(
                         self._main_solve_evidence.get("workspace_artifact_id"), str
                     )
@@ -3973,6 +4047,15 @@ class ModelCyclePorts:
                 treatment_integrity_passed = candidate_mcp_bridge.candidate_was_used(
                     mcp_candidate.binding.binding_id
                 )
+            if candidate.surface is EvolutionSurface.PLUGIN:
+                candidate_manifest_ids = {
+                    item.artifact_id for item in candidate_runtime.plugins
+                } - {item.artifact_id for item in champion_binding.plugins}
+                if candidate_manifest_ids:
+                    called_ids = set(shadow.get("plugin_calls", {}))
+                    treatment_integrity_passed = bool(
+                        candidate_manifest_ids & called_ids
+                    )
             candidate_workspace = self._arm_workspaces[candidate_label]
             baseline_eval = evaluate_frozen_workspace(
                 self._dynamic,
@@ -4518,7 +4601,7 @@ class ModelCyclePorts:
         candidate_evidence = _read(self._artifacts, candidate_evaluation)
         evidence = _read(self._artifacts, attribution)
         try:
-            AttributionReport.from_mapping(evidence["report"])
+            attribution_report = AttributionReport.from_mapping(evidence["report"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("attribution evidence has no valid causal report") from exc
         if self._evolution is None:
@@ -4593,6 +4676,21 @@ class ModelCyclePorts:
                 "candidate qualification bindings do not match durable evidence: "
                 + ", ".join(binding_failures)
             )
+        if attribution_report.disposition is AttributionDisposition.CONFOUNDED:
+            # The gate proves the sealed quality delta; attribution proves the
+            # candidate is the only changed coordinate.  A confounded report
+            # means the second lock failed, so promotion is blocked.
+            record = self._evolution.projection.candidates.get(exact_candidate_id)
+            if record is not None and record.state is CandidateState.VALIDATED:
+                self._evolution.reject(
+                    exact_candidate_id,
+                    reason="attribution report is confounded; sealed gate alone cannot promote",
+                )
+            return {
+                "qualified": {},
+                "current_active_set": self._roles.projection.current_active_set_id,
+                "note": "attribution report confounded; promotion blocked",
+            }
         pairs_value = arms_value.get("pairs")
         if not isinstance(pairs_value, list) or len(pairs_value) != len(design.seeds):
             raise RuntimeError("candidate evaluation has incomplete paired arm evidence")
@@ -5429,6 +5527,9 @@ def run_v2_cycle(
     autonomy_config = getattr(campaign_config, "autonomy_v2", None)
     council_max_messages = int(getattr(autonomy_config, "council_max_messages", 24))
     council_max_tokens = int(getattr(autonomy_config, "council_max_tokens", 4_194_304))
+    objective_history_window = int(
+        getattr(autonomy_config, "objective_history_window", 3)
+    )
     configured_surfaces = getattr(autonomy_config, "evolution_surfaces", None)
     enabled_surfaces: tuple[str, ...] | None = (
         tuple(str(item) for item in configured_surfaces)
@@ -5492,6 +5593,9 @@ def run_v2_cycle(
         )
         council_max_messages = int(cast(int, policy_values["council_max_messages"]))
         council_max_tokens = int(cast(int, policy_values["council_max_tokens"]))
+        objective_history_window = int(
+            cast(int, policy_values["objective_history_window"])
+        )
         configured_cohort_limit = int(cast(int, policy_values["cohort_limit"]))
         cohort_limit = configured_cohort_limit
         holdout_delay = int(cast(int, policy_values["task_holdout_delay_cycles"]))
@@ -5587,11 +5691,7 @@ def run_v2_cycle(
         roles=roles,
         data_dir=data_dir,
         holdout_delay=holdout_delay,
-        objective_history_window=(
-            int(campaign_config.autonomy_v2.objective_history_window)
-            if campaign_config is not None and campaign_config.autonomy_v2 is not None
-            else 3
-        ),
+        objective_history_window=objective_history_window,
         objective_probation_cycles=(
             int(campaign_config.autonomy_v2.objective_probation_cycles)
             if campaign_config is not None and campaign_config.autonomy_v2 is not None

@@ -96,3 +96,31 @@ class GenesisSeederTests(unittest.TestCase):
         self.assertIs(cohort.members[0].tier, CohortTier.FRESH_HOLDOUT)
         registered = self.registry.record(cohort.members[0].artifact_id)
         self.assertEqual(registered.artifact.task_id, "dynamic-genesis-copy")
+
+    def test_anchors_backfill_and_fresh_wins_priority_under_limit(self) -> None:
+        self.seeder.seed(self.runner)
+        source = sorted(
+            load_builtin_python_taskpacks(), key=lambda item: item.manifest.task_id
+        )[0]
+        copied_root = self.root / "copied-pack-2"
+        shutil.copytree(source.root, copied_root)
+        manifest_path = copied_root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["task_id"] = "dynamic-genesis-copy-2"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        TaskForge(self.registry).forge(
+            TaskPack.load(copied_root),
+            self.runner,
+            creator_generation=1,
+            source_spec_id="dynamic:genesis-2",
+            source_evidence_ids=("research:genesis-evidence-2",),
+            holdout_delay=1,
+            origin=DynamicTaskOrigin.DYNAMIC,
+        )
+        cohort = self.registry.select_dynamic_cohort(2, limit=3)
+        # The fresh dynamic task leads the cohort and anchors only backfill.
+        self.assertIs(cohort.members[0].tier, CohortTier.FRESH_HOLDOUT)
+        self.assertEqual(len(cohort.members), 3)
+        self.assertTrue(
+            all(member.tier is CohortTier.HALL_OF_FAME for member in cohort.members[1:])
+        )
