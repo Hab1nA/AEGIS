@@ -358,6 +358,28 @@ WSL 沙箱、`max_agent_steps=24`（运行时 `role_max_steps=24`，与 campaign
 另：发行版内安装的 aegis 包是独立副本，agent 侧代码改动需以
 `pip install --force-reinstall --no-deps` 同步进发行版。
 
+## 5b.2 复审修复的真实 E2E 验收（2026-08-29，campaign `evolution-smoke-v2` 第 2 代）
+
+在真实 relay 模型上运行第 2 代 `evolution-cycle --run --repair`，`state=completed`、
+无新增修复事故。本代首次真实行使完整候选链：
+
+- **Warrior 真实提案** workflow 候选（`evolution.request`，target=warrior），
+  收集 1 条、拒绝 0 条——此前"候选永久 retained"已消除（fresh cohort 就绪）；
+- **影子臂基线复用真实生效**：seed 0 `baseline_source=main-solve`（复用主
+  solve，省一次全量运行），seed 1 按设计专用臂；
+- **均值化门禁诚实裁决**：候选 mean fresh improvement 0.0000 < 0.02 →
+  `fresh-rejected`，零提升候选不被激活；周期以 `outcome_class=candidate-rejected`
+  诚实收尾，评估名额按设计消耗；
+- **FRESH 采纳与 holdout 晋级闭环**：第 1 代锻造的 `python-flatten-list` 以
+  FRESH 优先进入第 2 代 cohort，重验一次通过（`revalidated=false`，宽限重跑
+  按设计未触发）后晋升 `hall-of-fame`——"评委出题被下一轮采用"真实闭环；
+- **供应链连续出题**：第 2 代锻造注册 `python-parse-int`（`learning_outcome=
+  progressed`）；`authoring_attempt=2` 且 attempt-1 的失败证据以
+  `authoring_errors` 持久化（修复前该证据丢失）；
+- **课程假设键名修复真实生效**：第 2 代 prosecutor-audit 的 `curriculum`
+  字段含 3 条假设（第 1 代为空——模型自然输出 `curriculum_hypotheses`，
+  双键兼容接住），将随 curriculum_direction 进入第 3 代 forge context。
+
 ## 6. 边界与后续项
 
 - 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面
