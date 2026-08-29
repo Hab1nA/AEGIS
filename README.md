@@ -59,13 +59,14 @@ $env:AEGIS_DATA_DIR = "$env:LOCALAPPDATA\AEGIS"
 
 ## 关键机制
 
-- 动态任务库：`GenesisSeeder` 仅在任务库为空时注册 12 个内置锚点；一旦 Judge 锻造的动态任务达到合格条件，锚点即退出队列。每个任务在注册前都必须通过 reference/defect/mutant 校验。
-- 角色循环：Warrior/Judge/Prosecutor 通过 `RoleAgentRuntime` 运行，使用严格的 JSON 动作、经过校验的令牌用量，以及每个角色独立的沙箱生命周期。
-- 委员会：三次独立反思加上一次确定性的主席审议，生成下一周期的议程。
+- 动态任务库：`GenesisSeeder` 仅在任务库为空时注册 12 个内置锚点。每个任务在注册前都必须通过 reference/defect/mutant 校验。Fresh 任务优先入选下一轮 cohort（Judge 的新题立即被采用），锚点按需回填、渐进退役。校验失败不烧 task_id（可改名重投），拒绝原因与 per-case 失败明细回传给下一轮 forge。
+- 角色循环：Warrior/Judge/Prosecutor 通过 `RoleAgentRuntime` 运行，使用严格的 JSON 动作、经过校验的令牌用量，以及每个角色独立的沙箱生命周期。forge context 携带上周期校验错误、remediation 义务、检察官课程假设与 council 议程——"失败一次，不再重复失败"。
+- 委员会：三次独立反思加上一次主席审议，生成下一周期的议程；objective 修正需要包含检察官在内的 2/3 多数支持。
 - Git 检查点：Warrior 可以通过日志连接器（journaled connector）调用 `aegis.git_checkpoint`；`GitPublisher` 在路径授权与密钥扫描之后，仅推送只创建（create-only）的候选引用。需要 `autonomy_v2.public_repo_url`。
 - 归因：每个周期都会向 `data_dir/attribution_arms.jsonl` 追加一个 `EvaluationArm`，并生成内容寻址的 `qualify_attribution` 报告；如果没有同队列配对数据，报告会如实标记为 `invalid-design` 或 `confounded`。
-- 进化面：四个明确的可持续进化面——`workflow`、`subject`、`plugin`、`environment`——在 `src/aegis/evolution/surfaces.py` 中有严格的 JSON 模式与授权规则。只有 Warrior 可以提出提案；workflow/subject/plugin/environment 提案必须针对 Warrior（workflow 提案也可以针对提案者自身）。
-- 候选消费：`src/aegis/evolution/consumer.py` 将每个提案物化到内容寻址存储中，并馈送给 `EvolutionRegistry`（`collect -> validated -> qualified -> active`，每个面都有 champion，带血缘与回滚）。每个周期运行一个同队列配对的影子分支（shadow arm），归因差异（单坐标 `plugin_ids` 或 `runtime_variant`，通过角色生成身份对 workflow/subject 提供咨询性建议），并自动激活合格的候选。
+- 候选评估：影子评测的冠军基线直接复用本周期主循环 solve（同 cohort、同绑定、完整步数），每个 seed 只需跑候选臂；双臂步数对齐主循环（`candidate_max_extra_steps=24`，preflight 校验不超过 `max_agent_steps`）。合格门槛改为 seed 均值判定（fresh 提升 ≥0.02）加每-seed 地板（≥−0.10），单 seed 噪声不再一票否决。未启用的面在收集阶段即被拒绝，不占用每周期唯一的评估名额。
+- 进化面：`workflow`、`subject`、`plugin`、`environment`（以及受控的 harness-code）在 `src/aegis/evolution/surfaces.py` 中有严格的 JSON 模式与授权规则。只有 Warrior 可以提出提案；插件可以是源码内嵌（`sources` + 空 `image_digest`，entrypoint `("python3", "<file>")`，入口函数 `handle(action, arguments)`），在沙箱内以 stdin/stdout JSON 协议真实执行。
+- 环境构建器：两次独立构建的 digest 一致性作为可复现性证据记录在 receipt 上（默认 `require_reproducible=False`，可配置强制）；Trivy 缺失或拒绝时降级为 `scanner_passed=False` 证据，不阻断构建。
 - 活跃角色集绑定：每个角色在周期开始时解析一个 `CompositeRoleManifest`（`schema_version=2`：模型配置、workflow、subject、插件、运行时镜像、预算策略）；被激活的 champion workflow、subject、plugin 和环境镜像会注入到下一代的实际运行时封套与沙箱准备中。旧的 genesis 清单回退到默认值。
-- 环境构建器：`src/aegis/evolution/env_builder.py` 将真实的构建器（隔离下载、两次独立的离线 Podman 构建、Trivy 扫描、CAS 发布）接入周期。构建 `environment` 候选，其凭据（receipt）物化到候选上，影子分支在构建出的镜像上运行，激活时锁定 `runtime_image` 供后续世代使用。
+- 检察官实权：`aegis.adjust_runtime_policy` 除成本信封外还可调有限流程参数（`cohort_limit`、`task_authoring_attempts`、`task_proposals_per_cycle`、`candidate_max_steps`、`council_max_messages`，均有界）；审计的课程假设与 role_candidates 提名进入 forge/候选管道，结果如实反馈。
 - 修复：失败的周期会记录 `cycle_failed_recovery_started`；Prosecutor 补丁被发布、校验并激活，否则周期回滚。中断/失败的周期通过 `retry` 转换重试同一代。

@@ -267,6 +267,97 @@ WSL 沙箱、`max_agent_steps=24`（运行时 `role_max_steps=24`，与 campaign
 - 任何外部写只能经 journaled connector；凭据留在发布者环境。
 - token、请求失败与重试都必须记账，不只统计成功响应。
 
+## 5b. 进化有效性改造（2026-08-29）
+
+针对"设计链路完整但实际进化产出趋近于零"的审计结论，按"提高效率与进化
+有效性、不过度防御"的原则实施以下改动（全部附确定性测试）：
+
+**影子评测信号质量（P0）**
+
+- 影子臂双臂步数对齐主循环：`candidate_max_extra_steps` 默认 12 → 24
+  （`_candidate_step_limit` 额外以 warrior 策略步数封顶），影子臂 objective
+  的步数提示改为动态计算。
+- 冠军基线复用：seed 0 的 baseline 臂直接复用本周期主循环 champion solve
+  （同 cohort、同绑定、冻结工作区与 usage 证据），每周期少跑一次完整
+  Warrior；`arm_rows` 记录 `baseline_source=main-solve|dedicated-arm`。
+- 合格门槛均值化：fresh 提升从"每个 seed 独立 ≥0.02"改为 **seed 均值
+  ≥0.02** 加每-seed 地板（`min_seed_delta_floor=-0.10`）；regression
+  非劣同样均值化。`PromotionGatePolicy`/`CandidateGatePolicy` 新增
+  `min_seed_delta_floor` 字段（旧证据 replay 时缺省 −0.10）。
+
+**任务供应链自愈（P0）**
+
+- forge context 注入 `curriculum_direction`：上周期 REJECTED 任务的
+  task_id 与原因、已声明 task_ids、检察官 curriculum 假设、council 议程
+  摘要；forge objective 明确要求不再重复被拒模式。
+- 校验错误回显违规值（task_id / mutant 名 / clause_id），三重校验的
+  reference 失败原因携带 per-case 失败明细（`failure_summary`）。
+- REJECTED 记录不再占用 task_id（可换内容重投）；同内容仍幂等。
+- `task_proposals_per_cycle` 默认 1 → 3。
+- cohort 选择：FRESH 任务优先入选（新题下代即被采用）；锚点改为
+  **回填制**渐进退役（动态题不足 limit 时用锚点补位），不再一次性全退。
+
+**plugin 面真实化（P1）**
+
+- 新增源码插件：manifest 携带 `sources`（base64 Python 源码，单文件
+  ≤64KiB、总量 ≤192KiB、≤8 个），`image_digest` 留空，entrypoint
+  `("python3", "<source path>")`，入口模块暴露 `handle(action, arguments)`。
+  源码纳入 manifest 内容寻址身份。
+- `SandboxPluginExecutor` 对源码插件真实执行：逐文件 stage 进沙箱
+  `/tmp/aegis-plugin-<digest16>/`（回传 digest 校验），以 stdin 传 JSON
+  arguments、stdout 收 JSON 结果；声明外动作在 staging 前拒绝。
+
+**environment 面放宽（P1）**
+
+- 双构建 digest 一致性降级为**可复现性证据**：不一致时 receipt 记录
+  `reproducible=False` 并以首次构建继续发布（policy
+  `require_reproducible=True` 时仍 fail closed，且为默认关闭）。
+- Trivy 崩溃/超时/拒绝降级为 `scanner_passed=False` 证据
+  （`require_scanner_passed=True` 时仍 fail closed，默认关闭）。
+
+**收集与治理（P1/P2）**
+
+- 未启用的面在收集阶段即以明确原因拒绝，不注册、不烧每周期唯一的
+  候选评估名额；非 warrior 目标的 VALIDATED 候选在评估阶段被诚实
+  拒绝（不再永久滞留）。
+- objective 修正裁决改为 **2/3 多数**（检察官一票仍必需，但需再有一个
+  角色支持）；检察官 audit 提示词公开 `role_candidates` 通道与
+  curriculum 假设的去向。
+- `aegis.adjust_runtime_policy` 新增有界流程参数：`cohort_limit`、
+  `task_authoring_attempts`、`task_proposals_per_cycle`、
+  `candidate_max_steps`、`council_max_messages`。
+- `autonomy_budget.py` 契约文档更新为现实的请求量级说明。
+
+## 5b.1 进化有效性改造的真实 E2E 验收（2026-08-29，campaign `evolution-smoke-v2`）
+
+在真实 WSL/Podman + 真实 relay 模型（`deepseek-v4-flash-vision-exp`，
+`reasoning_effort=max`）上运行 `evolution-cycle --run --repair`，周期以
+`state=completed` 收尾：
+
+- 全部阶段落账：submission → judge-review → quality-lock → prosecutor-audit
+  → reflections → council → objective-governance → task-forge →
+  task-validation → candidate-evaluation → attribution → qualification →
+  activation → post-reflection → summary；
+- Judge 经声明式 task_specs 成功锻造新任务 `python-flatten-list`，控制面
+  在真实 WSL 沙箱完成 reference/defect/mutant 三重校验，`status=registered`、
+  `registered_count=1`、`learning_outcome=progressed`，周期
+  `outcome_class=task-outcome`（学习链路真实闭环）；
+- 本周期 Warrior 未提交 evolution 提案，候选评估 `enabled=true` 但无候选，
+  不烧评估名额。
+
+**环境排障记录（对复跑有用）**：本机近期 WSL 版本存在运行期周期性注册
+`/proc/sys/fs/binfmt_misc/WSLInterop` 的行为（约 1 分钟量级出现/消失振荡），
+无视 `/etc/wsl.conf` 的 `[interop] enabled=false`，导致 agent 侧
+`sandbox security checks failed: interop_disabled` 随机出现。处理：
+(a) 发行版内屏蔽 `systemd-binfmt.service` 与
+`proc-sys-fs-binfmt_misc.automount`；(b) `WslSandboxBackend` 默认
+`interop_warn_only=True`，宿主侧 transport 注入
+`AEGIS_SANDBOX_INTEROP_WARN=1`，agent 的 interop 检查降级为记录性警告
+（detail 中如实保留 "WSL interop is enabled" 事实），`doctor` 整体不再被
+振荡阻断。需要严苛隔离的部署可构造 `WslSandboxBackend(interop_warn_only=False)`。
+另：发行版内安装的 aegis 包是独立副本，agent 侧代码改动需以
+`pip install --force-reinstall --no-deps` 同步进发行版。
+
 ## 6. 边界与后续项
 
 - 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面

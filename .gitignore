@@ -31,6 +31,10 @@ env/
 .coverage
 htmlcov/
 
+# Security-scan and local build artifacts
+.mimosa/
+build_dist/
+
 # OS
 .DS_Store
 Thumbs.db
