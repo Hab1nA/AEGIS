@@ -74,7 +74,21 @@ def _record_candidate(
     source: str,
     proposal_id: str | None,
     rationale: str,
+    enabled_surfaces: frozenset[str] | None = None,
 ) -> ConsumedCandidate:
+    if enabled_surfaces is not None and surface.value not in enabled_surfaces:
+        return ConsumedCandidate(
+            surface,
+            target_role,
+            "",
+            "",
+            source,
+            proposal_id,
+            rationale,
+            collected=False,
+            validated=False,
+            error="surface is not enabled by the campaign evolution_surfaces config",
+        )
     artifact_id, artifact_sha256 = _materialize(artifacts, surface, content_json)
     try:
         registry.collect(
@@ -243,6 +257,7 @@ def _consume_proposal(
     source: str,
     proposal_id: str | None,
     rationale: str,
+    enabled_surfaces: frozenset[str] | None = None,
 ) -> ConsumedCandidate:
     return _record_candidate(
         registry=registry,
@@ -255,6 +270,7 @@ def _consume_proposal(
         source=source,
         proposal_id=proposal_id,
         rationale=rationale,
+        enabled_surfaces=enabled_surfaces,
     )
 
 
@@ -265,6 +281,7 @@ def _consume_reflection_proposals(
     reflections: Sequence[Mapping[str, Any]],
     objective_id: str,
     collection_evidence_id: str,
+    enabled_surfaces: frozenset[str] | None = None,
 ) -> tuple[ConsumedCandidate, ...]:
     """Consume structured workflow proposals produced by the three role reflections.
 
@@ -272,6 +289,7 @@ def _consume_reflection_proposals(
     schema-valid workflow body becomes a candidate.  Invalid proposals are
     recorded as rejected so the inbox is visible instead of silently dropped.
     """
+    disabled = frozenset(enabled_surfaces) if enabled_surfaces is not None else None
     consumed: list[ConsumedCandidate] = []
     seen: set[tuple[str, str]] = set()
     for payload in reflections:
@@ -359,6 +377,7 @@ def _consume_reflection_proposals(
                     source="reflection",
                     proposal_id=proposal_id,
                     rationale=rationale,
+                    enabled_surfaces=disabled,
                 )
             )
     return tuple(consumed)
@@ -374,7 +393,11 @@ def consume_cycle_proposals(
     collection_evidence_id: str,
     meta_evolution_enabled: bool = False,
     reflections: Sequence[Mapping[str, Any]] | None = None,
+    enabled_surfaces: Sequence[str] | None = None,
 ) -> tuple[ConsumedCandidate, ...]:
+    disabled = (
+        None if enabled_surfaces is None else frozenset(enabled_surfaces)
+    )
     """Scan one cycle's evidence and collect every valid evolution candidate."""
     consumed: list[ConsumedCandidate] = []
     if reflections:
@@ -385,6 +408,7 @@ def consume_cycle_proposals(
                 reflections=reflections,
                 objective_id=objective_id,
                 collection_evidence_id=collection_evidence_id,
+                enabled_surfaces=disabled,
             )
         )
     submitter_role: Role | None = None
@@ -433,6 +457,7 @@ def consume_cycle_proposals(
                 source="evolution.request",
                 proposal_id=raw.get("objective"),
                 rationale=str(raw.get("rationale", ""))[:2000],
+                enabled_surfaces=disabled,
             )
         )
 
@@ -537,6 +562,7 @@ def consume_cycle_proposals(
                 source="role_candidates",
                 proposal_id=raw.get("artifact_id"),
                 rationale="prosecutor role candidate subject",
+                enabled_surfaces=disabled,
             )
         )
 

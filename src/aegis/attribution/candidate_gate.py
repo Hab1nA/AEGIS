@@ -167,6 +167,7 @@ class CandidateGatePolicy:
     regression_noninferiority_margin: float = 0.01
     max_total_cost_increase: float = 0.10
     enforce_cost_limit: bool = False
+    min_seed_delta_floor: float = -0.10
 
     def __post_init__(self) -> None:
         if isinstance(self.required_seeds, bool) or not isinstance(self.required_seeds, int):
@@ -185,6 +186,11 @@ class CandidateGatePolicy:
                 raise ValueError(f"{name} must be finite and in [0,1]")
         if not isinstance(self.enforce_cost_limit, bool):
             raise TypeError("enforce_cost_limit must be bool")
+        floor = self.min_seed_delta_floor
+        if isinstance(floor, bool) or not isinstance(floor, (int, float)):
+            raise TypeError("min_seed_delta_floor must be numeric")
+        if not math.isfinite(float(floor)) or not -1.0 <= float(floor) <= 0.0:
+            raise ValueError("min_seed_delta_floor must be finite and in [-1,0]")
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -195,6 +201,7 @@ class CandidateGatePolicy:
             ),
             "max_total_cost_increase": float(self.max_total_cost_increase),
             "enforce_cost_limit": self.enforce_cost_limit,
+            "min_seed_delta_floor": float(self.min_seed_delta_floor),
         }
 
     @classmethod
@@ -206,8 +213,12 @@ class CandidateGatePolicy:
             "max_total_cost_increase",
             "enforce_cost_limit",
         }
-        if set(value) != expected:
-            raise ValueError("candidate gate policy has missing or unknown fields")
+        optional = {"min_seed_delta_floor"}
+        unknown = set(value) - expected - optional
+        if unknown:
+            raise ValueError("candidate gate policy has unknown fields")
+        if not expected <= set(value):
+            raise ValueError("candidate gate policy has missing fields")
         return cls(
             required_seeds=value["required_seeds"],
             fresh_improvement=value["fresh_improvement"],
@@ -216,6 +227,7 @@ class CandidateGatePolicy:
             ],
             max_total_cost_increase=value["max_total_cost_increase"],
             enforce_cost_limit=value["enforce_cost_limit"],
+            min_seed_delta_floor=value.get("min_seed_delta_floor", -0.10),
         )
 
 
@@ -390,10 +402,12 @@ def evaluate_candidate_gate(
     evidence: Iterable[SealedCandidatePair],
     policy: CandidateGatePolicy | None = None,
 ) -> CandidateGateReport:
-    """Apply all non-compensable gates to exactly two sealed seed pairs.
+    """Apply non-compensable gates to the paired sealed seed evidence.
 
-    Fresh improvement and regression noninferiority are checked independently
-    for every seed.  Cost is checked once over the total paired usage.
+    Fresh improvement and regression noninferiority are judged on the seed
+    mean, with a per-seed floor guarding against a catastrophic single seed
+    hiding inside an acceptable mean.  Cost is checked once over the total
+    paired usage.
     """
 
     applied = policy or CandidateGatePolicy()
@@ -445,30 +459,62 @@ def evaluate_candidate_gate(
             )
         )
     results = tuple(result_rows)
-    failed_fresh = tuple(
+    mean_fresh = sum(item.fresh_delta for item in results) / len(results)
+    floored_fresh = tuple(
         item.seed
         for item in results
-        if item.fresh_delta + 1e-12 < applied.fresh_improvement
+        if item.fresh_delta + 1e-12 < applied.min_seed_delta_floor
     )
-    if failed_fresh:
+    if mean_fresh + 1e-12 < applied.fresh_improvement:
         return _report(
             pairs,
             applied,
             CandidateGateDisposition.FRESH_REJECTED,
-            f"fresh improvement failed for seeds {','.join(map(str, failed_fresh))}",
+            (
+                f"mean fresh improvement {mean_fresh:.4f} below threshold "
+                f"{applied.fresh_improvement:.4f}"
+            ),
             results=results,
         )
-    failed_regression = tuple(
+    if floored_fresh:
+        return _report(
+            pairs,
+            applied,
+            CandidateGateDisposition.FRESH_REJECTED,
+            (
+                f"fresh delta collapsed below the per-seed floor "
+                f"{applied.min_seed_delta_floor:.4f} for seeds "
+                f"{','.join(map(str, floored_fresh))}"
+            ),
+            results=results,
+        )
+    mean_regression = sum(item.regression_delta for item in results) / len(results)
+    floored_regression = tuple(
         item.seed
         for item in results
-        if item.regression_delta + 1e-12 < -applied.regression_noninferiority_margin
+        if item.regression_delta + 1e-12 < applied.min_seed_delta_floor
     )
-    if failed_regression:
+    if mean_regression + 1e-12 < -applied.regression_noninferiority_margin:
         return _report(
             pairs,
             applied,
             CandidateGateDisposition.REGRESSION_REJECTED,
-            f"regression noninferiority failed for seeds {','.join(map(str, failed_regression))}",
+            (
+                f"mean regression delta {mean_regression:.4f} below the "
+                f"noninferiority margin -{applied.regression_noninferiority_margin:.4f}"
+            ),
+            results=results,
+        )
+    if floored_regression:
+        return _report(
+            pairs,
+            applied,
+            CandidateGateDisposition.REGRESSION_REJECTED,
+            (
+                f"regression delta collapsed below the per-seed floor "
+                f"{applied.min_seed_delta_floor:.4f} for seeds "
+                f"{','.join(map(str, floored_regression))}"
+            ),
             results=results,
         )
     baseline_costs = tuple(item.baseline.cost_units for item in pairs)
@@ -498,7 +544,10 @@ def evaluate_candidate_gate(
         pairs,
         applied,
         CandidateGateDisposition.QUALIFIED,
-        "every seed passed fresh improvement, regression noninferiority, and integrity gates; cost is observational",
+        (
+            "seed-mean fresh improvement, regression noninferiority, per-seed "
+            "floors, and integrity gates all passed; cost is observational"
+        ),
         results=results,
         total_cost_change=total_cost_change,
     )

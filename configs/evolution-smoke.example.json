@@ -23,7 +23,7 @@
     "evolution_surfaces": ["workflow", "subject", "plugin", "environment"],
     "environment_output_repository": "localhost/aegis-evolution",
     "scanner_binary": "trivy",
-    "candidate_max_extra_steps": 12
+    "candidate_max_extra_steps": 24
   },
   "sandbox_backend": "wsl",
   "test_mode": false,

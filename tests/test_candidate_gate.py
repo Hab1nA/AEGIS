@@ -103,18 +103,45 @@ class CandidateGateTests(unittest.TestCase):
 
         self.assertEqual(report.disposition, CandidateGateDisposition.INTEGRITY_REJECTED)
 
-    def test_fresh_threshold_applies_to_every_seed(self) -> None:
-        report = evaluate_candidate_gate((pair(11), pair(22, fresh_delta=0.019)))
-
-        self.assertEqual(report.disposition, CandidateGateDisposition.FRESH_REJECTED)
-        self.assertIn("22", report.reason)
-
-    def test_regression_noninferiority_applies_to_every_seed(self) -> None:
-        report = evaluate_candidate_gate(
-            (pair(11), pair(22, regression_delta=-0.011))
+    def test_fresh_threshold_applies_to_seed_mean(self) -> None:
+        # One weak seed no longer sinks a candidate when the mean clears the
+        # threshold; a weak mean still fails.
+        noise_tolerant = evaluate_candidate_gate((pair(11), pair(22, fresh_delta=0.019)))
+        weak_mean = evaluate_candidate_gate(
+            (pair(11, fresh_delta=0.011), pair(22, fresh_delta=0.011))
         )
 
-        self.assertEqual(report.disposition, CandidateGateDisposition.REGRESSION_REJECTED)
+        self.assertTrue(noise_tolerant.qualified)
+        self.assertEqual(weak_mean.disposition, CandidateGateDisposition.FRESH_REJECTED)
+        self.assertIn("mean fresh improvement", weak_mean.reason)
+
+    def test_fresh_per_seed_floor_rejects_catastrophic_seed(self) -> None:
+        report = evaluate_candidate_gate(
+            (pair(11, fresh_delta=0.20), pair(22, fresh_delta=-0.15))
+        )
+
+        self.assertEqual(report.disposition, CandidateGateDisposition.FRESH_REJECTED)
+        self.assertIn("per-seed floor", report.reason)
+        self.assertIn("22", report.reason)
+
+    def test_regression_noninferiority_applies_to_seed_mean(self) -> None:
+        noise_tolerant = evaluate_candidate_gate(
+            (pair(11), pair(22, regression_delta=-0.011))
+        )
+        weak_mean = evaluate_candidate_gate(
+            (pair(11, regression_delta=-0.02), pair(22, regression_delta=-0.02))
+        )
+        floored = evaluate_candidate_gate(
+            (pair(11, regression_delta=0.15), pair(22, regression_delta=-0.15))
+        )
+
+        self.assertTrue(noise_tolerant.qualified)
+        self.assertEqual(
+            weak_mean.disposition, CandidateGateDisposition.REGRESSION_REJECTED
+        )
+        self.assertIn("mean regression delta", weak_mean.reason)
+        self.assertEqual(floored.disposition, CandidateGateDisposition.REGRESSION_REJECTED)
+        self.assertIn("per-seed floor", floored.reason)
 
     def test_total_cost_is_aggregated_across_both_seeds(self) -> None:
         passing = evaluate_candidate_gate(

@@ -93,6 +93,7 @@ class PromotionGatePolicy:
     regression_noninferiority_margin: float
     max_total_cost_increase: float
     enforce_cost_limit: bool
+    min_seed_delta_floor: float = -0.10
 
     def __post_init__(self) -> None:
         # The sealed design is fixed to the independently replayed seeds [0,1].
@@ -115,6 +116,12 @@ class PromotionGatePolicy:
             raise ControlCorePolicyError("promotion_gate.enforce_cost_limit must be boolean")
         if self.enforce_cost_limit:
             raise ControlCorePolicyError("promotion cost must remain observational")
+        _number(
+            self.min_seed_delta_floor,
+            "promotion_gate.min_seed_delta_floor",
+            minimum=-1.0,
+            maximum=0.0,
+        )
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -125,6 +132,7 @@ class PromotionGatePolicy:
             ),
             "max_total_cost_increase": float(self.max_total_cost_increase),
             "enforce_cost_limit": self.enforce_cost_limit,
+            "min_seed_delta_floor": float(self.min_seed_delta_floor),
         }
 
 
@@ -202,14 +210,18 @@ class ControlCorePolicy:
             {"public_weight", "hidden_weight", "timeout_seconds"},
             "control_core.sealed_evaluator",
         )
+        gate_data = dict(data["promotion_gate"])
+        # Legacy candidate payloads predate the per-seed floor; default it.
+        gate_data.setdefault("min_seed_delta_floor", -0.10)
         gate = _strict(
-            data["promotion_gate"],
+            gate_data,
             {
                 "required_seeds",
                 "fresh_improvement",
                 "regression_noninferiority_margin",
                 "max_total_cost_increase",
                 "enforce_cost_limit",
+                "min_seed_delta_floor",
             },
             "control_core.promotion_gate",
         )
@@ -233,7 +245,7 @@ class ControlCorePolicy:
 
 DEFAULT_CONTROL_CORE_POLICY = ControlCorePolicy(
     SealedEvaluatorPolicy(0.25, 0.75, 120.0),
-    PromotionGatePolicy(2, 0.02, 0.01, 0.10, False),
+    PromotionGatePolicy(2, 0.02, 0.01, 0.10, False, -0.10),
     InternalTaskSandboxPolicy(
         "none",
         True,

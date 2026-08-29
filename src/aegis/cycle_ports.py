@@ -751,7 +751,8 @@ class ModelCyclePorts:
         environment_builder: EnvironmentBuilder | None = None,
         default_image: str | None = None,
         evaluate_candidates_enabled: bool = True,
-        candidate_max_extra_steps: int = 12,
+        candidate_max_extra_steps: int = 24,
+        evolution_surfaces: Sequence[str] | None = None,
         budget_policy_sha256: str | None = None,
         harness_repo: HarnessRepo | None = None,
         harness_backend: HarnessBackend | None = None,
@@ -822,6 +823,9 @@ class ModelCyclePorts:
         self._default_image = default_image
         self._evaluate_candidates_enabled = evaluate_candidates_enabled
         self._candidate_max_extra_steps = candidate_max_extra_steps
+        self._enabled_surfaces: frozenset[str] | None = (
+            frozenset(evolution_surfaces) if evolution_surfaces is not None else None
+        )
         if isinstance(candidate_max_extra_steps, bool) or not isinstance(
             candidate_max_extra_steps, int
         ) or not 1 <= candidate_max_extra_steps <= 1000:
@@ -890,6 +894,8 @@ class ModelCyclePorts:
             )
             self._harness_rollback = HarnessRollbackExecutor(harness_repo)
         self._arm_workspaces: dict[str, bytes] = {}
+        self._main_solve_evidence: dict[str, Any] | None = None
+        self._main_solve_task_ids: frozenset[str] | None = None
         workflow_ref, subject_ref = materialize_default_artifacts(artifacts)
         self._default_workflow_ref = workflow_ref
         self._default_subject_ref = subject_ref
@@ -1032,10 +1038,31 @@ class ModelCyclePorts:
         policy = self._runtime_policy_registry.effective_for_stage(boundary)
         return policy.values.get(name, fallback)
 
+    def _warrior_step_budget(self) -> int:
+        if self._runtime_policy_registry is not None:
+            boundary = RuntimeStageBoundary(
+                self._runtime_policy_cycle,
+                self._runtime_stage_ordinal,
+                f"stage:{self._runtime_stage_ordinal}",
+            )
+            stage_policy = self._runtime_policy_registry.effective_for_stage(boundary)
+            try:
+                configured = int(
+                    cast(Mapping[str, Any], stage_policy.values["role_max_steps"])[
+                        Role.WARRIOR.value
+                    ]
+                )
+                if configured > 0:
+                    return configured
+            except (KeyError, TypeError, ValueError):
+                pass
+        return self._limits.max_steps
+
     def _candidate_step_limit(self) -> int:
-        return int(
+        configured = int(
             self._policy_value("candidate_max_steps", self._candidate_max_extra_steps)
         )
+        return min(configured, self._warrior_step_budget())
 
     def _subagent_accounting_binding(self) -> Mapping[str, Any] | None:
         if self._runtime_policy_registry is None:
@@ -1498,6 +1525,12 @@ class ModelCyclePorts:
         evidence = self._solve_arm(
             snapshot, cohort, tasks, self._bindings[Role.WARRIOR], arm_label="champion"
         )
+        # Retain the champion solve so the candidate gate can reuse it as the
+        # baseline arm instead of paying for a second full model run.
+        self._main_solve_evidence = dict(evidence)
+        self._main_solve_task_ids = frozenset(
+            str(item.get("artifact_id", "")) for item in tasks
+        )
         # Persist the submission artifact up front so the control-plane frozen
         # binding can reference its typed content address (idempotent: the
         # cycle runtime records the same bytes and receives the same address).
@@ -1565,10 +1598,16 @@ class ModelCyclePorts:
         snapshot_context = dict(snapshot.to_mapping())
         if objective_override is not None:
             snapshot_context["objective"] = objective_override.to_mapping()
+        step_budget = (
+            self._warrior_step_budget()
+            if max_steps is None
+            else min(int(max_steps), self._warrior_step_budget())
+        )
         evidence = self._run_role(
             Role.WARRIOR,
             objective=(
-                "Solve the dynamic cohort inside the sandbox.  Use at most 12 tool steps, then "
+                f"Solve the dynamic cohort inside the sandbox.  Use at most {step_budget} tool "
+                "steps, then "
                 "write each solution under tasks/<task_id>/solution.py inside the workspace, run "
                 "the public tests under tasks/<task_id>/tests/public, then submit one payload "
                 "binding per-task artifact_id, solution summary, and public-test results.  Partial "
@@ -1843,7 +1882,12 @@ class ModelCyclePorts:
                 "Warrior workspace is mounted read-only; verify its digest matches the bound "
                 "workspace_digest before drawing evidence conclusions.  Submit one payload with "
                 "usage_verified, risk findings, and a structured curriculum hypothesis list for "
-                "the next cycle.  Independently decide every staged MCP candidate using "
+                "the next cycle; the control plane feeds those hypotheses to the next task author. "
+                "You may nominate one subject candidate per role by declaring role_candidates "
+                "as an object mapping a role name to {content:{content_markdown, rationale}}; "
+                "nominated candidates are collected and evaluated by the same gates as Warrior "
+                "proposals.  Independently decide every "
+                "staged MCP candidate using "
                 "mcp_decisions[{candidate_id,decision,rationale}]; use reject as a veto."
             ),
             stage_workspace=workspace,
@@ -2796,6 +2840,60 @@ class ModelCyclePorts:
         self._append_objective_history(snapshot, cohort, submission, quality_lock)
         return {**outcome.to_mapping(), "probation": probation}
 
+    def _curriculum_direction(
+        self,
+        prosecutor_audit: ArtifactRef,
+        council: ArtifactRef,
+    ) -> Mapping[str, Any]:
+        """Cross-cycle and cross-role guidance for the task author.
+
+        Feeds the Judge the signals that previously died in artifacts: why
+        earlier specs were rejected, what the Prosecutor hypothesizes about
+        the next curriculum, and what the council asked the next cycle to
+        change.  Keeps the loop "fail once, never fail the same way twice".
+        """
+        direction: dict[str, Any] = {}
+        prior_rejections: list[Mapping[str, Any]] = []
+        prior_task_ids: list[str] = []
+        for record in self._forge.registry.records():
+            prior_task_ids.append(record.artifact.task_id)
+            if record.status is not DynamicTaskStatus.REJECTED:
+                continue
+            prior_rejections.append(
+                {
+                    "task_id": record.artifact.task_id,
+                    "reasons": list(record.validation.reasons)[:8],
+                }
+            )
+        direction["prior_rejected_tasks"] = prior_rejections[-8:]
+        direction["declared_task_ids"] = sorted(set(prior_task_ids))[:64]
+        audit = _brief(self._artifacts, prosecutor_audit)
+        hypotheses = audit.get("curriculum")
+        if isinstance(hypotheses, list) and hypotheses:
+            direction["prosecutor_curriculum_hypotheses"] = hypotheses[:8]
+        council_data = _brief(self._artifacts, council)
+        agenda: list[Mapping[str, Any]] = []
+        messages = council_data.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, Mapping):
+                    continue
+                summary = message.get("summary")
+                if isinstance(summary, str) and summary.strip():
+                    agenda.append(
+                        {
+                            "sender": message.get("sender"),
+                            "message_type": message.get("message_type"),
+                            "summary": summary[:600],
+                        }
+                    )
+        amendment = council_data.get("amendment")
+        if isinstance(amendment, Mapping) and amendment:
+            direction["council_amendment"] = amendment
+        if agenda:
+            direction["council_agenda"] = agenda[:9]
+        return direction
+
     def forge_next_tasks(
         self,
         snapshot: CurriculumSnapshot,
@@ -2839,13 +2937,20 @@ class ModelCyclePorts:
                     "authoritative deliverable is the task_specs array in your submit "
                     "payload. Keep the spec compact: at most 6 cases per suite, one "
                     "mutant, and each source file under 40 lines. Adapt the template to "
-                    "the target function; do not restate unrelated context. Produce the "
+                    "the target function; do not restate unrelated context. Consult "
+                    "curriculum_direction before authoring: never repeat a spec that "
+                    "prior_rejected_tasks shows was rejected, cover the gaps named in "
+                    "prosecutor_curriculum_hypotheses and council_agenda when feasible, "
+                    "and pick a task_id absent from declared_task_ids. Produce the "
                     "spec directly in your final message; do not narrate your plan."
                 ),
                 context={
                     "snapshot": _truncate(snapshot.to_mapping()),
                     "attempt": attempt,
                     "previous_validation_errors": repair_feedback[:32],
+                    "curriculum_direction": self._curriculum_direction(
+                        prosecutor_audit, council
+                    ),
                     "taskpack_contract": {
                         "language": "python",
                         "deliverable": "submit payload task_specs",
@@ -3321,6 +3426,11 @@ class ModelCyclePorts:
             collection_evidence_id=collection_evidence_id,
             meta_evolution_enabled=self._meta_evolution_enabled,
             reflections=[{"proposals": council_reflection_proposals}],
+            enabled_surfaces=(
+                tuple(sorted(self._enabled_surfaces))
+                if self._enabled_surfaces is not None
+                else None
+            ),
         )
         result["collected"] = [
             item.to_mapping() for item in consumed if item.collected
@@ -3359,6 +3469,33 @@ class ModelCyclePorts:
                 None,
             )
         if candidate is None:
+            # Non-Warrior candidates cannot run a Warrior-solve shadow arm;
+            # reject them with an explicit reason instead of leaving them
+            # stuck in VALIDATED forever.
+            stranded = [
+                item
+                for item in self._evolution.validated_candidates()
+                if item.target_role is not Role.WARRIOR
+            ]
+            for item in stranded:
+                self._evolution.reject(
+                    item.candidate_id,
+                    reason=(
+                        "only Warrior-target candidates are shadow-evaluated and "
+                        "activated in this release"
+                    ),
+                )
+                result["rejected"].append(
+                    {
+                        "surface": item.surface.value,
+                        "target_role": item.target_role.value,
+                        "artifact_id": item.artifact_id,
+                        "error": (
+                            "only Warrior-target candidates are shadow-evaluated "
+                            "and activated in this release"
+                        ),
+                    }
+                )
             result["role_generations"] = self._record_role_generations(snapshot)
             return result
         result["candidate"] = {
@@ -3684,6 +3821,7 @@ class ModelCyclePorts:
             ),
             max_total_cost_increase=promotion.max_total_cost_increase,
             enforce_cost_limit=promotion.enforce_cost_limit,
+            min_seed_delta_floor=promotion.min_seed_delta_floor,
         )
         evaluator_fingerprint = "sealed-evaluator-sha256:" + hashlib.sha256(
             canonical_json(
@@ -3776,16 +3914,43 @@ class ModelCyclePorts:
         for seed in (0, 1):
             champion_label = f"candidate-baseline-{seed}"
             candidate_label = f"candidate-shadow-{seed}"
-            baseline_solve = self._solve_arm(
-                snapshot,
-                evaluation_cohort,
-                tasks,
-                champion_binding,
-                arm_label=champion_label,
-                max_steps=self._candidate_step_limit(),
-                evaluation_seed=seed,
-                evaluation_design_id=design.design_id,
-            )
+            baseline_solve: Mapping[str, Any] | None = None
+            baseline_workspace: bytes | None = None
+            baseline_source = "dedicated-arm"
+            if seed == 0 and self._main_solve_evidence is not None:
+                evaluation_task_ids = frozenset(
+                    str(item.get("artifact_id", "")) for item in tasks
+                )
+                if (
+                    self._main_solve_task_ids == evaluation_task_ids
+                    and isinstance(
+                        self._main_solve_evidence.get("workspace_artifact_id"), str
+                    )
+                    and "champion" in self._arm_workspaces
+                ):
+                    # Reuse the main-cycle champion solve as the seed-0
+                    # baseline: same cohort, same binding, full step budget,
+                    # and one fewer full model run per evaluation.
+                    baseline_solve = {
+                        **self._main_solve_evidence,
+                        "arm": champion_label,
+                        "evaluation_seed": seed,
+                        "baseline_source": "main-solve",
+                    }
+                    baseline_workspace = self._arm_workspaces["champion"]
+                    baseline_source = "main-solve"
+            if baseline_solve is None:
+                baseline_solve = self._solve_arm(
+                    snapshot,
+                    evaluation_cohort,
+                    tasks,
+                    champion_binding,
+                    arm_label=champion_label,
+                    max_steps=self._candidate_step_limit(),
+                    evaluation_seed=seed,
+                    evaluation_design_id=design.design_id,
+                )
+                baseline_workspace = self._arm_workspaces[champion_label]
             candidate_mcp_bridge = None
             if mcp_candidate is not None:
                 assert self._mcp_bridge is not None
@@ -3808,7 +3973,6 @@ class ModelCyclePorts:
                 treatment_integrity_passed = candidate_mcp_bridge.candidate_was_used(
                     mcp_candidate.binding.binding_id
                 )
-            baseline_workspace = self._arm_workspaces[champion_label]
             candidate_workspace = self._arm_workspaces[candidate_label]
             baseline_eval = evaluate_frozen_workspace(
                 self._dynamic,
@@ -3896,6 +4060,7 @@ class ModelCyclePorts:
             arm_rows.append(
                 {
                     "seed": seed,
+                    "baseline_source": baseline_source,
                     "champion": champion_arm.to_mapping(),
                     "candidate": candidate_arm.to_mapping(),
                     "sealed_pair": gate_pairs[-1].to_mapping(),
@@ -5133,10 +5298,10 @@ def _runtime_policy_genesis_values(
         "max_evolution_requests_per_run": 1,
         "max_evolution_source_refs": 5,
         "task_authoring_attempts": 2,
-        "task_proposals_per_cycle": 1,
+        "task_proposals_per_cycle": 3,
         "cohort_limit": 3,
         "candidate_evaluations_per_cycle": 1,
-        "candidate_max_steps": int(getattr(autonomy, "candidate_max_extra_steps", 12)),
+        "candidate_max_steps": int(getattr(autonomy, "candidate_max_extra_steps", 24)),
         "population_max_cells": 128,
         "council_max_messages": int(getattr(autonomy, "council_max_messages", 200)),
         "council_max_tokens": int(getattr(autonomy, "council_max_tokens", 4_194_304)),
@@ -5212,7 +5377,7 @@ def run_v2_cycle(
     environment_builder: EnvironmentBuilder | None = None,
     default_image: str | None = None,
     evaluate_candidates_enabled: bool = True,
-    candidate_max_extra_steps: int = 12,
+    candidate_max_extra_steps: int = 24,
     campaign_config: Any = None,
     harness_repo: HarnessRepo | None = None,
     harness_backend: HarnessBackend | None = None,
@@ -5264,6 +5429,12 @@ def run_v2_cycle(
     autonomy_config = getattr(campaign_config, "autonomy_v2", None)
     council_max_messages = int(getattr(autonomy_config, "council_max_messages", 24))
     council_max_tokens = int(getattr(autonomy_config, "council_max_tokens", 4_194_304))
+    configured_surfaces = getattr(autonomy_config, "evolution_surfaces", None)
+    enabled_surfaces: tuple[str, ...] | None = (
+        tuple(str(item) for item in configured_surfaces)
+        if configured_surfaces
+        else None
+    )
     require_warrior_strategy_proposal = bool(
         getattr(autonomy_config, "require_warrior_strategy_proposal", False)
     )
@@ -5309,6 +5480,12 @@ def run_v2_cycle(
             for name, config in role_configs.items()
         }
         candidate_max_extra_steps = cast(int, policy_values["candidate_max_steps"])
+        enabled_surfaces_raw = policy_values.get("evolution_surfaces")
+        enabled_surfaces = (
+            tuple(str(item) for item in enabled_surfaces_raw)
+            if isinstance(enabled_surfaces_raw, (list, tuple)) and enabled_surfaces_raw
+            else None
+        )
         subagent_max_steps = cast(int, policy_values["subagent_max_steps"])
         subagent_timeout_seconds = float(
             cast(float | int, policy_values["subagent_timeout_seconds"])
@@ -5429,6 +5606,7 @@ def run_v2_cycle(
         default_image=default_image,
         evaluate_candidates_enabled=evaluate_candidates_enabled,
         candidate_max_extra_steps=candidate_max_extra_steps,
+        evolution_surfaces=enabled_surfaces,
         budget_policy_sha256=policy_hash,
         harness_repo=harness_repo,
         harness_backend=harness_backend,

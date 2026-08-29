@@ -121,7 +121,7 @@ class AutonomyV2Config:
     subagent_max_result_bytes: int = 65_536
     environment_output_repository: str | None = None
     scanner_binary: str = "trivy"
-    candidate_max_extra_steps: int = 12
+    candidate_max_extra_steps: int = 24
     require_warrior_strategy_proposal: bool = False
 
     _FIELDS = frozenset(
@@ -335,7 +335,7 @@ class AutonomyV2Config:
         if not isinstance(scanner_binary, str) or not scanner_binary or scanner_binary != scanner_binary.strip():
             raise ConfigError("autonomy_v2.scanner_binary must be a non-empty trimmed string")
         candidate_steps = _positive_int(
-            raw.get("candidate_max_extra_steps", 12),
+            raw.get("candidate_max_extra_steps", 24),
             "autonomy_v2.candidate_max_extra_steps",
         )
         return cls(
