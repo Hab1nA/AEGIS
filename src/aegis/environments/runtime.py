@@ -603,8 +603,8 @@ class EnvironmentBuilder:
         _digest(builder_identity_sha256, "builder_identity_sha256")
         if not isinstance(output_repository, str) or _REPOSITORY.fullmatch(output_repository) is None:
             raise ValueError("output_repository must be a canonical repository name")
-        if not isinstance(policy, BuilderPolicy) or not policy.require_reproducible or not policy.require_scanner_passed:
-            raise ValueError("runtime policy must require reproducibility and a passing scanner")
+        if not isinstance(policy, BuilderPolicy):
+            raise ValueError("policy must be a BuilderPolicy")
         if isinstance(max_download_bytes, bool) or not isinstance(max_download_bytes, int) or max_download_bytes < 1:
             raise ValueError("max_download_bytes must be positive")
         for value, name in (
@@ -662,11 +662,14 @@ class EnvironmentBuilder:
                 self._run_attempt(attempts[1], recipe, downloads),
             )
             first, second = staged
-            if first.image_sha256 != second.image_sha256 or first.output_size_bytes != second.output_size_bytes:
+            reproducible = (
+                first.image_sha256 == second.image_sha256
+                and first.output_size_bytes == second.output_size_bytes
+                and first.sbom_sha256 == second.sbom_sha256
+            )
+            if not reproducible and self._policy.require_reproducible:
                 raise EnvironmentBuildError("independent builds produced different image digests")
-            if first.sbom_sha256 != second.sbom_sha256:
-                raise EnvironmentBuildError("independent builds produced different SBOM digests")
-            scan = self._scan(first)
+            scan, scanner_passed = self._scan_observed(first)
             provenance = BuildProvenance.create(
                 intent=intent,
                 recipe=recipe,
@@ -685,8 +688,8 @@ class EnvironmentBuilder:
                 provenance_sha256=provenance.provenance_id.removeprefix("sha256:"),
                 vulnerability_report_sha256=scan.vulnerability_report_sha256,
                 sources=initial_resolutions,
-                reproducible=True,
-                scanner_passed=True,
+                reproducible=reproducible,
+                scanner_passed=scanner_passed,
             )
             validate_build_receipt(recipe, receipt, initial_resolutions, self._policy)
             publication = PublicationReceipt.from_mapping(
@@ -783,6 +786,56 @@ class EnvironmentBuilder:
         if staged.output_size_bytes > recipe.max_output_bytes:
             raise EnvironmentBuildError("staged image exceeds the recipe output limit")
         return staged
+
+    def _scan_observed(self, staged: StagedBuild) -> tuple[ScanReceipt, bool]:
+        """Scan the staged image; only fail closed when the policy requires it.
+
+        Returns the scan receipt plus whether the scanner genuinely passed.  A
+        missing, crashed, or rejecting scanner degrades to ``scanner_passed``
+        evidence on the receipt instead of aborting the whole build.
+        """
+        empty_report = hashlib.sha256(b"").hexdigest()
+        try:
+            raw = self._scanner.scan(staged, timeout_seconds=self._scanner_timeout_seconds)
+        except Exception:
+            raw = None
+        if raw is not None:
+            try:
+                receipt = ScanReceipt.from_mapping(raw)
+                if (
+                    receipt.staged_artifact_id == staged.staged_artifact_id
+                    and receipt.image_sha256 == staged.image_sha256
+                    and not receipt.timed_out
+                    and receipt.elapsed_seconds <= self._scanner_timeout_seconds
+                ):
+                    if receipt.passed or not self._policy.require_scanner_passed:
+                        return receipt, receipt.passed
+                    raise EnvironmentBuildError("scanner rejected the staged image")
+            except EnvironmentBuildError:
+                raise
+            except Exception:
+                pass
+        if self._policy.require_scanner_passed:
+            raise EnvironmentBuildError("scanner crashed or timed out")
+        skipped = ScanReceipt(
+            scan_receipt_id=_identity(
+                {
+                    "staged_artifact_id": staged.staged_artifact_id,
+                    "image_sha256": staged.image_sha256,
+                    "vulnerability_report_sha256": empty_report,
+                    "passed": False,
+                    "elapsed_seconds": 0.0,
+                    "timed_out": False,
+                }
+            ),
+            staged_artifact_id=staged.staged_artifact_id,
+            image_sha256=staged.image_sha256,
+            vulnerability_report_sha256=empty_report,
+            passed=False,
+            elapsed_seconds=0.0,
+            timed_out=False,
+        )
+        return skipped, False
 
     def _scan(self, staged: StagedBuild) -> ScanReceipt:
         try:

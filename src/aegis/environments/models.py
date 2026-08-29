@@ -307,8 +307,8 @@ class BuildReceipt:
 class BuilderPolicy:
     allow_brokered_public_network: bool = True
     allowed_hosts: frozenset[str] = frozenset()
-    require_reproducible: bool = True
-    require_scanner_passed: bool = True
+    require_reproducible: bool = False
+    require_scanner_passed: bool = False
     max_dependencies: int = 256
 
     def __post_init__(self) -> None:

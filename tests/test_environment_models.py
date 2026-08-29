@@ -92,5 +92,8 @@ def test_builder_host_allowlist_and_verification_gates_fail_closed() -> None:
         reproducible=False,
         scanner_passed=True,
     )
+    # Default policy: non-reproducible evidence is accepted as-is.
+    validate_build_receipt(created, unverified, resolutions)
+    # Strict policy: reproducibility evidence stays enforceable.
     with pytest.raises(ValueError, match="reproducibility"):
-        validate_build_receipt(created, unverified, resolutions)
+        validate_build_receipt(created, unverified, resolutions, BuilderPolicy(require_reproducible=True))

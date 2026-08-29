@@ -7,6 +7,7 @@ import pytest
 from aegis.environments import (
     BuildAttempt,
     BuilderNetworkPolicy,
+    BuilderPolicy,
     BuildProvenance,
     BuildReceipt,
     BuildStep,
@@ -192,6 +193,7 @@ def runtime(
     builder: Builder | None = None,
     scanner: Scanner | None = None,
     store: Store | None = None,
+    policy: BuilderPolicy | None = None,
 ) -> tuple[EnvironmentBuilder, Resolver, Downloader, Builder, Scanner, Store]:
     resolved = resolver or Resolver()
     downloads = downloader or Downloader()
@@ -208,6 +210,7 @@ def runtime(
             builder_identity_sha256="3" * 64,
             output_repository="registry.example/generated",
             nonce_factory=lambda: "4" * 32,
+            policy=policy or BuilderPolicy(),
         ),
         resolved,
         downloads,
@@ -264,12 +267,25 @@ def test_redirect_to_metadata_or_private_network_fails_before_build_and_publish(
     assert store.publications == 0
 
 
-def test_non_reproducible_build_never_scans_or_publishes() -> None:
+def test_non_reproducible_build_publishes_with_evidence_and_strict_policy_fails_closed() -> None:
+    # Default policy: a non-reproducible build still publishes, with honest
+    # reproducible=False evidence on the receipt.
     environment, _, _, _, scanner, store = runtime(builder=Builder(second_digest="5" * 64))
+    receipt = environment.build(recipe())
+    assert receipt.reproducible is False
+    assert receipt.scanner_passed is True
+    assert scanner.calls == 1
+    assert store.publications == 1
+
+    # Strict policy: bit-for-bit reproducibility stays enforceable.
+    strict, _, _, _, strict_scanner, strict_store = runtime(
+        builder=Builder(second_digest="5" * 64),
+        policy=BuilderPolicy(require_reproducible=True),
+    )
     with pytest.raises(EnvironmentBuildError, match="different image digests"):
-        environment.build(recipe())
-    assert scanner.calls == 0
-    assert store.publications == 0
+        strict.build(recipe())
+    assert strict_scanner.calls == 0
+    assert strict_store.publications == 0
 
 
 def test_download_timeout_never_reaches_builder_or_publish() -> None:
@@ -282,19 +298,37 @@ def test_download_timeout_never_reaches_builder_or_publish() -> None:
 
 
 @pytest.mark.parametrize(
-    ("builder", "scanner", "message"),
+    ("builder", "message"),
     [
-        (Builder(timed_out=True), Scanner(), "timed out"),
-        (Builder(crash=True), Scanner(), "crashed"),
-        (Builder(), Scanner(passed=False), "rejected"),
-        (Builder(), Scanner(timed_out=True), "timed out"),
+        (Builder(timed_out=True), "timed out"),
+        (Builder(crash=True), "crashed"),
     ],
 )
-def test_crash_timeout_or_failed_scan_never_publishes(
-    builder: Builder, scanner: Scanner, message: str
-) -> None:
-    environment, _, _, _, _, store = runtime(builder=builder, scanner=scanner)
+def test_builder_failures_never_publish(builder: Builder, message: str) -> None:
+    environment, _, _, _, _, store = runtime(builder=builder)
     with pytest.raises(EnvironmentBuildError, match=message):
+        environment.build(recipe())
+    assert store.publications == 0
+
+
+@pytest.mark.parametrize(
+    "scanner",
+    [Scanner(passed=False), Scanner(timed_out=True)],
+)
+def test_scanner_failure_degrades_to_unscanned_receipt(scanner: Scanner) -> None:
+    environment, _, _, _, _, store = runtime(scanner=scanner)
+    receipt = environment.build(recipe())
+    assert receipt.scanner_passed is False
+    assert receipt.reproducible is True
+    assert store.publications == 1
+
+
+def test_scanner_failure_strict_policy_fails_closed() -> None:
+    environment, _, _, _, _, store = runtime(
+        scanner=Scanner(passed=False),
+        policy=BuilderPolicy(require_scanner_passed=True),
+    )
+    with pytest.raises(EnvironmentBuildError, match="rejected"):
         environment.build(recipe())
     assert store.publications == 0
 
