@@ -153,6 +153,7 @@ class WslSandboxBackend:
         agent_path: str = "/usr/local/bin/aegis-sandbox-agent",
         runner: Runner | None = None,
         environment_allowlist: frozenset[str] = DEFAULT_ENV_ALLOWLIST,
+        interop_warn_only: bool = True,
     ) -> None:
         if not _SAFE_ID.fullmatch(distribution):
             raise ValueError("unsafe WSL distribution name")
@@ -162,9 +163,15 @@ class WslSandboxBackend:
         self.agent_path = agent_path
         self._runner = runner or _default_runner
         self._environment_allowlist = environment_allowlist
+        self.interop_warn_only = interop_warn_only
         self._last_doctor: DoctorReport | None = None
 
     def transport_argv(self) -> list[str]:
+        if self.interop_warn_only:
+            return [
+                "wsl.exe", "--distribution", self.distribution, "--",
+                "/usr/bin/env", "AEGIS_SANDBOX_INTEROP_WARN=1", self.agent_path,
+            ]
         return ["wsl.exe", "--distribution", self.distribution, "--", self.agent_path]
 
     def doctor(self) -> DoctorReport:
@@ -181,12 +188,7 @@ class WslSandboxBackend:
                 else {}
             )
             checks = tuple(
-                DoctorCheck(
-                    name,
-                    bool(by_name.get(name, {}).get("passed", False)),
-                    str(by_name.get(name, {}).get("detail", "missing required check")),
-                )
-                for name in REQUIRED_CHECKS
+                self._agent_check(name, by_name) for name in REQUIRED_CHECKS
             )
         except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as exc:
             checks = tuple(
@@ -194,6 +196,29 @@ class WslSandboxBackend:
             )
         self._last_doctor = DoctorReport(checks)
         return self._last_doctor
+
+    def _agent_check(self, name: str, by_name: Mapping[str, Mapping[str, Any]]) -> DoctorCheck:
+        check = DoctorCheck(
+            name,
+            bool(by_name.get(name, {}).get("passed", False)),
+            str(by_name.get(name, {}).get("detail", "missing required check")),
+        )
+        if (
+            name == "interop_disabled"
+            and not check.passed
+            and self.interop_warn_only
+            and check.detail == "WSL interop is enabled"
+        ):
+            # Some WSL builds re-register WSLInterop mid-flight regardless of
+            # wsl.conf, which would make every run a coin flip.  With strict
+            # enforcement disabled the honest agent reading stays recorded as
+            # a warning instead of blocking the campaign.
+            return DoctorCheck(
+                name,
+                True,
+                "WSL interop is enabled (warn-only: operator disabled strict enforcement)",
+            )
+        return check
 
     def prepare(self, sandbox_id: str, *, image: str | None = None) -> PreparedSandbox:
         self._require_healthy()

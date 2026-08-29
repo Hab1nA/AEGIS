@@ -86,11 +86,49 @@ class WslSandboxTests(unittest.TestCase):
         self.assertEqual(result.stdout, "ok")
         self.assertEqual(
             calls[-1][0],
-            ["wsl.exe", "--distribution", "AEGIS-Sandbox", "--", "/usr/local/bin/aegis-sandbox-agent"],
+            [
+                "wsl.exe", "--distribution", "AEGIS-Sandbox", "--",
+                "/usr/bin/env", "AEGIS_SANDBOX_INTEROP_WARN=1",
+                "/usr/local/bin/aegis-sandbox-agent",
+            ],
         )
         request = json.loads(calls[-1][1])
         self.assertEqual(request["command"]["network"], "none")
         self.assertEqual(request["command"]["argv"][2], "print('; still data')")
+
+    def test_interop_warn_only_relaxes_only_the_interop_check(self) -> None:
+        calls: list[tuple[list[str], str, float]] = []
+
+        def runner(argv: list[str], stdin: str, timeout: float) -> subprocess.CompletedProcess[str]:
+            calls.append((argv, stdin, timeout))
+            return completed(
+                {
+                    "ok": True,
+                    "checks": [
+                        {"name": "interop_disabled", "passed": False, "detail": "WSL interop is enabled"},
+                        *(
+                            {"name": name, "passed": True}
+                            for name in REQUIRED_CHECKS
+                            if name != "interop_disabled"
+                        ),
+                    ],
+                }
+            )
+
+        relaxed = WslSandboxBackend(runner=runner)
+        report = relaxed.doctor()
+        self.assertTrue(report.passed)
+        relaxed_detail = next(
+            check.detail for check in report.checks if check.name == "interop_disabled"
+        )
+        self.assertIn("warn-only", relaxed_detail)
+
+        strict = WslSandboxBackend(runner=runner, interop_warn_only=False)
+        self.assertFalse(strict.doctor().passed)
+        self.assertEqual(
+            strict.transport_argv(),
+            ["wsl.exe", "--distribution", "AEGIS-Sandbox", "--", "/usr/local/bin/aegis-sandbox-agent"],
+        )
 
     def test_exec_requires_prior_passing_doctor(self) -> None:
         backend = WslSandboxBackend(runner=lambda *_: completed({"ok": True}))

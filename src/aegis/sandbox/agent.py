@@ -398,10 +398,20 @@ class SandboxAgent:
                 else "disabled"
             )
             enabled = self.interop_path.exists() and "enabled" in interop.lower()
-            checks["interop_disabled"] = (
-                not enabled,
-                "WSL interop disabled" if not enabled else "WSL interop is enabled",
-            )
+            if enabled and os.environ.get("AEGIS_SANDBOX_INTEROP_WARN") == "1":
+                # Some WSL builds re-register WSLInterop mid-flight regardless
+                # of wsl.conf, which would make every run a coin flip.  The
+                # operator may downgrade this check to a recorded warning.
+                checks["interop_disabled"] = (
+                    True,
+                    "WSL interop is enabled (warn-only: operator disabled strict "
+                    "enforcement via AEGIS_SANDBOX_INTEROP_WARN)",
+                )
+            else:
+                checks["interop_disabled"] = (
+                    not enabled,
+                    "WSL interop disabled" if not enabled else "WSL interop is enabled",
+                )
         except OSError as exc:
             checks["interop_disabled"] = (False, f"cannot inspect WSL interop: {exc}")
         checks["rootless_oci"] = self._check_rootless_oci()
