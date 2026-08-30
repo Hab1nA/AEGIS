@@ -1182,7 +1182,9 @@ class RuntimePolicyRegistry:
                 raise RuntimePolicyConflictError("request_id already identifies another amendment request")
             base = self.effective_for_stage(requested_at)
             if base_policy_id is not None and base.policy_id != base_policy_id:
-                raise RuntimePolicyConflictError("base_policy_id is stale")
+                raise RuntimePolicyConflictError(
+                    f"base_policy_id is stale; current policy_id is {base.policy_id}"
+                )
             if base.schema_version != 2:
                 raise RuntimePolicyError("immediate amendments require a v2 runtime policy")
             values = cast(dict[str, Any], thaw_json(cast(JsonValue, base.values)))
@@ -1231,7 +1233,9 @@ class RuntimePolicyRegistry:
                 raise RuntimePolicyConflictError("request_id already identifies another amendment request")
             base = self.effective_for_stage(requested_at)
             if base_policy_id is not None and base.policy_id != base_policy_id:
-                raise RuntimePolicyConflictError("base_policy_id is stale")
+                raise RuntimePolicyConflictError(
+                    f"base_policy_id is stale; current policy_id is {base.policy_id}"
+                )
             try:
                 target = self._versions[target_policy_id]
             except KeyError as exc:

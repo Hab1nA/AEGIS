@@ -166,7 +166,7 @@ def _evolution_cycle(args: argparse.Namespace) -> Mapping[str, Any]:
     registry = DynamicTaskRegistry(root / "dynamic_tasks.sqlite3")
     try:
         seeded: list[str] = []
-        if not args.dry_run and not args.no_seed_anchors and not registry.records():
+        if not args.dry_run and not args.no_seed_anchors:
             sandbox: SandboxBackend = (
                 FakeSandboxBackend() if config.sandbox_backend == "fake" else WslSandboxBackend()
             )

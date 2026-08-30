@@ -94,6 +94,7 @@ class PromotionGatePolicy:
     max_total_cost_increase: float
     enforce_cost_limit: bool
     min_seed_delta_floor: float = -0.10
+    cost_savings_path: float = 0.10
 
     def __post_init__(self) -> None:
         # The sealed design is fixed to the independently replayed seeds [0,1].
@@ -122,6 +123,12 @@ class PromotionGatePolicy:
             minimum=-1.0,
             maximum=0.0,
         )
+        _number(
+            self.cost_savings_path,
+            "promotion_gate.cost_savings_path",
+            minimum=0.0,
+            maximum=1.0,
+        )
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -133,6 +140,7 @@ class PromotionGatePolicy:
             "max_total_cost_increase": float(self.max_total_cost_increase),
             "enforce_cost_limit": self.enforce_cost_limit,
             "min_seed_delta_floor": float(self.min_seed_delta_floor),
+            "cost_savings_path": float(self.cost_savings_path),
         }
 
 
@@ -213,6 +221,7 @@ class ControlCorePolicy:
         gate_data = dict(data["promotion_gate"])
         # Legacy candidate payloads predate the per-seed floor; default it.
         gate_data.setdefault("min_seed_delta_floor", -0.10)
+        gate_data.setdefault("cost_savings_path", 0.10)
         gate = _strict(
             gate_data,
             {
@@ -222,6 +231,7 @@ class ControlCorePolicy:
                 "max_total_cost_increase",
                 "enforce_cost_limit",
                 "min_seed_delta_floor",
+                "cost_savings_path",
             },
             "control_core.promotion_gate",
         )
@@ -245,7 +255,7 @@ class ControlCorePolicy:
 
 DEFAULT_CONTROL_CORE_POLICY = ControlCorePolicy(
     SealedEvaluatorPolicy(0.25, 0.75, 120.0),
-    PromotionGatePolicy(2, 0.02, 0.01, 0.10, False, -0.10),
+    PromotionGatePolicy(2, 0.02, 0.01, 0.10, False, -0.10, 0.10),
     InternalTaskSandboxPolicy(
         "none",
         True,

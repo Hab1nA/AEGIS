@@ -449,8 +449,19 @@ def resolve_role_binding(
                 and candidate_manifest.model_profile_sha256 == model_profile
             ):
                 manifest = candidate_manifest
-        except (EvolutionRuntimeError, ValueError, TypeError):
-            manifest = None
+        except (EvolutionRuntimeError, ValueError, TypeError) as exc:
+            # Fail loud: an activated manifest that cannot resolve would
+            # silently discard every evolved workflow/subject below.
+            raise EvolutionRuntimeError(
+                f"active role-manifest {active_identity.artifact_id} failed to "
+                f"resolve: {exc}"
+            ) from exc
+        if manifest is None:
+            raise EvolutionRuntimeError(
+                f"active role-manifest {active_identity.artifact_id} does not match "
+                f"role {role.value} or the configured model profile; refusing to "
+                "silently fall back to default inputs"
+            )
 
     if manifest is not None:
         workflow = validate_workflow_content(

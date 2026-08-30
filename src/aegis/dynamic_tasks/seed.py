@@ -44,9 +44,14 @@ class GenesisSeeder:
         *,
         creator_generation: int = 1,
     ) -> tuple[DynamicTaskRecord, ...]:
-        if self.registry.records():
+        known = {record.artifact.task_id for record in self.registry.records()}
+        packs = [
+            pack
+            for pack in load_builtin_python_taskpacks(self.builtin_root)
+            if pack.manifest.task_id not in known
+        ]
+        if not packs:
             return ()
-        packs = load_builtin_python_taskpacks(self.builtin_root)
         records: list[DynamicTaskRecord] = []
         for pack in sorted(packs, key=lambda item: (item.manifest.task_id, item.manifest.version)):
             records.append(

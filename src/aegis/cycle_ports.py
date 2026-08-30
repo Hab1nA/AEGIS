@@ -1052,6 +1052,29 @@ class ModelCyclePorts:
             and evaluation_task_ids <= main_task_ids
         )
 
+    def _runtime_policy_envelope(
+        self, paired_design_id: str | None, boundary: RuntimeStageBoundary
+    ) -> Mapping[str, Any]:
+        """Policy values plus the identity/consumption data the Prosecutor
+        needs to construct a legal adjust_runtime_policy call."""
+        version = (
+            self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
+            if paired_design_id is not None
+            else self._runtime_policy_registry.effective_for_stage(boundary)
+        )
+        envelope: dict[str, Any] = {
+            **cast(
+                Mapping[str, Any],
+                thaw_json(cast(JsonValue, version.values)),
+            ),
+            "runtime_policy_id": version.policy_id,
+        }
+        if self._runtime_ledger is not None:
+            envelope["runtime_policy_consumed"] = dict(
+                self._runtime_ledger.consumed().to_policy_mapping()
+            )
+        return envelope
+
     def _warrior_step_budget(self) -> int:
         if self._runtime_policy_registry is not None:
             boundary = RuntimeStageBoundary(
@@ -1216,14 +1239,7 @@ class ModelCyclePorts:
             "meta_evolution_enabled": self._meta_evolution_enabled,
             "runtime_policy_adjuster": self._adjust_runtime_policy,
             "runtime_policy_values": (
-                (lambda: cast(
-                    Mapping[str, Any],
-                    (
-                        self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
-                        if paired_design_id is not None
-                        else self._runtime_policy_registry.effective_for_stage(boundary)
-                    ).values,
-                ))
+                (lambda: self._runtime_policy_envelope(paired_design_id, boundary))
                 if self._runtime_policy_registry is not None
                 else None
             ),
@@ -1262,16 +1278,8 @@ class ModelCyclePorts:
             def active_policy_values(_runtime_role: GatewayRole) -> Mapping[str, Any]:
                 if self._runtime_policy_registry is None:
                     return {}
-                values = cast(
-                    dict[str, Any],
-                    thaw_json(cast(
-                        JsonValue,
-                        (
-                            self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
-                            if paired_design_id is not None
-                            else self._runtime_policy_registry.effective_for_stage(boundary)
-                        ).values,
-                    )),
+                values = dict(
+                    self._runtime_policy_envelope(paired_design_id, boundary)
                 )
                 if max_steps is not None:
                     steps = cast(dict[str, Any], values["role_max_steps"])
@@ -1904,7 +1912,10 @@ class ModelCyclePorts:
                 "workspace_digest before drawing evidence conclusions.  Submit one payload with "
                 "usage_verified, risk findings, and curriculum_hypotheses (a list of "
                 "{hypothesis_id, summary, confidence} objects for the next cycle; the control "
-                "plane feeds them to the next task author under that exact key). "
+                "plane feeds them to the next task author under that exact key). The envelope "
+                "carries runtime_policy_id and runtime_policy_consumed; if consumed figures show "
+                "exhausted budgets or a flow bottleneck, call aegis.adjust_runtime_policy once "
+                "before submit with base_policy_id copied from runtime_policy_id. "
                 "You may nominate one subject candidate per role by declaring role_candidates "
                 "as an object mapping a role name to {content:{content_markdown, rationale}}; "
                 "nominated candidates are collected and evaluated by the same gates as Warrior "
@@ -2028,7 +2039,10 @@ class ModelCyclePorts:
                     and all(isinstance(ref, str) and ref.strip() for ref in item["evidence_refs"])
                 ):
                     valid_requests.append(dict(item))
-        proposals = evidence.get("submission", {}).get("proposals", [])
+        submission_payload = evidence.get("submission", {})
+        proposals = submission_payload.get("proposals") or submission_payload.get(
+            "strategy_proposals", []
+        )
         valid_proposals: list[Mapping[str, Any]] = []
         if isinstance(proposals, list):
             for item in proposals:
@@ -2153,12 +2167,22 @@ class ModelCyclePorts:
         )
         reflection_payloads = [_read(self._artifacts, ref) for ref in reflections]
         reflection_proposals: list[Mapping[str, Any]] = []
+        runtime_policy_requests: list[Mapping[str, Any]] = []
         for payload in reflection_payloads:
             raw_proposals = payload.get("proposals", []) if isinstance(payload, Mapping) else []
             if isinstance(raw_proposals, list):
                 for item in raw_proposals:
                     if isinstance(item, Mapping):
                         reflection_proposals.append(dict(item))
+            raw_requests = (
+                payload.get("runtime_policy_requests", [])
+                if isinstance(payload, Mapping)
+                else []
+            )
+            if isinstance(raw_requests, list):
+                for item in raw_requests:
+                    if isinstance(item, Mapping):
+                        runtime_policy_requests.append(dict(item))
         for payload in reflection_payloads:
             transcript.append(CouncilMessage.from_mapping(payload["message"]))
         chair = self._run_role(
@@ -2185,10 +2209,29 @@ class ModelCyclePorts:
                 "judge_review": _brief(self._artifacts, judge_review),
                 "prosecutor_audit": _brief(self._artifacts, prosecutor_audit),
                 "pending_runtime_policy_amendments": (
-                    [item.to_artifact_mapping() for item in self._runtime_policy_registry.pending_council_amendments()]
+                    [
+                        {**item.to_artifact_mapping(), "amendment_id": item.amendment_id}
+                        for item in self._runtime_policy_registry.pending_council_amendments()
+                    ]
                     if self._runtime_policy_registry is not None
                     else []
                 ),
+                "runtime_policy_requests": runtime_policy_requests,
+                "objective_history": {
+                    "required": int(
+                        self._policy_value(
+                            "objective_history_window", self._objective_history_window
+                        )
+                    ),
+                    "usable": self._usable_objective_history_count(
+                        int(
+                            self._policy_value(
+                                "objective_history_window",
+                                self._objective_history_window,
+                            )
+                        )
+                    ),
+                },
             },
         )
         chair_submission = chair.get("submission", {})
@@ -2220,7 +2263,10 @@ class ModelCyclePorts:
                         ),
                         context={
                             "pending_runtime_policy_amendments": [
-                                item.to_artifact_mapping()
+                                {
+                                    **item.to_artifact_mapping(),
+                                    "amendment_id": item.amendment_id,
+                                }
                                 for item in self._runtime_policy_registry.pending_council_amendments()
                             ],
                             "invalid_runtime_policy_decisions": _truncate(raw_decisions),
@@ -2542,6 +2588,16 @@ class ModelCyclePorts:
             return 0
         return int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
 
+    def _usable_objective_history_count(self, window: int) -> int:
+        """History entries that could produce a shadow result, cheap to count."""
+        history = self._objective_history()[-window:]
+        return sum(
+            1
+            for item in history
+            if str(item.get("snapshot_id", "")) in self._curriculum.projection.snapshots
+            and bool(item.get("usage_verified", False))
+        )
+
     def _shadow_objective_on_history(
         self, amendment: ObjectiveAmendment
     ) -> tuple[ShadowObjectiveResult, ...]:
@@ -2842,7 +2898,17 @@ class ModelCyclePorts:
             )
             self._append_objective_history(snapshot, cohort, submission, quality_lock)
             return {**outcome.to_mapping(), "probation": probation}
-        shadows = self._shadow_objective_on_history(amendment)
+        # Coverage pre-check: each shadow entry costs a full Warrior solve,
+        # so when the history window cannot satisfy the admission requirement
+        # anyway, reject now instead of sinking the solve cost first.
+        required_history = int(
+            self._policy_value(
+                "objective_history_window", self._objective_history_window
+            )
+        )
+        shadows: tuple[ShadowObjectiveResult, ...] = ()
+        if self._usable_objective_history_count(required_history) >= required_history:
+            shadows = self._shadow_objective_on_history(amendment)
         quality = _read(self._artifacts, quality_lock)
         integrity_objection = not bool(
             cast(Mapping[str, Any], quality.get("evaluation", {})).get(
@@ -2855,7 +2921,7 @@ class ModelCyclePorts:
             shadows,
             current_cycle=snapshot.cycle_number,
             integrity_objection=integrity_objection,
-            required_history=int(self._policy_value("objective_history_window", self._objective_history_window)),
+            required_history=required_history,
             probation_cycles=int(self._policy_value("objective_probation_cycles", self._objective_probation_cycles)),
         )
         try:
@@ -2985,8 +3051,11 @@ class ModelCyclePorts:
                     "template under templates/example-task/ for the expected structure and "
                     "semantics; you may run scratch checks with sandbox.exec, but the "
                     "authoritative deliverable is the task_specs array in your submit "
-                    "payload. Keep the spec compact: at most 6 cases per suite, one "
-                    "mutant, and each source file under 40 lines. Adapt the template to "
+                    "payload. Difficulty is the primary quality bar: aim the task at the "
+                    "current champion so at least one hidden case would fail a careless or "
+                    "previous-cycle solution (stateful setup, concurrency, edge partitions). "
+                    "Keep each spec compact anyway: at most 8 cases per suite, up to 2 "
+                    "mutants, and each source file under 60 lines. Adapt the template to "
                     "the target function; do not restate unrelated context. Consult "
                     "curriculum_direction before authoring: never repeat a spec that "
                     "prior_rejected_tasks shows was rejected, cover the gaps named in "
@@ -3010,7 +3079,8 @@ class ModelCyclePorts:
                             "prompt": "markdown task description",
                             "public_cases": {"version": 1, "cases": [{"name": "case-name", "clause_ids": ["FUNC.ARITHMETIC"], "steps": [{"op": "call", "symbol": "fn", "args": [1, 2], "expect": 3}]}]},
                             "public_test": "pytest source text",
-                            "hidden_cases": {"version": 1, "cases": [{"name": "case-name", "clause_ids": ["FUNC.ARITHMETIC"], "steps": [{"op": "call", "symbol": "fn", "args": [1, 2], "expect": 3}]}]},
+                            "hidden_cases": {"version": 1, "cases": [{"name": "case-name", "clause_ids": ["FUNC.ARITHMETIC"], "steps": [{"op": "construct", "symbol": "Counter", "args": [], "save": "obj"}, {"op": "parallel_method", "object": "obj", "method": "increment", "args": [], "workers": 8, "repeat": 2000}, {"op": "method", "object": "obj", "method": "value", "args": [], "expect": 16000}]}]},
+                            "step_ops": "call | method | construct | set_fixture | parallel_method | mutate | snapshot; assertions support expect, raises, expect_args, expect_kwargs, expect_fixtures — use them to build stateful and concurrency stress cases, not just pure calls",
                             "clauses": [{"clause_id": "FUNC.ARITHMETIC", "statement": "fn(a,b) returns the arithmetic result", "input_partition": "positive/zero/negative", "expected_outcome": "return", "security_relevant": False}],
                             "defect_clause_ids": ["FUNC.ARITHMETIC"],
                             "reference_solution": "python source text",
@@ -3021,6 +3091,7 @@ class ModelCyclePorts:
                             "reference passes public and hidden suites",
                             "defect is detected by at least one suite",
                             "hidden suite kills every mutant",
+                            "difficulty: the hidden suite should be hard enough that a naive or previous-cycle solution fails at least one case (the built-in python-atomic-counter pack is the reference exemplar)",
                         ],
                     },
                 },
@@ -3894,6 +3965,7 @@ class ModelCyclePorts:
             max_total_cost_increase=promotion.max_total_cost_increase,
             enforce_cost_limit=promotion.enforce_cost_limit,
             min_seed_delta_floor=promotion.min_seed_delta_floor,
+            cost_savings_path=promotion.cost_savings_path,
         )
         evaluator_fingerprint = "sealed-evaluator-sha256:" + hashlib.sha256(
             canonical_json(

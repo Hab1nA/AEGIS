@@ -491,7 +491,7 @@ class CampaignConfig:
     wall_time_seconds: int
     roles: Mapping[str, RoleConfig]
     task_pack_paths: tuple[str, ...]
-    max_agent_steps: int = 20
+    max_agent_steps: int = 24
     research_enabled: bool = True
     offline_research: bool = False
     test_mode: bool = False
@@ -570,7 +570,7 @@ class CampaignConfig:
                 raise ConfigError(f"roles.{name} must be an object")
             roles[name] = RoleConfig.from_mapping(value, expected_share=share)
         if acceptance_profile in AUTONOMY_ACCEPTANCE_PROFILES:
-            if _positive_int(raw.get("max_agent_steps", 20), "max_agent_steps") < AUTONOMY_MIN_AGENT_STEPS:
+            if _positive_int(raw.get("max_agent_steps", 24), "max_agent_steps") < AUTONOMY_MIN_AGENT_STEPS:
                 raise ConfigError(
                     f"acceptance profile requires max_agent_steps >= {AUTONOMY_MIN_AGENT_STEPS}"
                 )

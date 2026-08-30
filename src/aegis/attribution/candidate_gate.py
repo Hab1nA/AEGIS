@@ -168,6 +168,7 @@ class CandidateGatePolicy:
     max_total_cost_increase: float = 0.10
     enforce_cost_limit: bool = False
     min_seed_delta_floor: float = -0.10
+    cost_savings_path: float = 0.10
 
     def __post_init__(self) -> None:
         if isinstance(self.required_seeds, bool) or not isinstance(self.required_seeds, int):
@@ -178,6 +179,7 @@ class CandidateGatePolicy:
             "fresh_improvement",
             "regression_noninferiority_margin",
             "max_total_cost_increase",
+            "cost_savings_path",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -202,6 +204,7 @@ class CandidateGatePolicy:
             "max_total_cost_increase": float(self.max_total_cost_increase),
             "enforce_cost_limit": self.enforce_cost_limit,
             "min_seed_delta_floor": float(self.min_seed_delta_floor),
+            "cost_savings_path": float(self.cost_savings_path),
         }
 
     @classmethod
@@ -213,7 +216,7 @@ class CandidateGatePolicy:
             "max_total_cost_increase",
             "enforce_cost_limit",
         }
-        optional = {"min_seed_delta_floor"}
+        optional = {"min_seed_delta_floor", "cost_savings_path"}
         unknown = set(value) - expected - optional
         if unknown:
             raise ValueError("candidate gate policy has unknown fields")
@@ -228,6 +231,7 @@ class CandidateGatePolicy:
             max_total_cost_increase=value["max_total_cost_increase"],
             enforce_cost_limit=value["enforce_cost_limit"],
             min_seed_delta_floor=value.get("min_seed_delta_floor", -0.10),
+            cost_savings_path=value.get("cost_savings_path", 0.10),
         )
 
 
@@ -465,17 +469,6 @@ def evaluate_candidate_gate(
         for item in results
         if item.fresh_delta + 1e-12 < applied.min_seed_delta_floor
     )
-    if mean_fresh + 1e-12 < applied.fresh_improvement:
-        return _report(
-            pairs,
-            applied,
-            CandidateGateDisposition.FRESH_REJECTED,
-            (
-                f"mean fresh improvement {mean_fresh:.4f} below threshold "
-                f"{applied.fresh_improvement:.4f}"
-            ),
-            results=results,
-        )
     if floored_fresh:
         return _report(
             pairs,
@@ -540,13 +533,67 @@ def evaluate_candidate_gate(
             results=results,
             total_cost_change=total_cost_change,
         )
+    # Qualification paths.  Fresh improvement is the primary measure, but a
+    # trivial fresh task saturates both arms at 1.0 and makes any improvement
+    # mathematically unreachable; in that case the regression layer judges
+    # improvement, and a strictly cost-saving candidate with noninferior
+    # quality can qualify through the cost path.
+    fresh_saturated = all(
+        arm.fresh_quality is not None and arm.fresh_quality >= 1.0 - 1e-12
+        for arm in arms
+    )
+    if mean_fresh + 1e-12 >= applied.fresh_improvement:
+        return _report(
+            pairs,
+            applied,
+            CandidateGateDisposition.QUALIFIED,
+            (
+                f"seed-mean fresh improvement {mean_fresh:.4f} passed; "
+                "regression, floors, and integrity gates all passed; cost is observational"
+            ),
+            results=results,
+            total_cost_change=total_cost_change,
+        )
+    if (
+        fresh_saturated
+        and mean_regression + 1e-12 >= applied.fresh_improvement
+    ):
+        return _report(
+            pairs,
+            applied,
+            CandidateGateDisposition.QUALIFIED,
+            (
+                "fresh evidence saturated at 1.0 on both arms; seed-mean "
+                f"regression improvement {mean_regression:.4f} passed instead"
+            ),
+            results=results,
+            total_cost_change=total_cost_change,
+        )
+    if (
+        total_cost_change is not None
+        and applied.cost_savings_path > 0.0
+        and mean_fresh >= -applied.regression_noninferiority_margin - 1e-12
+        and mean_regression >= -applied.regression_noninferiority_margin - 1e-12
+        and total_cost_change <= -applied.cost_savings_path + 1e-12
+    ):
+        return _report(
+            pairs,
+            applied,
+            CandidateGateDisposition.QUALIFIED,
+            (
+                f"cost path: quality noninferior with {abs(total_cost_change):.1%} "
+                "total cost savings"
+            ),
+            results=results,
+            total_cost_change=total_cost_change,
+        )
     return _report(
         pairs,
         applied,
-        CandidateGateDisposition.QUALIFIED,
+        CandidateGateDisposition.FRESH_REJECTED,
         (
-            "seed-mean fresh improvement, regression noninferiority, per-seed "
-            "floors, and integrity gates all passed; cost is observational"
+            f"mean fresh improvement {mean_fresh:.4f} below threshold "
+            f"{applied.fresh_improvement:.4f}"
         ),
         results=results,
         total_cost_change=total_cost_change,

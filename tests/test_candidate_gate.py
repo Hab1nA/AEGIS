@@ -143,6 +143,44 @@ class CandidateGateTests(unittest.TestCase):
         self.assertEqual(floored.disposition, CandidateGateDisposition.REGRESSION_REJECTED)
         self.assertIn("per-seed floor", floored.reason)
 
+    def test_saturated_fresh_falls_back_to_regression_improvement(self) -> None:
+        def saturated_pair(seed: int, *, regression_delta: float) -> SealedCandidatePair:
+            return SealedCandidatePair(
+                seed,
+                arm(fresh=1.0, regression=0.8),
+                arm(fresh=1.0, regression=0.8 + regression_delta),
+            )
+
+        gated = evaluate_candidate_gate(
+            (saturated_pair(11, regression_delta=0.03), saturated_pair(22, regression_delta=0.05))
+        )
+        self.assertTrue(gated.qualified)
+        self.assertIn("saturated", gated.reason)
+
+        flat = evaluate_candidate_gate(
+            (saturated_pair(11, regression_delta=0.0), saturated_pair(22, regression_delta=0.0))
+        )
+        self.assertEqual(flat.disposition, CandidateGateDisposition.FRESH_REJECTED)
+
+    def test_cost_savings_path_qualifies_noninferior_candidate(self) -> None:
+        gated = evaluate_candidate_gate(
+            (
+                pair(11, fresh_delta=0.0, candidate_cost=85),
+                pair(22, fresh_delta=0.0, candidate_cost=85),
+            )
+        )
+        self.assertTrue(gated.qualified)
+        self.assertIn("cost path", gated.reason)
+        self.assertAlmostEqual(gated.total_cost_change or 0.0, -0.15)
+
+        noninferior_violated = evaluate_candidate_gate(
+            (
+                pair(11, fresh_delta=-0.05, candidate_cost=85),
+                pair(22, fresh_delta=0.0, candidate_cost=85),
+            )
+        )
+        self.assertEqual(noninferior_violated.disposition, CandidateGateDisposition.FRESH_REJECTED)
+
     def test_total_cost_is_aggregated_across_both_seeds(self) -> None:
         passing = evaluate_candidate_gate(
             (pair(11, candidate_cost=120), pair(22, candidate_cost=100))
