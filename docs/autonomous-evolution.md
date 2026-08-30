@@ -380,6 +380,35 @@ WSL 沙箱、`max_agent_steps=24`（运行时 `role_max_steps=24`，与 campaign
   字段含 3 条假设（第 1 代为空——模型自然输出 `curriculum_hypotheses`，
   双键兼容接住），将随 curriculum_direction 进入第 3 代 forge context。
 
+## 5b.3 第三轮审计修复的真实 E2E 验收（2026-08-30，campaign `evolution-smoke-v2` 第 3 代）
+
+第三轮审计（独立子代理）指出的问题及其修复，经脚本化全周期 E2E
+（`tests/test_audit_fixes_e2e.py`，5 场景）与真实模型第 3 代双重验证：
+
+- **锚点补齐真实生效**：题库 6 → 14，缺失的 8 个锚点在真实 WSL 沙箱逐一
+  完成 reference/defect/mutant 三重校验后回填（`valid=true`）；种子函数改为
+  增量语义，CLI 守卫同步放开；
+- **检察官实权从"不可构造"变为真实行使**：第 3 代 Prosecutor 在 audit 阶段
+  自愿调用 `aegis.adjust_runtime_policy`，patch `candidate_max_steps: 24→32`，
+  理由复述了系统提示的触发条款（"repeated rejected actions … and a process
+  bottleneck"），`base_policy_id` 从 envelope 携带的
+  `runtime_policy_id` 正确复制，修正案持久化并可由 council 追认——
+  envelope 携带 policy_id/consumed 的修复是本次行使的直接前提；
+- **候选门禁在扩充题库上产生真实区分信号**：第 3 代 again 有 Warrior
+  workflow 候选提交，影子臂（seed0 基线复用 / seed1 专用臂）在 14 题库上
+  测得 mean regression delta −0.1875，门禁按回归非劣界诚实拒绝——
+  上一轮的饱和 0.0000 天花板已被扩充题库+难度目标打破，门禁不再是摆设；
+- **供应链连续第 3 代出题入库**（`python-unicode-digit-sum`，
+  `learning_outcome=progressed`）；第 2 代的 `python-parse-int` 经重验晋升
+  hall-of-fame（连续第 2 次 FRESH 采纳）；
+- **脚本化 E2E 覆盖的其余修复路径**：成本路径激活零差候选并升级角色版本、
+  史量不足时 chair 提案被预检拒绝（哨兵证明零影子 solve 沉没）、
+  reflect 的 strategy.propose 经双键进入收集并诚实拒绝、
+  resolve_role_binding 对损坏 manifest fail-loud。
+
+已知边界：难度引导为咨询性，第 3 代出题仍为纯 call 用例（行为迁移需多代
+观察）；`authoring_errors`/`baseline_source` 等新增证据字段已落盘可审计。
+
 ## 6. 边界与后续项
 
 - 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面
