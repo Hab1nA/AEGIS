@@ -409,6 +409,28 @@ WSL 沙箱、`max_agent_steps=24`（运行时 `role_max_steps=24`，与 campaign
 已知边界：难度引导为咨询性，第 3 代出题仍为纯 call 用例（行为迁移需多代
 观察）；`authoring_errors`/`baseline_source` 等新增证据字段已落盘可审计。
 
+## 5b.4 第四轮迭代：难度反馈闭环与假设覆盖留痕（2026-08-31）
+
+实施并推送 `9ce3c39`：
+
+- **难度反馈闭环**：`_difficulty_signal_rows` 从 quality-lock 提取每任务
+  加权得分（public 0.25 / hidden 0.75）与 `fully_solved` 标记，经
+  `curriculum_direction.difficulty_signal` + `champion_fully_solved_count`
+  进入 forge context；forge objective 明确"冠军全对 = 题太易，瞄准缺口与
+  失败"。这把第三轮审计指出的"难度信号链全链断裂"从源头接通——出题者
+  第一次能看到冠军的真实得分分布；
+- **假设覆盖留痕**：task-forge artifact 持久化 `hypothesis_ids`
+  （本轮 forge 时在场的检察官假设 id），使"某代出题覆盖了哪些假设"可审计；
+- 单测锁定 `_difficulty_signal_rows` 的加权与 fully_solved 判定；
+- 全量回归 760 passed（gateway 偶发 socket 2 例，隔离重跑 33/33 全过）。
+
+**真实第 4 代部分验证**（运行至 tasks_validated 后人工停止）：
+`hypothesis_ids: ['H1','H2','H3','H4']` 已在真实 task-forge artifact 落盘；
+连续第 4 代出题入库（`python-strict-int`，`progressed`）。难度引导仍为
+咨询性——第 4 代出题仍为纯 call 用例，行为迁移需后续多代观察，或按
+5b.3 的升级路径将难度要求提升为控制面校验。第 4 代处于
+`tasks_validated` 中断态，可随时 `evolution-cycle --run --repair` 续跑。
+
 ## 6. 边界与后续项
 
 - 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面
