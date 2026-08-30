@@ -278,6 +278,39 @@ def _strip_forbidden(value: Any, *, path: str = "evidence") -> Any:
     return value
 
 
+def _difficulty_signal_rows(quality_lock_data: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Per-task discriminating-power rows from one quality-lock artifact.
+
+    quality weights follow the sealed evaluator (public 0.25 / hidden 0.75);
+    a fully-solved task cannot discriminate any candidate improvement.
+    """
+    rows: list[dict[str, Any]] = []
+    for task in (quality_lock_data.get("evaluation") or {}).get("tasks") or []:
+        if not isinstance(task, Mapping):
+            continue
+        public = task.get("public") or {}
+        hidden = task.get("hidden") or {}
+        public_total = int(public.get("total", 0) or 0)
+        hidden_total = int(hidden.get("total", 0) or 0)
+        public_ratio = (
+            float(public.get("passed", 0) or 0) / public_total if public_total else 0.0
+        )
+        hidden_ratio = (
+            float(hidden.get("passed", 0) or 0) / hidden_total if hidden_total else 0.0
+        )
+        quality = 0.25 * public_ratio + 0.75 * hidden_ratio
+        rows.append(
+            {
+                "task_id": task.get("artifact_id"),
+                "quality": round(quality, 4),
+                "fully_solved": (
+                    quality >= 0.999 and public_total > 0 and hidden_total > 0
+                ),
+            }
+        )
+    return rows[:12]
+
+
 def _truncate(value: Any, *, maximum: int = _MAX_STRING) -> Any:
     if isinstance(value, str):
         return value if len(value) <= maximum else value[:maximum]
@@ -2959,6 +2992,7 @@ class ModelCyclePorts:
         self,
         prosecutor_audit: ArtifactRef,
         council: ArtifactRef,
+        quality_lock: ArtifactRef | None = None,
     ) -> Mapping[str, Any]:
         """Cross-cycle and cross-role guidance for the task author.
 
@@ -3007,6 +3041,14 @@ class ModelCyclePorts:
             direction["council_amendment"] = amendment
         if agenda:
             direction["council_agenda"] = agenda[:9]
+        if quality_lock is not None:
+            # Difficulty feedback: what the champion already solves perfectly
+            # cannot discriminate improvement — the author must aim elsewhere.
+            rows = _difficulty_signal_rows(_brief(self._artifacts, quality_lock))
+            direction["difficulty_signal"] = rows
+            direction["champion_fully_solved_count"] = sum(
+                1 for row in rows if row["fully_solved"]
+            )
         return direction
 
     def forge_next_tasks(
@@ -3022,6 +3064,7 @@ class ModelCyclePorts:
         authoring_errors: list[str] = []
         evidence: Mapping[str, Any] | None = None
         drafts: list[Mapping[str, Any]] = []
+        direction = self._curriculum_direction(prosecutor_audit, council, quality_lock)
         builder = TaskPackBuilder(self._forge.registry, self._runner)
         authoring_attempts = int(
             self._policy_value("task_authoring_attempts", _TASK_AUTHORING_ATTEMPTS)
@@ -3054,6 +3097,10 @@ class ModelCyclePorts:
                     "payload. Difficulty is the primary quality bar: aim the task at the "
                     "current champion so at least one hidden case would fail a careless or "
                     "previous-cycle solution (stateful setup, concurrency, edge partitions). "
+                    "curriculum_direction.difficulty_signal lists what the champion already "
+                    "solves perfectly — every fully-solved task is too easy to discriminate "
+                    "improvement, so aim the new task at the gaps, failures, or harder "
+                    "partitions instead of rehashing solved ground. "
                     "Keep each spec compact anyway: at most 8 cases per suite, up to 2 "
                     "mutants, and each source file under 60 lines. Adapt the template to "
                     "the target function; do not restate unrelated context. Consult "
@@ -3067,9 +3114,7 @@ class ModelCyclePorts:
                     "snapshot": _truncate(snapshot.to_mapping()),
                     "attempt": attempt,
                     "previous_validation_errors": repair_feedback[:32],
-                    "curriculum_direction": self._curriculum_direction(
-                        prosecutor_audit, council
-                    ),
+                    "curriculum_direction": direction,
                     "taskpack_contract": {
                         "language": "python",
                         "deliverable": "submit payload task_specs",
@@ -3110,6 +3155,11 @@ class ModelCyclePorts:
                     "authoring_attempt": attempt,
                     "drafts": drafts,
                     "authoring_errors": authoring_errors[:32],
+                    "hypothesis_ids": [
+                        str(item["hypothesis_id"])
+                        for item in direction.get("prosecutor_curriculum_hypotheses", [])
+                        if item.get("hypothesis_id")
+                    ],
                     "declarative_only": True,
                 }
         if evidence is None:  # pragma: no cover - loop is statically non-empty
@@ -3119,6 +3169,11 @@ class ModelCyclePorts:
             "authoring_attempt": authoring_attempts,
             "drafts": drafts,
             "authoring_errors": authoring_errors[:32],
+            "hypothesis_ids": [
+                str(item["hypothesis_id"])
+                for item in direction.get("prosecutor_curriculum_hypotheses", [])
+                if item.get("hypothesis_id")
+            ],
             "declarative_only": True,
         }
 
