@@ -34,6 +34,7 @@ htmlcov/
 # Security-scan and local build artifacts
 .mimosa/
 build_dist/
+.video_agent/
 
 # OS
 .DS_Store
