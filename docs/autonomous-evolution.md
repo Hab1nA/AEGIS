@@ -122,6 +122,24 @@ usage 由 hub 以 chat-completions 形状返回（`prompt_tokens`/
 usage verified。（注：该段描述基于 agnes hub 实测行为，若 hub 行为调整，
 以 `ModelGateway` 单测为准。）
 
+**请求结构与 prompt 缓存约定（2026-08-31 实测）**：agnes hub 的
+`/responses` 返回 chat 形状 usage，其中 `prompt_tokens_details` 实测为
+`null`——provider **不上报缓存命中 token**，`cached_tokens` 恒 0，因此
+"命中率"无法从 usage 观测（3 次完全相同请求 latency 55s→1s 提示服务端有
+复用，但不可量化）。据此把可量化的优化目标定为**输入体积最小化**与
+**请求前缀字节稳定**：
+
+- `RoleAgentRuntime._request` 的 system 消息按角色固定（跨步骤字节一致，
+  不再内嵌 allowed_actions/active_runtime_policy_values/plugin_action_schemas
+  等逐请求内容——这些移入 user envelope 尾部）；
+- envelope 静态字段前置、动态字段（step/observations/收敛）置尾；请求
+  seed 未显式设置时固定为 0；
+- 协议 schema 块（约 5.9 KB 全量）按角色裁剪：每角色只携带可调用协议的
+  字段与子动作（`_ROLE_PROTOCOL_FIELDS` + `_ROLE_PROTOCOL_RELEVANCE`），
+  实际 user 前缀 Warrior 6.5KB / Judge 5.0KB / Prosecutor 4.7KB；
+- `cycle_ports._usage_summary` 增加 `cache_hit_ratio`（bp，0..10000，无
+  用量为 -1），供未来 provider 上报缓存时直接量化。
+
 ## 4c. Harness 代码进化与回滚验收记录（2026-08-10）
 
 `tests/test_evolution_harness.py::HarnessEvolutionCycleTests` 以真实 Git 仓库

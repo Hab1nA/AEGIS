@@ -1908,6 +1908,44 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("allowed_actions", envelope)
             self.assertNotIn("allowed_actions", request.messages[0].content)
 
+    def test_protocol_fields_are_role_gated_and_sub_actions_filtered(self) -> None:
+        """Only protocols for actions the role may invoke are advertised, and
+        nested action maps drop sub-actions the role cannot call, so the user
+        prefix stays lean without ever advertising an unusable protocol."""
+        runtime = RoleAgentRuntime(
+            FakeGateway([call("submit", summary="done", payload={})]),
+            ToolDispatcher(MemorySandbox(), FakeResearch(), "box"),
+            "model",
+            limits=RuntimeLimits(max_steps=4),
+        )
+        warrior = json.loads(
+            runtime._request(Role.WARRIOR, "objective-x", {"k": "v"}, [], step=1).messages[1].content
+        )
+        judge = json.loads(
+            runtime._request(Role.JUDGE, "objective-x", {"k": "v"}, [], step=1).messages[1].content
+        )
+        prosecutor = json.loads(
+            runtime._request(Role.PROSECUTOR, "objective-x", {"k": "v"}, [], step=1).messages[1].content
+        )
+        # Warrior-only protocols are absent for Judge/Prosecutor.
+        for envelope in (judge, prosecutor):
+            self.assertNotIn("evolution_protocol", envelope)
+            self.assertNotIn("evolution_request_proposal_schema", envelope)
+            self.assertNotIn("mcp_evolution_protocol", envelope)
+        self.assertIn("evolution_protocol", warrior)
+        # challenge.propose is judge-only.
+        self.assertNotIn("challenge_protocol", warrior)
+        self.assertIn("challenge_protocol", judge)
+        # aegis.adjust_runtime_policy is prosecutor-only.
+        self.assertNotIn("runtime_policy_adjust_arguments_schema", warrior)
+        self.assertNotIn("runtime_policy_adjust_arguments_schema", judge)
+        self.assertIn("runtime_policy_adjust_arguments_schema", prosecutor)
+        # github.skill_bundle is warrior-only: Judge/Prosecutor's github_protocol
+        # must not advertise that sub-action.
+        self.assertIn("skill_bundle", warrior["github_protocol"])
+        self.assertNotIn("skill_bundle", judge["github_protocol"])
+        self.assertNotIn("skill_bundle", prosecutor["github_protocol"])
+
 
 if __name__ == "__main__":
     unittest.main()

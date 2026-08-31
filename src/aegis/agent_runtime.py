@@ -266,6 +266,227 @@ _PLUGIN_EFFECT_CEILINGS: Mapping[Role, frozenset[EffectClass]] = {
 }
 
 
+# Static protocol/advisory blobs advertised in the request envelope. Keeping
+# them as module constants (instead of inline literals) lets the request
+# builder select a per-role subset while staying byte-stable across steps.
+_ROLE_PROTOCOL_FIELDS: Mapping[str, Mapping[str, Any]] = {
+    "evolution_request_proposal_schema": {
+        "action": "evolution.request",
+        "warrior_only": True,
+        "proposal": {
+            "surface": "workflow|subject|plugin|environment|mcp",
+            "target_role": "role name",
+            "content": "strict surface-specific JSON; schemas are enforced by the control plane",
+        },
+        "candidate_only": True,
+        "host_write_allowed": False,
+    },
+    "research_import_protocol": {
+        "action": "research.import",
+        "requires_sha256_from_current_research_fetch": True,
+        "candidate_only": True,
+        "execution_granted": False,
+        "supported_kinds": ["github", "paper", "skill"],
+        "arguments": {"sha256": "lowercase sha256", "manifest": "strict import object"},
+    },
+    "persistent_research_protocol": {
+        "recall": {
+            "action": "research.recall",
+            "arguments": {"sha256": "exact collector-verified content hash", "limit": "1..20"},
+            "cross_round": True,
+            "execution_granted": False,
+        },
+        "read": {
+            "action": "research.artifact_read",
+            "arguments": {
+                "artifact_id": "recalled immutable artifact id",
+                "locator": "listed exact locator",
+            },
+            "returns_untrusted_data_only": True,
+            "execution_granted": False,
+        },
+    },
+    "github_protocol": {
+        "resolve": {
+            "action": "github.resolve",
+            "arguments": {
+                "repository_url": "canonical https://github.com/owner/repository",
+                "ref": "optional branch, tag, commit, or HEAD",
+            },
+            "returns_exact_commit_for_collect": True,
+            "execution_granted": False,
+        },
+        "collect": {
+            "action": "github.collect",
+            "arguments": {
+                "repository_url": "canonical https://github.com/owner/repository",
+                "commit_sha": "exact lowercase 40-character commit",
+            },
+            "execution_granted": False,
+        },
+        "read": {
+            "action": "github.file_read",
+            "arguments": {"artifact_id": "collected artifact id", "path": "listed file path"},
+        },
+        "skill_bundle": {
+            "action": "github.skill_bundle",
+            "warrior_only": True,
+            "arguments": {
+                "artifact_id": "collected or recalled exact-commit GitHub artifact id",
+                "root": "repository-relative skill root containing exact SKILL.md",
+                "name": "canonical skill name",
+                "version": "exact semantic version",
+            },
+            "allowed_files": ["SKILL.md", "*.md", "*.rst", "*.txt", "*.json", "*.toml", "*.yaml", "*.yml"],
+            "permissions": [],
+            "dependencies": [],
+            "execution_granted": False,
+        },
+    },
+    "skill_protocol": {
+        "list": {"action": "skill.list", "arguments": {}},
+        "stage": {
+            "action": "skill.stage",
+            "arguments": {"name": "promoted skill name"},
+            "sandbox_only": True,
+            "host_execution_allowed": False,
+        },
+    },
+    "paper_protocol": {
+        "collect": {
+            "action": "paper.collect",
+            "arguments": {"identifier": "exact doi:... or arxiv:... identifier"},
+            "pdf_requires_verified_sandbox_extractor": True,
+            "pdf_fails_closed_without_extractor": True,
+            "execution_granted": False,
+        },
+        "read": {
+            "action": "paper.excerpt_read",
+            "arguments": {
+                "artifact_id": "collected artifact id",
+                "locator_type": "page or paragraph",
+                "locator": "listed locator",
+            },
+        },
+    },
+    "evolution_protocol": {
+        "action": "evolution.request",
+        "warrior_only": True,
+        "arguments": {
+            "objective": "bounded self-improvement objective",
+            "rationale": "evidence-grounded reason",
+            "source_refs": [
+                {
+                    "artifact_id": "recalled immutable artifact id",
+                    "locator": "listed exact locator",
+                }
+            ],
+        },
+        "candidate_only": True,
+        "host_write_allowed": False,
+    },
+    "mcp_evolution_protocol": {
+        "action": "aegis.deploy_mcp",
+        "warrior_only": True,
+        "candidate_only": True,
+        "required_tool_authorization": {
+            "tool_name": "exact tools/list name",
+            "input_schema": "exact tools/list inputSchema",
+            "schema_summary": "bounded description",
+            "risk_level": "L0|L1|L2|L3",
+            "permission_stage": "discovery|observation|operation|administration",
+        },
+        "note": "creates an inert candidate; deployment requires sealed paired promotion",
+    },
+    "challenge_protocol": {
+        "action": "challenge.propose",
+        "judge_only": True,
+        "declarative_only": True,
+        "failure_categories": [
+            "boundary",
+            "concurrency",
+            "input-validation",
+            "numeric",
+            "resource",
+            "security",
+            "serialization",
+            "state-management",
+        ],
+        "count": "1..4",
+    },
+    "knowledge_protocol": {
+        "search": {"action": "knowledge.search", "arguments": {"query": "string", "limit": "1..20"}},
+        "remember": {
+            "action": "knowledge.remember",
+            "requires_sha256_from_current_verified_fetch_or_collector": True,
+            "arguments": {
+                "sha256": "lowercase sha256",
+                "summary": "evidence-grounded reusable lesson",
+                "tags": ["lowercase-tag"],
+                "applicable_roles": ["role name"],
+                "experiment_result": "optional verified outcome",
+                "failure_reason": "optional failure evidence",
+            },
+        },
+    },
+    "runtime_policy_adjust_arguments_schema": {
+        "action": "aegis.adjust_runtime_policy",
+        "request_id": "caller-generated stable non-empty id",
+        "base_policy_id": "exact current runtime_policy.policy_id",
+        "patch": "non-empty object, mutually exclusive with rollback target",
+        "rollback_target_policy_id": "exact historical policy id or null",
+        "reason": "trimmed explanation",
+        "evidence_refs": "list of durable artifact/amendment/request ids",
+        "effect": "after this action; the next model step or tool action reads the new revision",
+    },
+}
+
+
+# Protocol fields that carry per-sub-action `action` keys; each sub-object is
+# filtered to the role's permitted actions when advertised.
+_NESTED_ACTION_FIELDS = {
+    "github_protocol": {
+        "resolve": "github.resolve",
+        "collect": "github.collect",
+        "read": "github.file_read",
+        "skill_bundle": "github.skill_bundle",
+    },
+    "persistent_research_protocol": {
+        "recall": "research.recall",
+        "read": "research.artifact_read",
+    },
+    "knowledge_protocol": {
+        "search": "knowledge.search",
+        "remember": "knowledge.remember",
+    },
+    "skill_protocol": {
+        "list": "skill.list",
+        "stage": "skill.stage",
+    },
+}
+
+
+def _role_protocol_relevance(role: Role) -> frozenset[str]:
+    """Protocol fields whose actions the given role may actually invoke.
+
+    Relevance is derived from the exact action names each field references
+    (strict equality against the role permission set), so it cannot drift
+    from the real permission set or false-positive on name prefixes.
+    """
+    actions = _PERMISSIONS[role]
+    relevant: set[str] = set()
+    for key, value in _ROLE_PROTOCOL_FIELDS.items():
+        serialized = json.dumps(value, sort_keys=True)
+        if any(f'"{action}"' in serialized for action in actions):
+            relevant.add(key)
+    return frozenset(relevant)
+
+
+_ROLE_PROTOCOL_RELEVANCE: Mapping[Role, frozenset[str]] = {
+    role: _role_protocol_relevance(role) for role in Role
+}
+
+
 WORKFLOW_ARTIFACT_SCHEMA: Mapping[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -3048,175 +3269,28 @@ class RoleAgentRuntime:
             "forced_convergence": allowed_actions != self._available_actions(role, research_action_count),
             "observations": self._request_observations(observations),
             "strategy_propose_arguments_schema": STRATEGY_PROPOSE_ARGUMENTS_SCHEMA,
-            "runtime_policy_adjust_arguments_schema": {
-                "request_id": "caller-generated stable non-empty id",
-                "base_policy_id": "exact current runtime_policy.policy_id",
-                "patch": "non-empty object, mutually exclusive with rollback target",
-                "rollback_target_policy_id": "exact historical policy id or null",
-                "reason": "trimmed explanation",
-                "evidence_refs": "list of durable artifact/amendment/request ids",
-                "effect": "after this action; the next model step or tool action reads the new revision",
-            },
-            "evolution_request_proposal_schema": {
-                "action": "evolution.request",
-                "warrior_only": True,
-                "proposal": {
-                    "surface": "workflow|subject|plugin|environment|mcp",
-                    "target_role": "role name",
-                    "content": "strict surface-specific JSON; schemas are enforced by the control plane",
-                },
-                "candidate_only": True,
-                "host_write_allowed": False,
-            },
-            "research_import_protocol": {
-                "action": "research.import",
-                "requires_sha256_from_current_research_fetch": True,
-                "candidate_only": True,
-                "execution_granted": False,
-                "supported_kinds": ["github", "paper", "skill"],
-                "arguments": {"sha256": "lowercase sha256", "manifest": "strict import object"},
-            },
-            "persistent_research_protocol": {
-                "recall": {
-                    "action": "research.recall",
-                    "arguments": {"sha256": "exact collector-verified content hash", "limit": "1..20"},
-                    "cross_round": True,
-                    "execution_granted": False,
-                },
-                "read": {
-                    "action": "research.artifact_read",
-                    "arguments": {
-                        "artifact_id": "recalled immutable artifact id",
-                        "locator": "listed exact locator",
-                    },
-                    "returns_untrusted_data_only": True,
-                    "execution_granted": False,
-                },
-            },
-            "github_protocol": {
-                "resolve": {
-                    "action": "github.resolve",
-                    "arguments": {
-                        "repository_url": "canonical https://github.com/owner/repository",
-                        "ref": "optional branch, tag, commit, or HEAD",
-                    },
-                    "returns_exact_commit_for_collect": True,
-                    "execution_granted": False,
-                },
-                "collect": {
-                    "action": "github.collect",
-                    "arguments": {
-                        "repository_url": "canonical https://github.com/owner/repository",
-                        "commit_sha": "exact lowercase 40-character commit",
-                    },
-                    "execution_granted": False,
-                },
-                "read": {
-                    "action": "github.file_read",
-                    "arguments": {"artifact_id": "collected artifact id", "path": "listed file path"},
-                },
-                "skill_bundle": {
-                    "action": "github.skill_bundle",
-                    "warrior_only": True,
-                    "arguments": {
-                        "artifact_id": "collected or recalled exact-commit GitHub artifact id",
-                        "root": "repository-relative skill root containing exact SKILL.md",
-                        "name": "canonical skill name",
-                        "version": "exact semantic version",
-                    },
-                    "allowed_files": ["SKILL.md", "*.md", "*.rst", "*.txt", "*.json", "*.toml", "*.yaml", "*.yml"],
-                    "permissions": [],
-                    "dependencies": [],
-                    "execution_granted": False,
-                },
-            },
-            "skill_protocol": {
-                "list": {"action": "skill.list", "arguments": {}},
-                "stage": {
-                    "action": "skill.stage",
-                    "arguments": {"name": "promoted skill name"},
-                    "sandbox_only": True,
-                    "host_execution_allowed": False,
-                },
-            },
-            "paper_protocol": {
-                "collect": {
-                    "action": "paper.collect",
-                    "arguments": {"identifier": "exact doi:... or arxiv:... identifier"},
-                    "pdf_requires_verified_sandbox_extractor": True,
-                    "pdf_fails_closed_without_extractor": True,
-                    "execution_granted": False,
-                },
-                "read": {
-                    "action": "paper.excerpt_read",
-                    "arguments": {
-                        "artifact_id": "collected artifact id",
-                        "locator_type": "page or paragraph",
-                        "locator": "listed locator",
-                    },
-                },
-            },
-            "evolution_protocol": {
-                "action": "evolution.request",
-                "warrior_only": True,
-                "arguments": {
-                    "objective": "bounded self-improvement objective",
-                    "rationale": "evidence-grounded reason",
-                    "source_refs": [
-                        {
-                            "artifact_id": "recalled immutable artifact id",
-                            "locator": "listed exact locator",
-                        }
-                    ],
-                },
-                "candidate_only": True,
-                "host_write_allowed": False,
-            },
-            "mcp_evolution_protocol": {
-                "action": "aegis.deploy_mcp",
-                "warrior_only": True,
-                "candidate_only": True,
-                "required_tool_authorization": {
-                    "tool_name": "exact tools/list name",
-                    "input_schema": "exact tools/list inputSchema",
-                    "schema_summary": "bounded description",
-                    "risk_level": "L0|L1|L2|L3",
-                    "permission_stage": "discovery|observation|operation|administration",
-                },
-                "note": "creates an inert candidate; deployment requires sealed paired promotion",
-            },
-            "challenge_protocol": {
-                "action": "challenge.propose",
-                "judge_only": True,
-                "declarative_only": True,
-                "failure_categories": [
-                    "boundary",
-                    "concurrency",
-                    "input-validation",
-                    "numeric",
-                    "resource",
-                    "security",
-                    "serialization",
-                    "state-management",
-                ],
-                "count": "1..4",
-            },
-            "knowledge_protocol": {
-                "search": {"action": "knowledge.search", "arguments": {"query": "string", "limit": "1..20"}},
-                "remember": {
-                    "action": "knowledge.remember",
-                    "requires_sha256_from_current_verified_fetch_or_collector": True,
-                    "arguments": {
-                        "sha256": "lowercase sha256",
-                        "summary": "evidence-grounded reusable lesson",
-                        "tags": ["lowercase-tag"],
-                        "applicable_roles": ["role name"],
-                        "experiment_result": "optional verified outcome",
-                        "failure_reason": "optional failure evidence",
-                    },
-                },
-            },
         }
+        # Protocol schemas are large static blobs (~5.9 KB for all roles). Each
+        # role only ever calls a subset, so advertise only the protocol fields
+        # (and, for nested action maps, only the sub-actions) the role can
+        # actually invoke. This cuts the request prefix materially while
+        # keeping the schema set constant per role (byte-stable across steps,
+        # preserving prompt-cache reuse).
+        allowed_action_set = frozenset(allowed_actions)
+        for key, value in _ROLE_PROTOCOL_FIELDS.items():
+            if key not in _ROLE_PROTOCOL_RELEVANCE[role]:
+                continue
+            nested = _NESTED_ACTION_FIELDS.get(key)
+            if nested is not None:
+                kept = {
+                    sub: sub_value
+                    for sub, sub_value in value.items()
+                    if nested[sub] in allowed_action_set
+                }
+                if kept:
+                    envelope[key] = kept
+            else:
+                envelope[key] = value
         if self.policy_provider is not None:
             envelope["active_runtime_policy_values"] = thaw_json(
                 dict(self.policy_provider(role))
