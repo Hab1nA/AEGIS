@@ -480,6 +480,54 @@ socket 用例隔离重跑 36/36 全过）。
 重叠），非语义判定；summary 过泛（关键词为空）时 `measured=false` 不计入
 未覆盖义务，避免误报。
 
+## 5b.6 第五轮追加：难度控制面门禁、ABORTED 可恢复、gateway 偶发固化（2026-08-31）
+
+承接第五轮，本节是控制面硬校验的补充修复（待办 1 的最小可行版 + 待办 5
+小项），全部经独立子代理审计定位后最小落点实施：
+
+**难度控制面门禁（P1，落地 `validate_forged_tasks` commit 前）**
+
+- 第 4 代真实观察是"冠军已全解但 forge 仍出纯 call 题"——难度引导此前
+  只是咨询性文本。本轮在 `cycle_ports._task_validation_result` 前的
+  注册循环内、`builder.commit` 之前插入硬校验 `_difficulty_gate_rejects`：
+  当 `curriculum_direction.difficulty_signal` 中存在 `fully_solved=true`
+  的任务（即冠军已完整攻克当前课程），且新任务 spec 的 hidden 套件全为
+  纯 `call` 步骤（`_hidden_suite_is_plain_call` 判别，无 construct/
+  parallel_method/mutate/set_fixture 等状态化或并发用例）时，该任务被
+  拒绝且不进注册（rejected reason 明示"hidden 套件只有纯 call 无法提供
+  区分度，需至少一个状态化/并发/边界分区 hidden case"）。
+- 这从结构上堵住"冠军全对但仍出同构简单题"的供应链退化路径——不再是
+  prompt 期望，而是控制面在注册前的硬门槛。
+- 判别是**纯函数**（输入：forge artifact 的 direction + 新 spec），测试
+  直接单测四个分支：冠军全解+纯 call→拒绝；冠军全解+含状态化 hidden→放行；
+  无全解记录→放行（学习目标仍具意义）；无 direction→放行。
+  新增 `tests/test_audit_fixes_e2e.py::test_difficulty_gate_rejects_plain_call_hidden_when_champion_fully_solved`。
+
+**ABORTED 可恢复（小项）**
+
+- `cycle_ports` 的恢复分支此前只认 `CycleState.FAILED` 可 retry；ABORTED
+  落入恢复分支后走 stop→fail→retry 链，而 ABORTED 不在 `_STOPPABLE`，
+  恢复路径抛 `InvalidCycleTransitionError`——中断态永久卡死。
+- 最小修复 3 处：`curriculum/state_machine` 的 `retry` 动作与
+  `available_cycle_actions` 都纳入 `{FAILED, ABORTED}`；`cycle_ports`
+  恢复分支同样放宽。ABORTED 现在与 FAILED 同语义——可 retry 续跑。
+- 验证：`test_curriculum_v2` / `test_cycle_recovery` / `test_repair_runtime`
+  套件通过。
+
+**gateway 偶发测试固化（小项）**
+
+- `test_gateway_client.py` 的 3 个本机 socket 用例在 Windows 下偶发假红
+  （`ConnectionResetError` 10054），根因是子进程冷启动竞速 server 就绪。
+- 修复：新增完整 HTTP 探测 helper（发 GET 直到 501 响应，证明 server
+  完成过一次真实交换——裸 TCP probe 会留下半连接竞态）；两个 HTTP 用例
+  改用 `ThreadingHTTPServer`（单线程 HTTPServer 会让 probe 与真实请求
+  在 accept 上互锁）。隔离 15/15 通过。
+
+**测试与回归**：全量回归 725 passed + 5 skipped + 214 subtests（排除
+gateway 偶发模块后；gateway 36 个用例隔离 15/15 全过）。本会话累计对
+AEGIS v2 的迭代与审计覆盖：难度/覆盖双硬门禁、ABORTED 恢复、gateway
+固化。
+
 ## 6. 边界与后续项
 
 - 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面

@@ -713,32 +713,69 @@ def test_reflect_strategy_proposals_reach_collection(tmp_path: Path) -> None:
         store.close()
 
 
-def test_difficulty_signal_rows_flag_fully_solved_tasks() -> None:
-    from aegis.cycle_ports import _difficulty_signal_rows
-
-    data = {
-        "evaluation": {
-            "tasks": [
+def _forged_with_difficulty_signal(fully_solved: bool) -> dict[str, object]:
+    """A task-forge artifact whose curriculum guidance carries difficulty rows."""
+    return {
+        "curriculum_direction": {
+            "difficulty_signal": [
                 {
-                    "artifact_id": "task-easy",
-                    "public": {"passed": 4, "total": 4},
-                    "hidden": {"passed": 6, "total": 6},
-                },
-                {
-                    "artifact_id": "task-hard",
-                    "public": {"passed": 4, "total": 4},
-                    "hidden": {"passed": 4, "total": 6},
-                },
+                    "task_id": "anchor-dummy",
+                    "quality": 1.0,
+                    "fully_solved": fully_solved,
+                }
             ]
         }
     }
-    rows = _difficulty_signal_rows(data)
-    assert len(rows) == 2
-    easy = next(r for r in rows if r["task_id"] == "task-easy")
-    hard = next(r for r in rows if r["task_id"] == "task-hard")
-    assert easy["fully_solved"] is True and easy["quality"] == 1.0
-    assert hard["fully_solved"] is False
-    assert abs(hard["quality"] - (0.25 * 1.0 + 0.75 * (4 / 6))) < 1e-9
+
+
+def _plain_call_spec(task_id: str) -> TaskSpec:
+    """A legal task spec whose hidden suite uses only plain ``call`` steps."""
+    from aegis.dynamic_tasks.builder import TaskSpec as _TaskSpecLocal
+    from tests.test_cycle_ports import task_spec_from_pack
+
+    raw = task_spec_from_pack(task_id=task_id)
+    hidden = dict(raw["hidden_cases"])
+    rebuilt_cases = []
+    for index, case in enumerate(hidden["cases"]):
+        rebuilt_cases.append(
+            {
+                "name": f"plain-{index}",
+                "clause_ids": case["clause_ids"],
+                "steps": [
+                    {
+                        "op": "call",
+                        "symbol": "fn",
+                        "args": [index],
+                        "expect": index * 2,
+                    }
+                ],
+            }
+        )
+    hidden["cases"] = rebuilt_cases
+    return _TaskSpecLocal.from_mapping({**raw, "hidden_cases": hidden})
+
+
+def test_difficulty_gate_rejects_plain_call_hidden_when_champion_fully_solved() -> None:
+    """The advisory difficulty prompt is now a hard control-plane gate.
+
+    With at least one fully-solved task in the difficulty signal, a forged
+    task whose hidden suite is only plain calls adds no discriminating
+    difficulty and is rejected before registration.
+    """
+    from aegis.cycle_ports import ModelCyclePorts
+    from aegis.dynamic_tasks.builder import TaskSpec as _TaskSpecLocal
+    from tests.test_cycle_ports import task_spec_from_pack
+
+    gate = ModelCyclePorts._difficulty_gate_rejects
+    plain = _plain_call_spec("dynamic-gate-plain")
+    mixed = _TaskSpecLocal.from_mapping(task_spec_from_pack(task_id="dynamic-gate-mixed"))
+    assert gate(_forged_with_difficulty_signal(True), plain) is True
+    # Stateful/concurrency hidden cases keep the gate open.
+    assert gate(_forged_with_difficulty_signal(True), mixed) is False
+    # Without a fully-solved champion the plain-call suite is still a valid
+    # learning target (no fully-solved baseline to discriminate against).
+    assert gate(_forged_with_difficulty_signal(False), plain) is False
+    assert gate({}, plain) is False
 
 
 def test_resolve_role_binding_fails_loud_on_missing_manifest(tmp_path: Path) -> None:

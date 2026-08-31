@@ -48,6 +48,33 @@ class FakeTransport:
         return outcome
 
 
+def _wait_until_listening(host: str, port: int, *, attempts: int = 100) -> None:
+    """Block until the local test server completes a real HTTP exchange.
+
+    The child-process transport spawns a fresh Python interpreter on each
+    call; on Windows that cold start races the ``serve_forever`` thread, and a
+    bare TCP probe leaves a half-open connection that the single-threaded
+    HTTPServer must first consume — racing the real request.  Sending a real
+    GET (the generic handler answers 501) proves the server accepted and
+    finished one request before we post.
+    """
+    import http.client as _http_client
+
+    for _ in range(attempts):
+        try:
+            connection = _http_client.HTTPConnection(host, port, timeout=0.2)
+            try:
+                connection.request("GET", "/probe")
+                response = connection.getresponse()
+                response.read(64)
+                return
+            finally:
+                connection.close()
+        except OSError:
+            time.sleep(0.02)
+    raise AssertionError(f"test server on {host}:{port} never completed an HTTP exchange")
+
+
 class RecordingObserver:
     def __init__(self) -> None:
         self.started: list[GatewayAttempt] = []
@@ -585,9 +612,9 @@ class StdlibTransportTests(unittest.TestCase):
             listener.close()
 
     def test_child_process_propagates_http_error(self) -> None:
-        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-        class Slow429(BaseHTTPRequestHandler):
+        class SlowHTTPRequest429(BaseHTTPRequestHandler):
             def do_POST(self) -> None:
                 self.send_response(429)
                 self.send_header("Content-Length", "2")
@@ -597,12 +624,13 @@ class StdlibTransportTests(unittest.TestCase):
             def log_message(self, *_: object) -> None:
                 return
 
-        server = HTTPServer(("127.0.0.1", 0), Slow429)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHTTPRequest429)
         port = server.server_address[1]
         import threading
 
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
+        _wait_until_listening("127.0.0.1", port)
         transport = StdlibHTTPTransport()
         try:
             with patch.dict(
@@ -624,7 +652,7 @@ class StdlibTransportTests(unittest.TestCase):
             server.server_close()
 
     def test_large_response_does_not_deadlock_child_pipe(self) -> None:
-        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         body = b'{"content":"' + b"a" * 262144 + b'"}'
 
@@ -638,7 +666,7 @@ class StdlibTransportTests(unittest.TestCase):
             def log_message(self, *_: object) -> None:
                 return
 
-        server = HTTPServer(("127.0.0.1", 0), LargeResponse)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), LargeResponse)
         port = server.server_address[1]
         import threading
 

@@ -359,6 +359,28 @@ def _hypothesis_keywords(summary: str) -> list[str]:
     return sorted({word for word in words if word not in _HYPOTHESIS_STOPWORDS})
 
 
+def _hidden_suite_is_plain_call(spec: TaskSpec) -> bool:
+    """True when every hidden-case step is a plain ``call``.
+
+    The sealed evaluator supports stateful (construct/method/set_fixture),
+    concurrency (parallel_method), mutation and snapshot ops; a hidden suite
+    that uses none of them discriminates only trivial implementations, so it
+    cannot raise the bar above an already fully-solved curriculum.  An empty
+    hidden suite is treated as plain (no discriminating power).
+    """
+    hidden = spec.hidden_cases
+    cases = hidden.get("cases") if isinstance(hidden, Mapping) else None
+    if not isinstance(cases, list) or not cases:
+        return True
+    for case in cases:
+        if not isinstance(case, Mapping):
+            continue
+        for step in case.get("steps") or []:
+            if isinstance(step, Mapping) and step.get("op") != "call":
+                return False
+    return True
+
+
 def _truncate(value: Any, *, maximum: int = _MAX_STRING) -> Any:
     if isinstance(value, str):
         return value if len(value) <= maximum else value[:maximum]
@@ -3522,6 +3544,19 @@ class ModelCyclePorts:
         for item in raw[:proposal_limit]:
             try:
                 spec = TaskSpec.from_mapping(item)
+                if self._difficulty_gate_rejects(forged, spec):
+                    rejected.append(
+                        {
+                            "task_id": spec.task_id,
+                            "reasons": [
+                                "difficulty-gate: the champion already fully solves the "
+                                "curriculum; a hidden suite made only of plain calls adds no "
+                                "discriminating difficulty — include at least one stateful, "
+                                "concurrency or edge-partition hidden case",
+                            ],
+                        }
+                    )
+                    continue
                 record = builder.commit(
                     spec,
                     creator_generation=snapshot.cycle_number,
@@ -3651,6 +3686,27 @@ class ModelCyclePorts:
                 }
             )
         return rows
+
+    @staticmethod
+    def _difficulty_gate_rejects(
+        forged: Mapping[str, Any], spec: TaskSpec
+    ) -> bool:
+        """Control-plane difficulty gate (P1): reject a plain-call hidden suite
+        once the champion already fully solves the curriculum.
+
+        A fully-solved curriculum means the champion passes every current
+        task's hidden suite; a new task whose hidden suite is made only of
+        plain ``call`` steps adds no discriminating difficulty.  The author is
+        told to include at least one stateful, concurrency or edge-partition
+        hidden case instead — the old advisory prompt becomes a hard check.
+        """
+        direction = forged.get("curriculum_direction")
+        rows = (direction or {}).get("difficulty_signal") or []
+        champion_fully_solved = any(
+            isinstance(row, Mapping) and bool(row.get("fully_solved"))
+            for row in rows
+        )
+        return champion_fully_solved and _hidden_suite_is_plain_call(spec)
 
     def _task_validation_result(
         self,
@@ -6139,10 +6195,11 @@ def run_v2_cycle(
             if ref is not None:
                 resume_evidence[stage] = ref
     try:
-        if state is CycleState.FAILED:
+        if state in {CycleState.FAILED, CycleState.ABORTED}:
             curriculum.transition_cycle(
                 "retry",
-                reason="control-plane restart after a repaired or rolled-back failure",
+                reason="control-plane restart after a repaired or rolled-back failure, "
+                "or an aborted cycle",
             )
         elif state not in {CycleState.CREATED, CycleState.COMPLETED}:
             curriculum.transition_cycle(
@@ -6255,8 +6312,8 @@ def run_v2_cycle(
                     )
                 artifacts.put_json("runtime-policy-maintenance", maintenance)
                 state = curriculum.projection.cycle_state
-                was_retry = state is CycleState.FAILED
-                if state is CycleState.FAILED:
+                was_retry = state in {CycleState.FAILED, CycleState.ABORTED}
+                if state in {CycleState.FAILED, CycleState.ABORTED}:
                     curriculum.transition_cycle(
                         "retry",
                         reason="policy repaired by maintenance Prosecutor amendment",

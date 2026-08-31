@@ -132,7 +132,7 @@ def cycle_transition(
         return CycleState.STOPPING
     if action == "fail" and current in _FAILABLE:
         return CycleState.FAILED
-    if action == "retry" and current is CycleState.FAILED:
+    if action == "retry" and current in {CycleState.FAILED, CycleState.ABORTED}:
         return CycleState.CREATED
     if action == "advance" and current in _NEXT:
         return _NEXT[current]
@@ -156,7 +156,7 @@ def available_cycle_actions(state: CycleState) -> tuple[str, ...]:
         actions.add("fail")
     if state is CycleState.PAUSED:
         actions.add("resume")
-    if state is CycleState.FAILED:
+    if state in {CycleState.FAILED, CycleState.ABORTED}:
         actions.add("retry")
     return tuple(sorted(actions))
 
