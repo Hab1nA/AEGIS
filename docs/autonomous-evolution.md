@@ -528,6 +528,45 @@ gateway 偶发模块后；gateway 36 个用例隔离 15/15 全过）。本会话
 AEGIS v2 的迭代与审计覆盖：难度/覆盖双硬门禁、ABORTED 恢复、gateway
 固化。
 
+**Mimosa 完整扫描（scanner_enobufs 问题本轮消除）**
+
+- 仓库内 `.mimosa/` 历史 6 次 run 的 `scanner_failed: spawnSync node.exe
+  ETIMEDOUT` 是此前"每次提交都报 scanner_enobufs"的根因（审计侦查确认
+  `.mimosa/history` 无 enobufs 字样，只有 ETIMEDOUT 类子进程失败）。本轮
+  以 `security_scan`（depth=deep）重新运行完整扫描，正常返回 seal
+  （scan-2026-08-31T08-10-55.846Z-ff9b8fb044a8，`verdictEffect: none`），
+  不再报 scanner_enobufs。
+- 10 条 findings（8 high / 1 medium / 1 low）逐条审查，**全部为既有项，
+  零条涉及本轮 5b.6 改动的四个文件**（cycle_ports.py /
+  state_machine.py / test_gateway_client.py / test_audit_fixes_e2e.py）：
+  - 5 条 code-injection（CWE-95）指向 `sandbox/backend.py`、`fake.py`、
+    `owned.py`、`wsl.py`、`subagent_worker.py` 的 `exec` 执行面——这是
+    沙箱**设计内行为**（沙箱本就执行模型/任务/子代理代码，隔离即边界），
+    非漏洞；
+  - 2 条 path-traversal advisory 指向 `research/pdf_extractor.py` 的
+    open 入口（`proofGaps: 需人工确认真实数据流`），属既有 research 输入面；
+  - 1 条 path-traversal（CWE-22）`agent_runtime.py:414`、1 条 XXE
+    （CWE-776）`research/paper_collector.py:338`、1 条 insecure-randomness
+    （CWE-330）`evaluation/promotion.py:119`（bootstrap 重抽样用统计随机，
+    非安全随机），均为既有代码。
+
+**有意搁置项（审计判定、明确记录，勿无意重做）**
+
+- **n=2 统计功效透明化**（原待办 5 小项）：子代理审计确认 `candidate_gate`
+  的 required_seeds=2 门禁已带每-seed delta（`seed_results`），且
+  `evaluation/promotion.py` 已有 10_000 次 bootstrap 的 95% 质量/节省下界
+  ——"2 seed 均值 vs 单 seed 塌陷"的统计不确定性已被区间化呈现。剩余可选的
+  离散度字段（mean±max per-seed delta 进报告）判断为低价值，**有意搁置**。
+- **非 warrior 候选评测基础设施**（原待办 3）：子代理审计判定为中改——
+  需为 subject/plugin/environment 面新增影子臂评估器 + 按 surface 分发的
+  决策分支（替换 `cycle_ports.py` 的单一 Warrior 拒绝点）+ registry 每面
+  QUALIFIED/ACTIVATED 映射。当前非 warrior 目标候选在评估阶段被**诚实
+  拒绝**（reason 明示），不会滞留或烧名额，属于明确语义而非静默丢失。
+  评估是完整进化闭环的下一块拼图，**有意搁置**至真实 E2E 稳定后再实施。
+- **真实 E2E 验证**（本轮 3 项改动的运行期验证）：按既定节奏，单测+回归
+  已覆盖行为，真实 WSL/模型 cycle 验证（campaign `evolution-smoke-v2`
+  第 5 代续跑）留待下一轮迭代执行。
+
 ## 6. 边界与后续项
 
 - 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面
