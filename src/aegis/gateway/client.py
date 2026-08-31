@@ -1,4 +1,9 @@
-"""DeepSeek native Responses API gateway forcing json_object output."""
+"""OpenAI-compatible Responses API gateway forcing json_object output.
+
+Default relay: `agnes-2.5-flash` at `https://apihub.agnes-ai.com/v1`
+(endpoint `POST /responses`), Bearer auth. Thinking is enabled via the
+top-level `reasoning_effort: "max"` field — see docs/autonomous-evolution.md.
+"""
 
 from __future__ import annotations
 
@@ -118,6 +123,20 @@ def _user_agent() -> str:
     return os.environ.get("AEGIS_OPENAI_USER_AGENT") or _DEFAULT_USER_AGENT
 # 5xx (including 501) is always retryable, matching the transport layer.
 _NON_RETRYABLE_STATUSES = frozenset({400, 404, 405, 415, 422})
+
+
+def _strip_code_fence(text: str) -> str:
+    """Strip the markdown ```json ... ``` wrapper some relays add around
+    structured JSON output, and drop surrounding whitespace."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        newline = cleaned.find("\n")
+        if newline == -1:
+            return ""
+        cleaned = cleaned[newline + 1 :].strip()
+    if cleaned.endswith("```"):
+        cleaned = cleaned[: -3].rstrip()
+    return cleaned
 
 
 class ModelGateway:
@@ -385,7 +404,7 @@ class ModelGateway:
                 raise GatewayError("model relay response contains no text output")
             if not isinstance(text, str):
                 raise TypeError
-            return text
+            return _strip_code_fence(text)
         except (KeyError, IndexError, TypeError, AssertionError) as exc:
             raise GatewayError("model relay response contains no text output") from exc
 
@@ -407,6 +426,19 @@ class ModelGateway:
                 if isinstance(out_details, Mapping) and isinstance(out_details.get("reasoning_tokens"), int):
                     reasoning = int(out_details["reasoning_tokens"])
                 return TokenUsage(input_tokens, output_tokens, cached, reasoning, True)
+            # Some compatibility relays answer the Responses endpoint with
+            # chat-completions-shaped usage (prompt/completion tokens).
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+                cached = 0
+                details = usage.get("prompt_tokens_details")
+                if isinstance(details, Mapping) and isinstance(details.get("cached_tokens"), int):
+                    cached = int(details["cached_tokens"])
+                reasoning = usage.get("reasoning_tokens")
+                if not isinstance(reasoning, int):
+                    reasoning = 0
+                return TokenUsage(prompt_tokens, completion_tokens, cached, reasoning, True)
         # Conservative, explicitly unverified approximation for relays omitting usage.
         input_chars = sum(len(m.content) for m in request.messages)
         return TokenUsage(math.ceil(input_chars / 3), math.ceil(len(text) / 3), verified=False)

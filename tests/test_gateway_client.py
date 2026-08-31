@@ -138,6 +138,25 @@ class GatewayTests(unittest.TestCase):
         }
         self.assertEqual(ModelGateway._extract_text(only_reasoning), "think")
 
+    def test_extract_text_strips_markdown_code_fence(self) -> None:
+        fenced = ModelGateway._extract_text(
+            {"output_text": '\n\n```json\n{"action":"ok","arguments":{}}\n```'}
+        )
+        self.assertEqual(fenced, '{"action":"ok","arguments":{}}')
+        message_with_fence = ModelGateway._extract_text(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": '```\n{"a":1}\n```'}],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(message_with_fence, '{"a":1}')
+        bare = ModelGateway._extract_text({"output_text": '\n\n{"a":1}'})
+        self.assertEqual(bare, '{"a":1}')
+
     def test_incomplete_status_raises_gateway_truncation_error(self) -> None:
         transport = FakeTransport(
             [
@@ -354,6 +373,41 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(
             all(not result.succeeded and not result.usage.verified for _, result in observer.finished)
         )
+
+    def test_chat_style_usage_is_verified_and_mapped(self) -> None:
+        transport = FakeTransport(
+            [
+                response(
+                    {
+                        "output_text": "ok",
+                        "usage": {
+                            "prompt_tokens": 7,
+                            "completion_tokens": 3,
+                            "total_tokens": 10,
+                            "prompt_tokens_details": {"cached_tokens": 2},
+                            "reasoning_tokens": 1,
+                        },
+                    }
+                )
+            ]
+        )
+        result = ModelGateway(self.config, transport=transport).complete(self.request)
+        self.assertTrue(result.usage.verified)
+        self.assertEqual(result.usage.input_tokens, 7)
+        self.assertEqual(result.usage.output_tokens, 3)
+        self.assertEqual(result.usage.cached_tokens, 2)
+        self.assertEqual(result.usage.reasoning_tokens, 1)
+
+    def test_chat_style_usage_without_reasoning_field_stays_verified(self) -> None:
+        usage = ModelGateway._extract_usage(
+            {"usage": {"prompt_tokens": 9, "completion_tokens": 2}},
+            self.request,
+            "ok",
+        )
+        self.assertTrue(usage.verified)
+        self.assertEqual(usage.input_tokens, 9)
+        self.assertEqual(usage.output_tokens, 2)
+        self.assertEqual(usage.reasoning_tokens, 0)
 
     def test_missing_usage_is_conservative_and_unverified(self) -> None:
         transport = FakeTransport([response({"output_text": "abcdef"})])

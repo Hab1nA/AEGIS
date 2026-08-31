@@ -5493,7 +5493,7 @@ def _runtime_policy_genesis_values(
             )
         ),
         "role_max_output_tokens": {
-            name: max(int(config.max_output_tokens), 393_216)
+            name: max(int(config.max_output_tokens), 65_536)
             for name, config in role_configs.items()
         },
         "role_reasoning_effort": {
@@ -5513,7 +5513,7 @@ def _runtime_policy_genesis_values(
         "subagent_max_steps": 32,
         "subagent_timeout_seconds": 600.0,
         "subagent_max_result_bytes": 1_048_576,
-        "subagent_max_output_tokens": 393_216,
+        "subagent_max_output_tokens": 65_536,
         "subagent_max_total_tokens": max(
             1, int(campaign_config.total_tokens) // 4, 300_000_000
         ),
@@ -5679,7 +5679,7 @@ def run_v2_cycle(
         genesis_policy = runtime_policy_registry.genesis(
             _runtime_policy_genesis_values(campaign_config, limits, role_configs),
             {
-                name: max(393_216, int(config.max_output_tokens))
+                name: max(65_536, int(config.max_output_tokens))
                 for name, config in role_configs.items()
             },
         )
