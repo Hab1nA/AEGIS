@@ -35,6 +35,7 @@ htmlcov/
 .mimosa/
 build_dist/
 .video_agent/
+.v2c/
 
 # OS
 .DS_Store
