@@ -18,9 +18,10 @@ python -m pytest
 
 ```powershell
 AEGIS_OPENAI_API_KEY = "sk-..."
-AEGIS_OPENAI_BASE_URL = "https://opencode.ai/zen/go/v1"
-# 结构化角色请求优先使用 response_format {"type":"json_object"}
-# （DeepSeek JSON Output 模式；参见 docs/autonomous-evolution.md）。
+AEGIS_OPENAI_BASE_URL = "https://apihub.agnes-ai.com/v1"
+# 结构化角色请求固定使用 Responses + json_object；agnes-2.5-flash 以
+# 顶层 reasoning_effort 开启 thinking（budget_tokens 打满 65536）。
+# （参见 docs/autonomous-evolution.md）。
 AEGIS_OPENAI_STRUCTURED_FORMAT = "json_object"
 # 隐藏推理（hidden-reasoning）中继服务可能较慢；为每次模型调用设置充裕的超时时间。
 AEGIS_OPENAI_TIMEOUT_SECONDS = "3600"

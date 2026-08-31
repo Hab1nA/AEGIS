@@ -82,35 +82,45 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
   `test_cycle_ports.py::test_environment_candidate_build_activates_and_binds_runtime_image`
   与真实沙箱驱动覆盖。
 
-真实 relay 模型（deepseek-v4-flash）按以下约定可稳定产出合法 JSON action：
+真实 relay 模型（agnes-2.5-flash）按以下约定可稳定产出合法 JSON action：
 
-**网关凭据与协议要求（deepseek-v4-flash）**
+**网关凭据与协议要求（agnes-2.5-flash）**
 
-- `AEGIS_OPENAI_BASE_URL=https://opencode.ai/zen/go/v1`（当前默认 relay；
-  `https://cf.api.fan/v1` 曾可用，其旧 key 已失效，不再作为默认）
+- `AEGIS_OPENAI_BASE_URL=https://apihub.agnes-ai.com/v1`（agnes-2.5-flash
+  官方 hub；网关固定 `POST {base_url}/responses`，即 `/v1/responses`；旧的
+  `https://opencode.ai/zen/go/v1` 是上一代 deepseek relay，已随切换弃用）
 - `AEGIS_OPENAI_API_KEY=<sk-...>`（必需）。配置采用**项目级**方式：在
   仓库根目录创建 git-ignored 的 `.aegis.env`（键值即上述两个变量名），
   AEGIS CLI 启动时仅从该文件加载；不写入 Windows 用户/机器级环境变量，
   因此不影响 Codex 等其它软件。显式 `$env:AEGIS_OPENAI_*` 仍优先于文件。
-- relay 规则：`text.format={"type":"json_object"}` 要求输入消息中出现
-  “json” 字样，否则返回 400 `invalid_request_error`
-- `AEGIS_OPENAI_USER_AGENT`（可选）：Cloudflare 前置 relay 会按浏览器签名
-  拦截默认 UA，网关默认发送 Chrome 风格 UA，可经该变量覆盖
+- 载荷规则：`text.format={"type":"json_object"}` 恒定下发；system prompt
+  含 "json" 字样（`RoleAgentRuntime` 的固定提示词已满足）
+- `AEGIS_OPENAI_USER_AGENT`（可选）：Cloudflare 前置的中继可能按浏览器
+  签名拦截默认 UA，网关默认发送 Chrome 风格 UA，可经该变量覆盖
 - 协议固定为官方原生 Responses API：网关只调用 `{base_url}/responses`，
   载荷 `text.format` 一律为 `{"type":"json_object"}`；不保留 chat 兼容
   格式、plain 或 json_schema。`AEGIS_OPENAI_PROTOCOL` 与
   `AEGIS_OPENAI_STRUCTURED_FORMAT` 已废弃，设置后会被忽略。base_url
-  可指向官方 `https://api.deepseek.com` 或上述 relay。
-- `AEGIS_OPENAI_TIMEOUT_SECONDS`（可选，默认 900）
-- campaign 配置三角色 `model: "deepseek-v4-flash"` 且
-  `reasoning_effort: "max"`（配置与网关请求均接受 `max`）
+  默认指向 agnes 官方 hub `https://apihub.agnes-ai.com/v1`。
+- `AEGIS_OPENAI_TIMEOUT_SECONDS`（可选，默认 900；thinking max + 65K
+  输出下建议 3600，见下"预算默认值"）
+- campaign 配置三角色 `model: "agnes-2.5-flash"` 且
+  `reasoning_effort: "max"`（max 即 thinking 开启、预算打满 65,536；
+  配置与网关请求均接受 `max`）
 
 环境变量由运行进程环境提供，网关与子代理 worker 均继承。真实连通性已用项目
 自身 `ModelGateway` 验证（responses + json_object + max，usage verified）。
 若 relay 偶发输出非 JSON 文本，运行时按既有 JSON 契约拒绝并让模型在界内步数
-重试。另注意：该 relay 的 `/responses` 响应以 `reasoning` 项开头、真实 JSON 在
-最后的 `message` 项（`output_text` 字段缺失）；网关提取器已按"跳过推理项、取
-最后一个 message 项文本"处理，实测单步 4 秒返回合法 JSON action。
+重试。另注意：agnes-2.5-flash 的 `/responses` 响应以 `reasoning` 项开头、
+真实 JSON 在最后的 `message` 项（`output_text` 字段可能缺失）；网关提取器
+按"跳过推理项、取最后一个 message 项文本"处理，并在交给 JSON 解析前剥离
+```json 围栏与前后空白（该模型默认会把结构化输出包进 markdown 围栏）。
+usage 由 hub 以 chat-completions 形状返回（`prompt_tokens`/
+`completion_tokens`/`reasoning_tokens`），网关在 `_extract_usage` 中映射
+为 input/output/cached/reasoning 并保持 `verified=true`，Prosecutor 账本
+与 usage_verified 验收基线不受影响。实测（2026-08-31）：单步 200 返回、
+usage verified。（注：该段描述基于 agnes hub 实测行为，若 hub 行为调整，
+以 `ModelGateway` 单测为准。）
 
 ## 4c. Harness 代码进化与回滚验收记录（2026-08-10）
 
@@ -154,24 +164,24 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
   或 json_schema。响应未完成（`status: "incomplete"` / `incomplete_details`）
   或无文本时直接报错，绝不把截断结果交给运行时。system prompt 必须包含
   "json" 字样，`RoleAgentRuntime` 的固定提示词已满足。
-- **最高推理强度**：角色配置 `reasoning_effort: "max"`。该 relay 的
-  `deepseek-v4-flash` 是隐藏推理模型，medium/未设置时曾出现长时间挂起或把
-  输出预算全部花在 `reasoning_content` 上；max 在实测中稳定返回。
+- **最高推理强度**：角色配置 `reasoning_effort: "max"`。agnes-2.5-flash
+  是隐藏推理模型（thinking 模式），`max` 把思考预算打满（65,536 token）
+  并保留可见 JSON 输出余量，实测稳定返回合法 action。
 - **声明式任务锻造**：Judge 只声明任务内容（task_id、prompt、public/hidden
   cases、public_test、reference/defect/mutant 源码），控制面 TaskPackBuilder
   负责固定布局、manifest 与 content_hash、task_id 预留/冲突预检、文件白名单
   与 dry-run；模型不再写入草稿文件，缓存文件污染 sealed 套件的问题从结构上
   消除。task-validation 结果带 `status/registered_count/learning_outcome`，
   零注册周期标记 `learning-degraded`，不再以普通 task-outcome 静默完成。
-- **输出 token 上限**：deepseek-v4-flash 支持 1M 上下文与最高 384K 输出
-  （即 393,216 token）；角色 `max_output_tokens` 默认直接对齐该能力上限
-  （393,216），保证 max 推理与最终 JSON 内容都有充足余量，显著降低
-  `finish_reason: length` / 截断重试。注意 `max_output_tokens` 同时涵盖
-  推理 token 与可见输出 token。
+- **输出 token 上限**：agnes-2.5-flash 支持 512K（512,000 token）上下文
+  与最高 65.5K（65,536 token）输出；角色 `max_output_tokens` 默认直接对齐
+  该能力上限（65,536），保证 max 思考（budget_tokens 打满）与最终 JSON
+  内容都有充足余量，显著降低 `finish_reason: length` / 截断重试。注意
+  `max_output_tokens` 同时涵盖思考 token 与可见输出 token。
 - **预算默认值**：v2 周期每个模型阶段（warrior/judge/prosecutor/council/
   task-forge 等）各计一个 invocation（round），示例配置 `max_rounds` 默认 64、
   `council_max_tokens` 固定 4,194,304（多轮议事 transcript 的累计上限，单次
-  模型调用仍受 1M 上下文与角色 `max_output_tokens` 约束）、`max_requests`
+  模型调用仍受 512K 上下文与角色 `max_output_tokens` 约束）、`max_requests`
   默认 500、`total_tokens` 默认 60M，确保真实模型一轮完整周期不被默认预算
   卡死；运行时仍可由检察官按需调整后续预算。
 - **截断显式化**：网关检测到 `finish_reason: length` 或 content 为空且
@@ -183,7 +193,7 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
   `reasoning_content` 可达几十 KB）超过管道缓冲时会互相等待而死锁，表现
   为"relay 卡住"；现改为轮询读管道再收尾子进程，256KB 响应有回归测试。
 - **模型流量默认直连**：网关不再继承系统/WinINET 代理，默认直连
-  `AEGIS_OPENAI_BASE_URL`（本 relay 为 Cloudflare 直连可达）；如需走代理，
+  `AEGIS_OPENAI_BASE_URL`（agnes hub 直连可达）；如需走代理，
   显式设置 `AEGIS_OPENAI_HTTPS_PROXY`。research 流量仍使用
   `AEGIS_HTTPS_PROXY`，互不影响。
 
