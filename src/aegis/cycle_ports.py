@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import math
+import re
 import secrets
 import subprocess
 import tarfile
@@ -309,6 +310,53 @@ def _difficulty_signal_rows(quality_lock_data: Mapping[str, Any]) -> list[dict[s
             }
         )
     return rows[:12]
+
+
+_HYPOTHESIS_STOPWORDS = frozenset(
+    {
+        "task",
+        "tasks",
+        "next",
+        "with",
+        "that",
+        "this",
+        "from",
+        "have",
+        "the",
+        "and",
+        "for",
+        "will",
+        "should",
+        "into",
+        "more",
+        "than",
+        "case",
+        "cases",
+        "such",
+        "them",
+        "then",
+        "these",
+        "their",
+        "which",
+        "while",
+        "would",
+        "about",
+        "against",
+        "using",
+        "use",
+        "used",
+        "work",
+        "works",
+        "make",
+        "like",
+    }
+)
+
+
+def _hypothesis_keywords(summary: str) -> list[str]:
+    """Meaningful tokens of a hypothesis summary for cheap overlap matching."""
+    words = re.findall(r"[a-z0-9]{4,}", str(summary).lower())
+    return sorted({word for word in words if word not in _HYPOTHESIS_STOPWORDS})
 
 
 def _truncate(value: Any, *, maximum: int = _MAX_STRING) -> Any:
@@ -2990,6 +3038,7 @@ class ModelCyclePorts:
 
     def _curriculum_direction(
         self,
+        snapshot: CurriculumSnapshot,
         prosecutor_audit: ArtifactRef,
         council: ArtifactRef,
         quality_lock: ArtifactRef | None = None,
@@ -3016,6 +3065,7 @@ class ModelCyclePorts:
             )
         direction["prior_rejected_tasks"] = prior_rejections[-8:]
         direction["declared_task_ids"] = sorted(set(prior_task_ids))[:64]
+        direction.update(self._carried_over_hypotheses(snapshot))
         audit = _brief(self._artifacts, prosecutor_audit)
         hypotheses = audit.get("curriculum")
         if isinstance(hypotheses, list) and hypotheses:
@@ -3051,6 +3101,52 @@ class ModelCyclePorts:
             )
         return direction
 
+    def _carried_over_hypotheses(
+        self, snapshot: CurriculumSnapshot
+    ) -> Mapping[str, Any]:
+        """Last cycle's uncovered curriculum hypotheses, for the next author.
+
+        task-validation already records which hypotheses the registered tasks
+        covered; the ones it did not cover are the author's obligations next
+        cycle.  Reads the previous generation's validation evidence through
+        the curriculum cycle events (the CAS itself has no kind index).
+        """
+        if self._campaign_event_store is None:
+            return {}
+        cycle_number = snapshot.cycle_number
+        if cycle_number <= 1:
+            return {}
+        campaign_id = self._curriculum.projection.campaign_id
+        events = self._campaign_event_store.read(campaign_id)
+        previous: str | None = None
+        for event in reversed(events):
+            if event.event_type != "cycle_state_changed_v2":
+                continue
+            payload = event.payload
+            if not isinstance(payload, Mapping):
+                continue
+            if payload.get("action") == "complete_task_validation":
+                candidate = payload.get("evidence_id")
+                if isinstance(candidate, str) and candidate:
+                    previous = candidate
+                break
+        if previous is None:
+            return {}
+        try:
+            validation = _read_artifact_id(self._artifacts, previous)
+        except ValueError:
+            return {}
+        uncovered = validation.get("uncovered_hypothesis_ids")
+        if not isinstance(uncovered, list) or not uncovered:
+            return {}
+        uncovered_ids = {str(value) for value in uncovered}
+        carried = [
+            item
+            for item in validation.get("hypothesis_coverage") or []
+            if isinstance(item, Mapping) and str(item.get("hypothesis_id")) in uncovered_ids
+        ]
+        return {"carried_over_hypotheses": carried[:8]}
+
     def forge_next_tasks(
         self,
         snapshot: CurriculumSnapshot,
@@ -3064,7 +3160,9 @@ class ModelCyclePorts:
         authoring_errors: list[str] = []
         evidence: Mapping[str, Any] | None = None
         drafts: list[Mapping[str, Any]] = []
-        direction = self._curriculum_direction(prosecutor_audit, council, quality_lock)
+        direction = self._curriculum_direction(
+            snapshot, prosecutor_audit, council, quality_lock
+        )
         builder = TaskPackBuilder(self._forge.registry, self._runner)
         authoring_attempts = int(
             self._policy_value("task_authoring_attempts", _TASK_AUTHORING_ATTEMPTS)
@@ -3107,7 +3205,11 @@ class ModelCyclePorts:
                     "curriculum_direction before authoring: never repeat a spec that "
                     "prior_rejected_tasks shows was rejected, cover the gaps named in "
                     "prosecutor_curriculum_hypotheses and council_agenda when feasible, "
-                    "and pick a task_id absent from declared_task_ids. Produce the "
+                    "and pick a task_id absent from declared_task_ids. "
+                    "carried_over_hypotheses lists the hypotheses the previous cycle "
+                    "left uncovered — author a task that exercises each one and let "
+                    "its clause text reference the hypothesis topic so coverage is "
+                    "measurable. Produce the "
                     "spec directly in your final message; do not narrate your plan."
                 ),
                 context={
@@ -3155,11 +3257,9 @@ class ModelCyclePorts:
                     "authoring_attempt": attempt,
                     "drafts": drafts,
                     "authoring_errors": authoring_errors[:32],
-                    "hypothesis_ids": [
-                        str(item["hypothesis_id"])
-                        for item in direction.get("prosecutor_curriculum_hypotheses", [])
-                        if item.get("hypothesis_id")
-                    ],
+                    "curriculum_direction": _truncate(dict(direction)),
+                    "hypothesis_ids": self._forged_hypothesis_ids(direction),
+                    "curriculum_hypotheses": self._forged_hypotheses(direction),
                     "declarative_only": True,
                 }
         if evidence is None:  # pragma: no cover - loop is statically non-empty
@@ -3169,13 +3269,32 @@ class ModelCyclePorts:
             "authoring_attempt": authoring_attempts,
             "drafts": drafts,
             "authoring_errors": authoring_errors[:32],
-            "hypothesis_ids": [
-                str(item["hypothesis_id"])
-                for item in direction.get("prosecutor_curriculum_hypotheses", [])
-                if item.get("hypothesis_id")
-            ],
+            "curriculum_direction": _truncate(dict(direction)),
+            "hypothesis_ids": self._forged_hypothesis_ids(direction),
+            "curriculum_hypotheses": self._forged_hypotheses(direction),
             "declarative_only": True,
         }
+
+    @staticmethod
+    def _forged_hypotheses(
+        direction: Mapping[str, Any],
+    ) -> list[Mapping[str, Any]]:
+        hypotheses = direction.get("prosecutor_curriculum_hypotheses")
+        if not isinstance(hypotheses, list):
+            return []
+        return [
+            dict(item)
+            for item in hypotheses
+            if isinstance(item, Mapping) and str(item.get("hypothesis_id", "")).strip()
+        ][:8]
+
+    @classmethod
+    def _forged_hypothesis_ids(
+        cls, direction: Mapping[str, Any]
+    ) -> list[str]:
+        return [
+            str(item["hypothesis_id"]) for item in cls._forged_hypotheses(direction)
+        ]
 
     def _inspect_task_specs(
         self, evidence: Mapping[str, Any]
@@ -3397,6 +3516,7 @@ class ModelCyclePorts:
             return self._task_validation_result((), (), required_fresh, no_specs=True)
         builder = TaskPackBuilder(self._forge.registry, self._runner)
         registered: list[Mapping[str, Any]] = []
+        coverage_texts: list[str] = []
         rejected: list[Mapping[str, Any]] = []
         proposal_limit = int(self._policy_value("task_proposals_per_cycle", _MAX_PROPOSALS))
         for item in raw[:proposal_limit]:
@@ -3433,9 +3553,104 @@ class ModelCyclePorts:
                     **record.artifact.to_mapping(),
                     "clause_coverage": spec.clause_summary(),
                 })
-        return self._task_validation_result(
+                coverage_texts.append(
+                    " ".join(
+                        [
+                            spec.task_id,
+                            " ".join(item.clause_id for item in spec.clauses),
+                            " ".join(item.statement for item in spec.clauses),
+                            " ".join(item.input_partition for item in spec.clauses),
+                        ]
+                    ).lower()
+                )
+        hypotheses = forged.get("curriculum_hypotheses")
+        hypotheses_list = (
+            [
+                dict(item)
+                for item in hypotheses
+                if isinstance(item, Mapping) and str(item.get("hypothesis_id", "")).strip()
+            ][:16]
+            if isinstance(hypotheses, list)
+            else []
+        )
+        result = self._task_validation_result(
             registered, rejected, required_fresh, no_specs=False
         )
+        if hypotheses_list:
+            result["hypothesis_ids"] = [
+                str(item["hypothesis_id"]) for item in hypotheses_list
+            ]
+            rows = self._hypothesis_coverage(hypotheses_list, coverage_texts)
+            result["hypothesis_coverage"] = rows
+            uncovered = [
+                str(row["hypothesis_id"])
+                for row in rows
+                if row.get("measured") and not row.get("covered")
+            ]
+            result["uncovered_hypothesis_ids"] = uncovered[:16]
+            if uncovered:
+                result["remediation_obligations"] = [
+                    *result.get("remediation_obligations", []),
+                    "forge tasks that exercise the uncovered hypotheses: "
+                    + ", ".join(uncovered[:8]),
+                ]
+        return result
+
+    @staticmethod
+    def _hypothesis_coverage(
+        hypotheses: Sequence[Mapping[str, Any]],
+        coverage_texts: Sequence[str],
+    ) -> list[Mapping[str, Any]]:
+        """Which of this cycle's hypotheses the forged tasks exercise.
+
+        Matching is deliberately cheap and token-based: a hypothesis is covered
+        when registered task clause text matches every keyword of the
+        hypothesis summary.  Uncovered hypotheses are the author's obligation
+        next cycle.
+        """
+        tokens = {
+            token
+            for text in coverage_texts
+            for token in re.findall(r"[a-z0-9]{4,}", text.lower())
+        }
+        rows: list[Mapping[str, Any]] = []
+        for item in hypotheses:
+            hypothesis_id = str(item["hypothesis_id"])
+            keywords = _hypothesis_keywords(str(item.get("summary", "")))
+            if not keywords:
+                rows.append(
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "measured": False,
+                        "covered": False,
+                        "evidence": "summary too vague to measure",
+                    }
+                )
+                continue
+            matched = [
+                keyword
+                for keyword in keywords
+                if any(
+                    token.startswith(keyword) or keyword.startswith(token)
+                    for token in tokens
+                )
+            ]
+            covered = len(matched) == len(keywords)
+            rows.append(
+                {
+                    "hypothesis_id": hypothesis_id,
+                    "measured": True,
+                    "covered": covered,
+                    "matched_keywords": matched,
+                    "evidence": (
+                        "registered task clause text covers every hypothesis keyword"
+                        if covered
+                        else "registered task text misses hypothesis keywords: "
+                        + ", ".join(sorted(set(keywords) - set(matched))[:8])
+                    ),
+                }
+            )
+        return rows
 
     def _task_validation_result(
         self,

@@ -251,6 +251,172 @@ def _envelopes(gateway: AuditAwareGateway):
     return [json.loads(r.messages[1].content) for r in gateway.requests]
 
 
+def _latest_artifact(artifacts: ContentAddressedArtifactStore, kind: str) -> dict:
+    entries = sorted(
+        (artifacts.root / kind).iterdir(), key=lambda p: p.stat().st_mtime
+    )
+    assert entries, f"no {kind} artifact"
+    return json.loads(entries[-1].read_text(encoding="utf-8"))
+
+
+def _task_validation_artifacts(
+    artifacts: ContentAddressedArtifactStore,
+) -> list[dict]:
+    entries = sorted(
+        (artifacts.root / "task-validation").iterdir(), key=lambda p: p.stat().st_mtime
+    )
+    return [json.loads(p.read_text(encoding="utf-8")) for p in entries]
+
+
+def test_hypothesis_coverage_closes_the_loop_across_cycles(tmp_path: Path) -> None:
+    """An uncovered hypothesis becomes the next author's obligation.
+
+    Cycle 1's Prosecutor hypothesizes a concurrency-stress task; the forged
+    task's clauses do not exercise it, so task-validation marks it uncovered
+    and remediation carries it into cycle 2's forge direction.  Cycle 2's
+    forged task explicitly names the hypothesis topic, is covered, and the
+    carry-over disappears.
+    """
+    unconv_hyp = {
+        "hypothesis_id": "hyp-1",
+        "summary": "add concurrency stress on atomic counters",
+        "confidence": 0.7,
+    }
+    covered_hyp = {
+        "hypothesis_id": "hyp-2",
+        "summary": "flaky empty input edge partitions",
+        "confidence": 0.5,
+    }
+
+    def audited(*extra: object) -> dict[str, object]:
+        return submit(
+            "audited",
+            {
+                "usage_verified": True,
+                "safety_passed": True,
+                "integrity_passed": True,
+                "curriculum_hypotheses": [unconv_hyp, covered_hyp],
+                **({} if not extra else {"extra": extra}),
+            },
+        )
+
+    def forged_with_clause(seed: str, *, cover_hyp2: bool = False) -> dict[str, object]:
+        spec = task_spec_from_pack(task_id=f"dynamic-hyp-{seed}")
+        clauses = [
+            {
+                "clause_id": "CONTRACT.HYPOTHESIS",
+                "statement": (
+                    f"the implementation must add concurrency stress and stay correct "
+                    f"under concurrent {seed} atomic counter increments"
+                ),
+                "input_partition": "concurrent atomic counter stress operations",
+                "expected_outcome": "correct totals",
+                "security_relevant": False,
+            }
+        ]
+        if cover_hyp2:
+            clauses.append(
+                {
+                    "clause_id": "CONTRACT.EDGE",
+                    "statement": (
+                        "the implementation must handle empty input edge partitions "
+                        "and flaky boundaries"
+                    ),
+                    "input_partition": "empty inputs and boundary partitions",
+                    "expected_outcome": "no crash",
+                    "security_relevant": False,
+                }
+            )
+        spec["clauses"] = clauses
+        spec["defect_clause_ids"] = ["CONTRACT.HYPOTHESIS"]
+        for case in spec["public_cases"]["cases"]:
+            case["clause_ids"] = ["CONTRACT.HYPOTHESIS"]
+        hidden = spec["hidden_cases"]["cases"]
+        for case in hidden:
+            case["clause_ids"] = ["CONTRACT.HYPOTHESIS"]
+        if cover_hyp2:
+            hidden.append(
+                {
+                    "name": "edge-partitions",
+                    "clause_ids": ["CONTRACT.EDGE"],
+                    "steps": [
+                        {
+                            "op": "call",
+                            "symbol": "fn",
+                            "args": [],
+                            "expect": None,
+                        }
+                    ],
+                }
+            )
+        for mutant in spec["mutants"]:
+            mutant["clause_ids"] = ["CONTRACT.HYPOTHESIS"]
+        return submit("forged", {"task_specs": [spec]})
+
+    def forged_plain(seed: str) -> dict[str, object]:
+        """Standard built-in pack: registers but exercises no hypothesis."""
+        return submit("forged", {"task_specs": [task_spec_from_pack(task_id=f"dynamic-hyp-{seed}")]})
+
+    actions = [
+        submit("solved", {"task_ids": [], "results": []}),
+        submit("reviewed", {"findings": [], "quality_score": 0.5}),
+        audited(),
+        submit("reflect-warrior", {"claims": []}),
+        submit("reflect-judge", {"claims": []}),
+        submit("reflect-prosecutor", {"claims": []}),
+        submit("council", {"proposal": None, "agenda": []}),
+        forged_plain("cycle1"),
+    ]
+    sandbox = WritingFakeSandboxBackend()
+    common, store, artifacts, roles, evolution = build_cycle(tmp_path, sandbox=sandbox)
+    try:
+        result1 = run_v2_cycle(gateway=AuditAwareGateway(actions), **common)
+        validations_after_1 = _task_validation_artifacts(artifacts)
+        latest = validations_after_1[-1]
+        assert latest["hypothesis_ids"] == ["hyp-1", "hyp-2"]
+        by_id = {row["hypothesis_id"]: row for row in latest["hypothesis_coverage"]}
+        assert by_id["hyp-1"]["measured"] is True
+        assert by_id["hyp-1"]["covered"] is False
+        assert by_id["hyp-2"]["measured"] is True
+        assert by_id["hyp-2"]["covered"] is False
+        assert latest["uncovered_hypothesis_ids"] == ["hyp-1", "hyp-2"]
+        assert any(
+            "uncovered hypotheses" in obligation
+            for obligation in latest["remediation_obligations"]
+        )
+        forge1 = _latest_artifact(artifacts, "task-forge")
+        assert forge1["curriculum_hypotheses"][0]["hypothesis_id"] == "hyp-1"
+
+        actions2 = [
+            submit("solved", {"task_ids": [], "results": []}),
+            submit("reviewed", {"findings": [], "quality_score": 0.5}),
+            audited(),
+            submit("reflect-warrior", {"claims": []}),
+            submit("reflect-judge", {"claims": []}),
+            submit("reflect-prosecutor", {"claims": []}),
+            submit("council", {"proposal": None, "agenda": []}),
+            forged_with_clause("cycle2", cover_hyp2=True),
+        ]
+        result2 = run_v2_cycle(gateway=AuditAwareGateway(actions2), **common)
+        # The cycle-2 forge direction carried the uncovered hypotheses over.
+        forge2 = _latest_artifact(artifacts, "task-forge")
+        carried = forge2.get("curriculum_direction", {}).get(
+            "carried_over_hypotheses", []
+        )
+        carried_ids = {row["hypothesis_id"] for row in carried}
+        assert "hyp-1" in carried_ids
+        assert "hyp-2" in carried_ids
+        validations_after_2 = _task_validation_artifacts(artifacts)
+        latest2 = validations_after_2[-1]
+        by_id2 = {row["hypothesis_id"]: row for row in latest2["hypothesis_coverage"]}
+        assert by_id2["hyp-1"]["covered"] is True
+        assert by_id2["hyp-2"]["covered"] is True
+        assert latest2["uncovered_hypothesis_ids"] == []
+        assert result2.snapshot_id != result1.snapshot_id
+    finally:
+        store.close()
+
+
 def test_cost_path_activates_zero_delta_candidate(tmp_path: Path) -> None:
     """Before the fix this exact scenario could only end in fresh-rejected."""
     solution = (

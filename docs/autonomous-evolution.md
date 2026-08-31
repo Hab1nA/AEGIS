@@ -441,6 +441,45 @@ WSL 沙箱、`max_agent_steps=24`（运行时 `role_max_steps=24`，与 campaign
 5b.3 的升级路径将难度要求提升为控制面校验。第 4 代处于
 `tasks_validated` 中断态，可随时 `evolution-cycle --run --repair` 续跑。
 
+## 5b.5 第五轮迭代：假设覆盖核算闭环与孤儿代码清理（2026-08-31）
+
+实施并推送（commit 待填）：
+
+**假设覆盖核算闭环**（待办 2）：task-forge 已持久化 `hypothesis_ids`，但全仓
+零消费——闭环缺口。本轮接通：
+
+- **forge artifact 补全方向证据**：task-forge artifact 新增
+  `curriculum_direction` 落盘（此前只进 context，出题依据不可审计）与
+  `curriculum_hypotheses`（带 summary 的完整假说，供下代核算）；
+- **task-validation 覆盖核算**：`validate_forged_tasks` 读取
+  `curriculum_hypotheses`，对每个假说按"任务 clause 文本是否覆盖假说
+  summary 全部关键词"判定 `hypothesis_coverage`（每行含
+  `measured/covered/matched_keywords/evidence`），产出
+  `uncovered_hypothesis_ids` 并追加 remediation obligation；
+- **跨代 carry-over**：`_curriculum_direction` 经 cycle 事件索引读上代
+  task-validation，把 `carried_over_hypotheses`（未覆盖假说 + 证据）注入
+  下代 forge context；forge objective 明示"author a task that exercises
+  each one"——出题者第一次被要求对上代未覆盖假设负责；
+- **关键坑**：`complete_task_validation` 事件 state 是 `tasks_validated`
+  而非 `completed`，初版过滤条件永远不匹配，去掉 state 条件后修复。
+
+**孤儿代码清理**（待办 4）：`src/aegis/curriculum/planner.py`（722 行）经
+独立子代理审计确认为完全未接线的孤儿——仅被 `curriculum/__init__.py`
+re-export 与自身测试引用，无任何生产调用路径；其队列选择/任务锻造/能力缺口
+职责与 `DynamicTaskRegistry.select_dynamic_cohort`/`TaskForge` 真实实现重复。
+删除 planner.py 与 test_curriculum_planner.py，同步清理 `__init__.py`
+re-export 与 `__all__`（6 符号）。全仓库零残留引用。
+
+**测试与回归**：`tests/test_audit_fixes_e2e.py` 新增第 7 个场景
+`test_hypothesis_coverage_closes_the_loop_across_cycles`——两代连跑验证
+"首代未覆盖假说 → 下代 direction 携带 → 次代覆盖后 carry-over 消失"的
+完整闭环。全量回归 760 passed + 6 skipped + 214 subtests（gateway 偶发
+socket 用例隔离重跑 36/36 全过）。
+
+已知边界：覆盖判定为关键词匹配（假说 summary 与任务 clause 文本的 token
+重叠），非语义判定；summary 过泛（关键词为空）时 `measured=false` 不计入
+未覆盖义务，避免误报。
+
 ## 6. 边界与后续项
 
 - 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面

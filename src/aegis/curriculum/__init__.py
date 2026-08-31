@@ -10,14 +10,6 @@ from .models import (
     ObjectiveVersion,
     RoleVersionIdentity,
 )
-from .planner import (
-    CapabilityGap,
-    CurriculumHypothesis,
-    CurriculumPlan,
-    CurriculumPlanner,
-    CurriculumPlanningError,
-    TaskCapabilityProfile,
-)
 from .registry import (
     CONSTITUTION_RECORDED_V2,
     CURRICULUM_SNAPSHOT_RECORDED_V2,
@@ -46,14 +38,9 @@ __all__ = [
     "OBJECTIVE_CAPABILITIES",
     "ActiveRoleSet",
     "Constitution",
-    "CapabilityGap",
     "CONSTITUTION_RECORDED_V2",
     "CURRICULUM_SNAPSHOT_RECORDED_V2",
     "CurriculumSnapshot",
-    "CurriculumHypothesis",
-    "CurriculumPlan",
-    "CurriculumPlanner",
-    "CurriculumPlanningError",
     "CurriculumRegistry",
     "CurriculumRegistryError",
     "CYCLE_STATE_CHANGED_V2",
@@ -71,7 +58,6 @@ __all__ = [
     "OBJECTIVE_PROVISIONAL_V2",
     "OBJECTIVE_ROLLED_BACK_V2",
     "RoleVersionIdentity",
-    "TaskCapabilityProfile",
     "available_cycle_actions",
     "cycle_transition",
 ]
