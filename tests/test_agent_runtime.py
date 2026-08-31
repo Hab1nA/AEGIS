@@ -1886,6 +1886,28 @@ class RuntimeTests(unittest.TestCase):
                 ),
             )
 
+    def test_system_prompt_is_byte_stable_across_steps_and_seed_is_fixed(self) -> None:
+        """Prompt-cache preservation: the system message must not drift between
+        steps and the request seed must be deterministic, so the provider can
+        reuse the leading input block across requests of one run."""
+        runtime = RoleAgentRuntime(
+            FakeGateway([call("submit", summary="done", payload={})]),
+            ToolDispatcher(MemorySandbox(), FakeResearch(), "box"),
+            "model",
+            limits=RuntimeLimits(max_steps=4),
+        )
+        requests = [
+            runtime._request(Role.WARRIOR, "objective-x", {"k": "v"}, [], step=step)
+            for step in (1, 2, 3)
+        ]
+        systems = {request.messages[0].content for request in requests}
+        self.assertEqual(len(systems), 1)
+        self.assertTrue(all(request.seed == 0 for request in requests))
+        for request in requests:
+            envelope = json.loads(request.messages[1].content)
+            self.assertIn("allowed_actions", envelope)
+            self.assertNotIn("allowed_actions", request.messages[0].content)
+
 
 if __name__ == "__main__":
     unittest.main()

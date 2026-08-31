@@ -546,12 +546,27 @@ def _observation_receipts(observations: Sequence[Any]) -> list[Mapping[str, Any]
 
 
 def _usage_summary(usages: Sequence[TokenUsage]) -> Mapping[str, int]:
+    """Token totals plus a provider cache-hit ratio for the phase.
+
+    ``cache_hit_ratio`` is the share of billed input tokens that the provider
+    served from its prompt cache (cached_tokens / input_tokens), in basis
+    points (0..10000, -1 when no usage was reported or all inputs were
+    zero). A ratio near zero signals per-request prefix drift that defeats
+    automatic prompt caching.
+    """
+    requests = len(usages)
+    input_tokens = sum(item.input_tokens for item in usages)
+    cached_tokens = sum(item.cached_tokens for item in usages)
+    ratio = -1
+    if requests and input_tokens > 0:
+        ratio = min(10000, round(cached_tokens * 10000 / input_tokens))
     return {
-        "requests": len(usages),
-        "input_tokens": sum(item.input_tokens for item in usages),
+        "requests": requests,
+        "input_tokens": input_tokens,
         "output_tokens": sum(item.output_tokens for item in usages),
-        "cached_tokens": sum(item.cached_tokens for item in usages),
+        "cached_tokens": cached_tokens,
         "reasoning_tokens": sum(item.reasoning_tokens for item in usages),
+        "cache_hit_ratio": ratio,
     }
 
 

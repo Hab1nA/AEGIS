@@ -19,6 +19,7 @@ from aegis.curriculum import CurriculumRegistry, CycleState
 from aegis.cycle_ports import (
     ModelCyclePorts,
     _repair_taskpack_content_hash,
+    _usage_summary,
     run_v2_cycle,
 )
 from aegis.dynamic_tasks import (
@@ -1717,6 +1718,17 @@ class CyclePortsTests(unittest.TestCase):
             finally:
                 dynamic.close()
                 store.close()
+
+    def test_usage_summary_reports_cache_hit_ratio_in_basis_points(self) -> None:
+        zero_hits = TokenUsage(100, 3, cached_tokens=0, verified=True)
+        summary = _usage_summary([zero_hits, TokenUsage(100, 3, cached_tokens=100, verified=True)])
+        self.assertEqual(summary["input_tokens"], 200)
+        self.assertEqual(summary["cached_tokens"], 100)
+        self.assertEqual(summary["cache_hit_ratio"], 5000)
+        empty = _usage_summary([])
+        self.assertEqual(empty["requests"], 0)
+        self.assertEqual(empty["cache_hit_ratio"], -1)
+
 
 if __name__ == "__main__":
     unittest.main()
