@@ -2,7 +2,7 @@
 
 AEGIS 是一个面向软件工程智能体的受监督、对抗式、自我进化循环系统。动态任务库从仓库自有的锚点（anchors）冷启动，Judge（法官）锻造下一批任务，Warrior（战士）在隔离沙箱中求解任务，Prosecutor（检察官）审计使用情况与课程假设，三个角色通过独立反思外加委员会投票进行协商。角色版本通过内容寻址候选、归因分支（attribution arms）和试用期激活来进化；失败的循环由 Prosecutor 管道修复，或回滚到最后已知良好状态（last-known-good）。
 
-v1 的固定 12 任务战役控制器、晋升漏斗（promotion funnels）以及技能/策略自动晋升运行时已被移除。当前设计仅支持动态模式：`task_pack_paths` 必须为空，且 `autonomy_v2.enabled` 必须为 true。
+设计仅支持动态模式：仓库不携带预置任务包（`task_pack_paths` 必须为空），任务由 Judge 从仓库自有的锚点动态锻造，并需开启 `autonomy_v2.enabled`。
 
 ## 安装与测试
 
@@ -28,6 +28,7 @@ AEGIS_OPENAI_TIMEOUT_SECONDS = "3600"
 ```
 
 在宿主机进程中显式设置的 `$env:AEGIS_OPENAI_*` 仍会覆盖该文件。
+# 以下辅助键同样支持写入 `.aegis.env`（推荐方式，避免写进系统环境变量污染其它项目）。
 # 可选的模型网关代理；留空表示直连（绕过系统代理）。
 $env:AEGIS_OPENAI_HTTPS_PROXY = ""
 $env:AEGIS_SEARCH_BASE_URL = "http://127.0.0.1:8888"

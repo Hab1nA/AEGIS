@@ -22,12 +22,11 @@ task containers.
 
 The launcher deliberately discovers the current WSL private gateway instead of persisting an address. It
 requires the Windows host proxy on port 7897; if that proxy is unavailable the unit fails closed and retries.
-Set these Windows user environment variables before starting AEGIS:
-
-```powershell
-[Environment]::SetEnvironmentVariable("AEGIS_SEARCH_BASE_URL", "http://127.0.0.1:8888", "User")
-[Environment]::SetEnvironmentVariable("AEGIS_ALLOW_INSECURE_SEARCH_LOOPBACK", "true", "User")
-```
+The AEGIS CLI loads `AEGIS_SEARCH_BASE_URL` and `AEGIS_ALLOW_INSECURE_SEARCH_LOOPBACK` (plus
+`AEGIS_DATA_DIR` and `AEGIS_HTTPS_PROXY`) from the project-scoped, git-ignored `.aegis.env` at startup, so no
+Windows user/machine environment variables are required. If a one-off override is needed, set the variable
+for the current PowerShell session only (`$env:AEGIS_SEARCH_BASE_URL = "..."`); never persist it with
+`[Environment]::SetEnvironmentVariable(..., "User")`.
 
 Restart WSL and exercise one JSON query through AEGIS before creating the first campaign. The Windows
 research transport awakens the distribution and retries briefly while `aegis-search.service` starts, so a
