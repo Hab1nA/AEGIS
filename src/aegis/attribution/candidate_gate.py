@@ -383,6 +383,12 @@ def _report(
     normalized_cost_change = (
         None if total_cost_change is None else round(total_cost_change, 12)
     )
+    if results:
+        per_seed = ", ".join(
+            f"seed {item.seed} fresh {item.fresh_delta:+.4f}"
+            for item in normalized_results
+        )
+        reason = f"{reason} [{per_seed}]"
     payload: dict[str, Any] = {
         "disposition": disposition.value,
         "reason": reason,

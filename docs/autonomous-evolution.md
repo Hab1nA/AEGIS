@@ -570,20 +570,48 @@ AEGIS v2 的迭代与审计覆盖：难度/覆盖双硬门禁、ABORTED 恢复�
 
 **有意搁置项（审计判定、明确记录，勿无意重做）**
 
-- **n=2 统计功效透明化**（原待办 5 小项）：子代理审计确认 `candidate_gate`
-  的 required_seeds=2 门禁已带每-seed delta（`seed_results`），且
-  `evaluation/promotion.py` 已有 10_000 次 bootstrap 的 95% 质量/节省下界
-  ——"2 seed 均值 vs 单 seed 塌陷"的统计不确定性已被区间化呈现。剩余可选的
-  离散度字段（mean±max per-seed delta 进报告）判断为低价值，**有意搁置**。
-- **非 warrior 候选评测基础设施**（原待办 3）：子代理审计判定为中改——
-  需为 subject/plugin/environment 面新增影子臂评估器 + 按 surface 分发的
-  决策分支（替换 `cycle_ports.py` 的单一 Warrior 拒绝点）+ registry 每面
-  QUALIFIED/ACTIVATED 映射。当前非 warrior 目标候选在评估阶段被**诚实
-  拒绝**（reason 明示），不会滞留或烧名额，属于明确语义而非静默丢失。
-  评估是完整进化闭环的下一块拼图，**有意搁置**至真实 E2E 稳定后再实施。
-- **真实 E2E 验证**（本轮 3 项改动的运行期验证）：按既定节奏，单测+回归
+- **真实 E2E 验证**（5b.6 三项改动的运行期验证）：按既定节奏，单测+回归
   已覆盖行为，真实 WSL/模型 cycle 验证（campaign `evolution-smoke-v2`
-  第 5 代续跑）留待下一轮迭代执行。
+  第 5 代续跑）留待后续迭代执行。
+
+## 5b.7 第五轮续：非 Warrior 诚实拒绝收紧与 n=2 功效透明化（2026-08-31）
+
+承接 5b.6 的搁置项审查（独立子代理判定），两项小改落地：
+
+**非 Warrior 候选诚实拒绝收紧（替代"中改评测"搁置项）**
+
+- 子代理审计确认：非 Warrior 候选是**合法存在**的输入——prosecutor
+  `role_candidates`（consumer.py:511-567）与 council/reflect
+  `strategy_proposals`（consumer.py:277-383）两条通道都允许 target=judge/
+  prosecutor，且能合法走完 collect→validate 到 VALIDATED（测试实证
+  `test_evolution_consumer.py:72-114`）。但**不需要** sealed 影子评测——
+  影子臂是 Warrior-solve 配对（cycle_ports `evaluate_candidates` 主路径
+  `role=Role.WARRIOR`），judge/prosecutor 是审计角色、无可被评测的 solve
+  行为；为一个非求解角色构造评测等于发明不存在的评测对象。reject 是
+  **正确防御**，且被 `test_audit_fixes_e2e.py::test_reflect_strategy_
+  proposals_reach_collection` 锁定。
+- 本轮修复一处与文档措辞不符的行为：reject 原先只在"无 Warrior 候选"
+  的周期触发（`if candidate is None` 内），有 Warrior 候选时非 Warrior
+  仍会滞留 VALIDATED——"不再永久滞留"仅对无 Warrior 周期成立。现将
+  stranded 拒绝循环**移出该分支、每个评估周期都执行**（cycle_ports.py
+  `evaluate_candidates`），彻底兑现 docs 声明的"诚实拒绝、不滞留、不烧
+  名额"语义。
+
+**n=2 统计功效透明化（替代"低价值搁置"项）**
+
+- 子代理审计确认 `CandidateGateReport` 已带 `seed_results`（每 seed 的
+  fresh/regression delta）与 per-seed floor（`min_seed_delta_floor`
+  抓单 seed 塌陷），`evaluation/promotion.py` 已有 bootstrap 95% 区间。
+- 本轮在 `candidate_gate._report` 统一把每 seed 的 fresh delta 追加到
+  reason 末尾（`[seed 11 fresh +0.0200, seed 22 fresh +0.0100]`）——
+  合格/拒绝任何 disposition 的 reason 都带 per-seed 离散度，"2 seed 均值
+  掩盖单 seed 塌陷"从此透明可见。`seed_results` 字段契约不变，reason 是
+  追加式（现有 `assertIn` 测试不碎）。
+- 新增断言：`test_candidate_gate.py::test_two_seeds_must_each_pass_all_
+  quality_gates` 校验 reason 含每 seed fresh delta。
+
+**测试与回归**：全量回归 728 passed + 5 skipped + 214 subtests（排除
+gateway 偶发模块；gateway 36 用例隔离全过）。
 
 ## 6. 边界与后续项
 

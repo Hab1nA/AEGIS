@@ -3952,34 +3952,35 @@ class ModelCyclePorts:
                 ),
                 None,
             )
-        if candidate is None:
-            # Non-Warrior candidates cannot run a Warrior-solve shadow arm;
-            # reject them with an explicit reason instead of leaving them
-            # stuck in VALIDATED forever.
-            stranded = [
-                item
-                for item in self._evolution.validated_candidates()
-                if item.target_role is not Role.WARRIOR
-            ]
-            for item in stranded:
-                self._evolution.reject(
-                    item.candidate_id,
-                    reason=(
-                        "only Warrior-target candidates are shadow-evaluated and "
-                        "activated in this release"
+        # Non-Warrior candidates cannot run a Warrior-solve shadow arm; reject
+        # them every cycle with an explicit reason instead of letting them
+        # linger in VALIDATED (a Warrior candidate in the same cycle must not
+        # hide them).
+        stranded = [
+            item
+            for item in self._evolution.validated_candidates()
+            if item.target_role is not Role.WARRIOR
+        ]
+        for item in stranded:
+            self._evolution.reject(
+                item.candidate_id,
+                reason=(
+                    "only Warrior-target candidates are shadow-evaluated and "
+                    "activated in this release"
+                ),
+            )
+            result["rejected"].append(
+                {
+                    "surface": item.surface.value,
+                    "target_role": item.target_role.value,
+                    "artifact_id": item.artifact_id,
+                    "error": (
+                        "only Warrior-target candidates are shadow-evaluated "
+                        "and activated in this release"
                     ),
-                )
-                result["rejected"].append(
-                    {
-                        "surface": item.surface.value,
-                        "target_role": item.target_role.value,
-                        "artifact_id": item.artifact_id,
-                        "error": (
-                            "only Warrior-target candidates are shadow-evaluated "
-                            "and activated in this release"
-                        ),
-                    }
-                )
+                }
+            )
+        if candidate is None:
             result["role_generations"] = self._record_role_generations(snapshot)
             return result
         result["candidate"] = {

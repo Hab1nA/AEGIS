@@ -70,6 +70,10 @@ class CandidateGateTests(unittest.TestCase):
         self.assertEqual(report.disposition, CandidateGateDisposition.QUALIFIED)
         self.assertAlmostEqual(report.total_cost_change or 0.0, 0.10)
         self.assertEqual(tuple(item.seed for item in report.seed_results), (11, 22))
+        # n=2 power transparency: the reason carries per-seed fresh deltas so a
+        # single-seed collapse inside an acceptable mean is visible, not hidden.
+        self.assertRegex(report.reason, r"seed 11 fresh [+\-][0-9.]+")
+        self.assertRegex(report.reason, r"seed 22 fresh [+\-][0-9.]+")
         self.assertTrue(report.report_id.startswith("candidate-gate-report-sha256:"))
         self.assertEqual(type(report).from_mapping(report.to_mapping()), report)
         with self.assertRaises(FrozenInstanceError):
