@@ -1,6 +1,6 @@
 # AEGIS v2
 
-**Adversarial Engineering Guardian Intelligence System** —— 一个让智能体在任务循环中**自己改造自己的 harness**、从而持续进化的系统。
+**Adversarial Evolutionary Generative Intelligence System** —— 一个让智能体在任务循环中**自己改造自己的 harness**、从而持续进化的系统。
 
 大模型的权重决定它的潜力，但一个智能体实际表现出什么能力，取决于它穿在模型外面的整套装备：工作流（怎么组织解题）、主题设定（以什么视角理解任务）、插件（手上有什么工具）、运行环境（沙箱里装了什么）、以及支撑这一切的 harness 代码本身。AEGIS 的核心主张是：**冻结权重，进化 harness**。把这些装备全部建模为可版本化、可评测、可回滚的"进化表面"，让智能体在自己的任务循环中提出改造方案，由对抗式评审与真实评测构成的证据门控决定改造能否被采纳、能否传给下一代。
 

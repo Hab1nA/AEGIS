@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aegis"
 version = "0.1.0"
-description = "AEGIS: Adversarial Engineering Guardian Intelligence System"
+description = "AEGIS: Adversarial Evolutionary Generative Intelligence System"
 requires-python = ">=3.12"
 license = {text = "Proprietary"}
 readme = "README.md"

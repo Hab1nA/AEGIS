@@ -1,4 +1,4 @@
-"""AEGIS: Adversarial Engineering Guardian Intelligence System."""
+"""AEGIS: Adversarial Evolutionary Generative Intelligence System."""
 
 from .models import Role
 
