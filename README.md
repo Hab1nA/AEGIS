@@ -1,19 +1,21 @@
 # AEGIS v2
 
-**Adversarial Engineering Guardian Intelligence System** —— 面向软件工程智能体的受监督、对抗式、自我进化循环系统。
+**Adversarial Engineering Guardian Intelligence System** —— 一个让智能体在任务循环中**自己改造自己的 harness**、从而持续进化的系统。
 
-AEGIS 用一组有明确分工的智能体角色（Warrior / Judge / Prosecutor）和一个委员会，把“让智能体自己变强”这件事做成一个**可审计、可回滚、诚实报告**的自动化闭环：每个周期都产出可复核的证据链，任何一项自我改进都必须通过归因与试用期验证后才能影响下一代。
+大模型的权重决定它的潜力，但一个智能体实际表现出什么能力，取决于它穿在模型外面的整套装备：工作流（怎么组织解题）、主题设定（以什么视角理解任务）、插件（手上有什么工具）、运行环境（沙箱里装了什么）、以及支撑这一切的 harness 代码本身。AEGIS 的核心主张是：**冻结权重，进化 harness**。把这些装备全部建模为可版本化、可评测、可回滚的"进化表面"，让智能体在自己的任务循环中提出改造方案，由对抗式评审与真实评测构成的证据门控决定改造能否被采纳、能否传给下一代。
 
-> 项目处于研究阶段，采用 **dynamic-only** 设计：仓库不携带预置任务包（`task_pack_paths` 必须为空），任务由 Judge 从仓库自有的锚点动态锻造，并需开启 `autonomy_v2.enabled`。功能“已实现”仅表示存在对应运行路径与测试；系统是否适合正式运行，以最新 `autonomy-preflight` 的实时结果为准。
+> 项目处于研究阶段，采用 **dynamic-only** 设计：仓库不携带预置任务包（`task_pack_paths` 必须为空），任务由 Judge 从仓库自有的锚点动态锻造，并需开启 `autonomy_v2.enabled`。功能"已实现"仅表示存在对应运行路径与测试；系统是否适合正式运行，以最新 `autonomy-preflight` 的实时结果为准。
 
 ---
 
 ## 目录
 
-- [设计思路](#设计思路)
-- [一次进化周期](#一次进化周期)
-- [核心机制](#核心机制)
-- [威胁模型与安全姿态](#威胁模型与安全姿态)
+- [核心理念：harness 是第一进化基质](#核心理念harness-是第一进化基质)
+- [可进化的表面](#可进化的表面)
+- [进化循环全景](#进化循环全景)
+- [对抗式三角色：选择压力的来源](#对抗式三角色选择压力的来源)
+- [证据门控：进化的适应度函数](#证据门控进化的适应度函数)
+- [围栏内的进化](#围栏内的进化)
 - [环境要求](#环境要求)
 - [安装](#安装)
 - [配置 `.aegis.env`](#配置-aegisenv)
@@ -25,105 +27,103 @@ AEGIS 用一组有明确分工的智能体角色（Warrior / Judge / Prosecutor�
 
 ---
 
-## 设计思路
+## 核心理念：harness 是第一进化基质
 
-现代编码智能体并不天然可靠：它们可能走捷径、硬编码答案、在隐藏测试上作弊，甚至无法分辨自己是否真的有进步。AEGIS 的设计前提是：
+### 为什么进化 harness，而不是权重
 
-- **一切输入皆不可信**。模型输出、任务代码、下载内容、甚至三个角色自身都被视为潜在对抗者；提示注入与恶意任务代码是**预期之内**的事情，而不是例外。
-- **进步必须被证明**。任何角色版本的改动都要经过内容寻址的候选、同队列配对的归因评测和试用期激活，才能进入下一代；负结果与无法归因的试验会被如实记录。
-- **失败必须能回收**。周期中断或失败可以重试同一代，也可以由检察官管道修复或回滚到最近已知良好状态（last-known-good）。
+让智能体变强有两条路。一条是继续训练模型——但梯度更新是黑盒、昂贵且不可审查的，每次"进步"都无法被 diff，出错也无法局部回滚。另一条路是承认：**在权重冻结的前提下，智能体的能力上限由它的 harness 决定**，而 harness 是纯粹的软件工程对象。AEGIS 选择第二条路：
 
-三个角色在一个“受监督的对抗赛场”中合作与制衡：
+- 每次自我改进都产出一个**内容寻址的候选工件**——一段可读、可审查、可配对评测的代码或配置，而不是一坨新的权重；
+- 改坏了可以**回滚到 last-known-good**，改好了可以沿着谱系追溯它解决了哪一代的哪类失败；
+- 更重要的是：编码智能体的典型失败——硬编码答案、状态泄漏、并发错误、不安全的路径处理——大多发生在 harness 层面。工作流缺一个强制验证步骤、工具少一道防护、环境没暴露正确的检查点。**这些弱点恰恰是身在循环中的 Agent 自己最能诊断、也最应该自己动手修的东西。**
 
-| 角色 | 职责 |
-|---|---|
-| **Warrior（战士）** | 在隔离沙箱中求解任务；是唯一可以提出自我进化提案（workflow / subject / plugin / environment）的角色 |
-| **Judge（法官）** | 评审 Warrior 的提交，建立证据链，并锻造下一批任务，持续给 Warrior 出难题 |
-| **Prosecutor（检察官）** | 审计真实 usage、风险与课程假设，行使治理实权（调整运行时策略、下令回滚），并提名修复补丁 |
+于是进化的主体和被进化的对象在 AEGIS 里是同一个：解题的 Warrior 提出改造，改造的产物又穿回 Warrior 身上。这就是"自己改造自己的 harness"。
 
-三者通过“独立反思 + 委员会投票”进行协商；整个系统在不可变目标与安全控制面的约束下运行。
+### 进化闭环的四个环节
 
-## 一次进化周期
+1. **暴露**：Warrior 穿着当前 harness 在隔离沙箱中解题，每一次失败、绕路和低效都被完整记录进周期证据链——弱点不是靠想象发现的，是被任务逼出来的。
+2. **提案**：改进的动机来自实践。只有真正在沙箱里干活的 Warrior 有资格提出进化提案（`evolution.request`）；旁观者（Judge、Prosecutor）的提名会被诚实拒绝——它们可以诊断问题，但只有承担后果的角色才能改自己的装备。
+3. **裁决**：提案被物化为候选，在**同一批任务、同一绑定、只差 harness 这一个变量**的条件下跑同代配对影子评测，归因报告回答"这次改造真的有用吗"。分不开就承认 `confounded`，样本太小就披露功效局限——负结果也是结果。
+4. **遗传**：通过门控的候选被激活进角色的 `CompositeRoleManifest`，下一代 Warrior 出生时就穿着新装备；未通过的候选留在谱系里，不消耗未来的机会。
 
-一个周期（一代）的完整闭环：
+### harness 与课程的共同进化
+
+静态基准会被过拟合，自我评估会自我强化。AEGIS 用一个会出题的对手替代静态基准：Judge 每个周期锻造新任务（经 reference/defect/mutant 三重校验后隔离入库），任务难度随着 Warrior 装备的升级水涨船高。**题目在变难，装备在变强**——这是一个双向的军备竞赛，适应度永远锚定在"当前课程下的真实表现"，而不是某个可以被背下来的固定题库。锚点任务只在空库时冷启动，之后渐进退役，系统最终完全运行在自己给自己出的题上。
+
+## 可进化的表面
+
+`src/aegis/evolution/surfaces.py` 为每类 harness 改造定义了严格的 JSON schema 与授权规则。全部表面**仅由 Warrior 提议**，插件/环境/主题只能面向 Warrior 自身：
+
+| 进化面 | 改造的是什么 | 形态 |
+|---|---|---|
+| `workflow` | 角色的解题流程（阶段计划、步骤组织） | 内容寻址工作流工件 |
+| `subject` | 任务主题与视角设定 | 主题工件 |
+| `plugin` | 手上的工具：源码内嵌（`sources` + 空 `image_digest`）或镜像插件，在沙箱内以 stdin/stdout JSON 协议**真实执行**；仅 ABI 动作 | 插件工件 |
+| `environment` | 沙箱运行环境配方（digest-pinned 基础镜像 + 离线/brokered-public 构建，双构建 digest 一致 + Trivy 扫描作为证据） | 环境 receipt 工件 |
+| `harness-code`（受控） | **进化控制代码本身**：Warrior 经 `aegis.propose_harness_change` 提交真实代码补丁；控制面在隔离 clone 上验证 checkpoint 树一致、compile/import 冒烟、基线与候选双金丝雀零回归后才激活并提交到真实 harness 仓库 | Git checkpoint + 补丁 |
+
+`harness-code` 面是这条理念走得最远的地方：连"决定谁能进化、怎么评测"的那部分代码，本身也在进化射程之内（需 `meta_evolution_enabled` 显式授权，且沙箱/发布/评测/归因边界永不开禁）。候选生命周期沿 `{campaign}:evolution:v2` 事件流推进：`collected → validated → qualified → active`，带每面 champion、父代谱系与回滚记录。
+
+## 进化循环全景
+
+一个周期（一代）= 一次完整的"暴露 → 提案 → 裁决 → 遗传"：
 
 ```mermaid
 flowchart TD
-    O["不可变目标与安全控制面"] --> S["课程快照与角色激活集"]
-    S --> A["冷启动锚点 / Judge 锻造动态任务"]
-    A --> W["Warrior 在隔离沙箱解题"]
-    W --> J["Judge 评审并锻造下一批任务"]
+    O["不可变安全宪法（进化发生在围栏内）"] --> S["角色激活集：这一代的 harness 基因组"]
+    S --> A["课程任务（锚点冷启动 / Judge 锻造新题）"]
+    A --> W["Warrior 穿着当前 harness 解题"]
+    W --> J["Judge 对抗式评审 + 锻造更难的新题"]
     J --> L["确定性质量锁定"]
     L --> P["Prosecutor 审计 usage / 风险 / 课程假设"]
     P --> C["三方独立反思 + 委员会裁决"]
     C --> F["TaskForge 校验入库（holdout 隔离期）"]
-    F --> E["候选收集 → 同代配对影子评测 → 归因"]
-    E --> R["角色候选合格 / 试用 → 激活集提交"]
+    F --> E["进化提案 → 同代配对影子评测 → 归因"]
+    E --> R["合格候选激活，写入下一代 manifest"]
     R --> S
     C -. 失败 .-> X["RecoverySupervisor 修复 / 回滚 last-known-good"]
     X --> S
 ```
 
-控制面由 `EvolutionCycleController` 驱动：Warrior 求解 → Judge 评审 → 确定性质量锁定 → Prosecutor 审计 → 三方反思 → 委员会协商 → 任务锻造与验证 → **候选评测**（影子臂）→ 归因 → 候选合格 → 激活集提交。每一阶段先落盘再进入下一阶段，快照对重试幂等。整个周期的事件流持久化在 append-only 的 `EventStore`（单一事实来源）中，所有证据工件（提交、评审、质量锁、审计、委员会、锻造、验证、归因、合格、激活）都存入内容寻址存储。
+控制面由 `EvolutionCycleController` 驱动，每一阶段先落盘再进入下一阶段，快照对重试幂等；整个事件流持久化在 append-only 的 `EventStore`（单一事实来源）中。失败或中断（含 ABORTED）的周期可以 `retry` 同一代理赔，或走检察官修复管道（发布 → 校验 → 激活，否则回滚）。
 
-## 核心机制
+## 对抗式三角色：选择压力的来源
 
-### 动态任务库
+单一智能体自我改进最大的陷阱是**自我强化回路**：自己出题、自己打分、自己表扬自己。AEGIS 把循环拆给三个利益相互制衡的角色：
 
-任务库是一个哈希链式 SQLite 账本。仓库自带的 12 个内置锚点任务（见 `taskpacks/python/`，每个都附有校验证据）仅在**空库**时以 `FIXED_ANCHOR` 注册；之后任务由 Judge 锻造、`TaskForge` 校验（reference 通过、defect 检出、mutant 全被杀）后进入隔离期（holdout），到期才可入选 cohort。队列优先选用动态任务，锚点按需回填、渐进退役。校验失败不烧毁 task_id（可改名重投），拒绝原因与逐用例失败明细会回传给下一轮锻造。
-
-### 角色循环与证据链
-
-三个角色统一运行在 `RoleAgentRuntime` 之上：模型每轮只发出一个严格 JSON 动作，令牌用量被校验并记录，沙箱动作限定在预置的 WSL/Podman 容器内（按角色独立生命周期）。Judge 与 Prosecutor 的上下文经过**脱敏**（私人推理与原始工具输出替换为摘要），防止评审环节被污染。所有模型请求走原生 Responses API 且强制 JSON 输出。
-
-### 委员会与治理
-
-每次协商由三次独立反思加一次主席审议组成，产出下一周期的议程。客观目标（objective）的修正需要包含检察官在内的 2/3 多数支持；目标本身受历史窗口与试用期约束，安全宪法不可变。
-
-### 检察官的实权
-
-除成本信封外，检察官可以**有界地**调整流程参数（`cohort_limit`、`task_authoring_attempts`、`task_proposals_per_cycle`、`candidate_max_steps`、`council_max_messages`）。审计出的课程假设与角色候选提名进入锻造/候选管道，结果如实反馈；在进化故障时还可通过 `aegis.order_rollback` 下令回滚。
-
-### 归因与诚实评估
-
-每个周期向 `attribution_arms.jsonl` 追加一个 `EvaluationArm`，并生成内容寻址的 `qualify_attribution` 报告；若缺少同队列配对数据，报告会如实标记为 `invalid-design` 或 `confounded`，绝不假装成功。候选评估使用**同 cohort 配对影子臂**：影子冠军的评测直接复用本周期主循环的 solve 设定（同队列、同绑定、完整步数），每 seed 只需跑候选臂。合格门槛采用 seed 均值判定（fresh 提升 ≥ 0.02）加每-seed 地板（≥ −0.10），单 seed 噪声不再一票否决；样本量小时（如 n=2）功效局限被透明披露。未启用的进化面在收集阶段即被拒绝，不占用每周期唯一的评估名额；非 Warrior 角色提出的候选会被每周期诚实拒绝。
-
-### 进化面与激活
-
-可进化表面在 `src/aegis/evolution/surfaces.py` 中定义了严格的 JSON schema 与授权规则，全部**仅由 Warrior 提议**：
-
-| 进化面 | 目标 | 说明 |
+| 角色 | 职责 | 制衡的是谁 |
 |---|---|---|
-| `workflow` | 可指向提议者自身 | 改变角色工作流 |
-| `subject` | Warrior | 改变任务主题/领域 |
-| `plugin` | Warrior | 源码内嵌（`sources` + 空 `image_digest`）或镜像内插件，在沙箱内以 stdin/stdout JSON 协议真实执行；仅 ABI 动作，无 EXTERNAL |
-| `environment` | Warrior | 沙箱运行环境配方，离线或 brokered-public 构建 |
+| **Warrior（战士）** | 穿着当前 harness 在隔离沙箱解题；唯一有权提出进化提案的角色 | —— |
+| **Judge（法官）** | 对抗式评审提交（上下文经脱敏，看不到私人推理原文），建立证据链；并锻造下一批更难的任务 | Warrior 的自我评估 |
+| **Prosecutor（检察官）** | 审计真实 usage、风险与课程假设；有界调整运行时策略；进化故障时下令回滚 | Warrior 与 Judge 的合谋空间 |
 
-另有受控的 `harness-code` 面：Warrior 通过 `aegis.propose_harness_change` 提交真实代码补丁，控制面在隔离 clone 上验证零回归后自动激活；评测/沙箱/发布/配置/归因等越权路径被硬拒绝。
+协商采用"三次独立反思 + 一次主席审议"的委员会机制，客观目标的修正需要**包含检察官在内的 2/3 多数**——单靠解题方和出题方无法改写系统的追求。检察官的实权有界且全程留痕（`cohort_limit`、`candidate_max_steps` 等参数调整均在界内），它审计出的课程假设会进入锻造管道，结果如实反馈。
 
-候选生命周期沿 `{campaign}:evolution:v2` 事件流推进：`collected → validated → qualified → active`，带每面 champion、父代谱系与回滚记录。每个角色在周期开始时解析一个 `CompositeRoleManifest`（schema v2：模型配置、workflow、subject、插件、运行时镜像、预算策略）；被激活的 champion 会真实注入下一代角色的运行时封套与沙箱准备。旧的 genesis 清单回退到默认值。
+三角色统一运行在 `RoleAgentRuntime` 之上：模型每轮只发出一个严格 JSON 动作，令牌用量被校验并记录，沙箱动作限定在按角色独立生命周期的 WSL/Podman 容器内。所有模型请求走原生 Responses API 且强制 JSON 输出。
 
-### 可信外部写入
+## 证据门控：进化的适应度函数
 
-需要写仓库等外部资源时走插件代理：`aegis.git_checkpoint` 是 journaled connector（意图先行的 `SqliteConnectorJournal`），经 `GitPublisher` 在隔离 clone 上执行——精确 base 的 CAS、路径级授权、密钥扫描、只创建（create-only）候选引用。远端凭据只存在于发布者环境中，绝不进入沙箱。
+进化系统的好坏最终取决于适应度函数是否诚实。AEGIS 用**同 cohort 配对影子评测**回答"这个 harness 改动真的有用吗"：
 
-### 失败修复与重试
+- **冠军基线零额外成本**：影子评测的基线直接复用本周期主循环的 solve——同队列、同绑定、完整步数，每 seed 只需跑候选臂；
+- **双臂步数对齐**：候选臂可获得有限额外步数（`candidate_max_extra_steps=24`），preflight 校验不超过 `max_agent_steps`，候选不会靠"更多步数"作弊；
+- **门槛抗噪**：seed 均值提升 ≥ 0.02 且每-seed 地板 ≥ −0.10，单 seed 噪声不再一票否决；小样本（如 n=2）的功效局限被透明披露；
+- **归因诚实**：每周期向 `attribution_arms.jsonl` 追加 `EvaluationArm` 账本并生成内容寻址归因报告；缺少配对数据时如实标记 `invalid-design` / `confounded`，不伪装成成功；
+- **机会成本受控**：未启用的进化面在收集阶段即被拒绝，不占用每周期唯一的评估名额；非 Warrior 提名被逐周期诚实拒绝。
 
-周期失败时先记录原始错误，交由检察官产出有界补丁（≤ 10 步），再运行 `RecoverySupervisor`：发布 → 校验 → 激活修复后的角色版本，否则回滚到 last-known-good。FAILED 与中断（含 ABORTED）的周期可通过 `retry` 转换在同一代重试。
+激活不是终点：候选进入试用期（probation）观察，目标受历史窗口约束；环境候选的构建 receipt（两次独立构建 digest 一致 + 扫描证据）物化到候选上，激活后 `runtime_image` 被 digest 钉死，后续代际的沙箱 prepare 直接使用新镜像。
 
-## 威胁模型与安全姿态
+## 围栏内的进化
 
-威胁模型（详见 [docs/threat-model.md](docs/threat-model.md)）把 Warrior、Judge、Prosecutor、下载的网页内容、任务代码、依赖与模型输出全部列为不可信来源，受保护的资产包括宿主机文件/凭据/进程/网络、隐藏测试与评分规则、审计事件完整性。
+进化发生在围栏内——这是上述一切得以诚实的物理前提，而非项目的主要卖点。威胁模型（[docs/threat-model.md](docs/threat-model.md)）把三个角色、任务代码、下载内容与模型输出全部视为不可信，主要控制：
 
-主要控制：
+- **专用 WSL 发行版**：禁用 Windows automount、interop 与 PATH 注入；
+- **无根 Podman**：任务容器**无网络**、无 capabilities、受限 CPU/内存/PID；专用 loopback ext4 工作区，启动核对内核挂载表而非仅看标记文件；
+- **密封评测**：隐藏用例、reference、mutant 只留在控制面一侧，绝不出现在 Warrior 文件系统；冻结哈希不可变；
+- **可信外部写入**：`aegis.git_checkpoint` 走意图先行的 journaled connector，经隔离 clone + 路径授权 + 密钥扫描 + create-only 引用发布；
+- **失败即关闭**：研究服务或代理不可用时研究功能 fails closed，任务执行始终离线；密钥只驻宿主机进程，绝不进入 WSL。
 
-- **专用 WSL 发行版**：禁用 Windows automount、interop 与 PATH 注入；不装 sudo，容器运行时不暴露 socket 或宿主秘密。
-- **无根 Podman**：任务容器**无网络**、无 capabilities、受限 CPU/内存/PID；专用 loopback ext4 工作区（64 MiB），启动时核对内核挂载表与 `statvfs`——单靠标记文件永远不能证明隔离。
-- **密封评测**：隐藏用例、reference、mutant 只留在控制面一侧，绝不出现在 Warrior 或提交 worker 的文件系统；冻结哈希不可变，独立密封评测器判定。
-- **失败即关闭**：研究端点或代理不可用时研究功能 fails closed；任务执行始终离线。生产环境的假沙箱与未配置的在线研究都会被阻断。
-- **密钥只驻宿主机进程**，不会复制进 WSL。
-
-残余风险：WSL2 并不等价于一台独立管理的远程机器，Hypervisor/内核/Podman/WSL 集成缺陷仍可能存在；高价值或敌意负载建议使用可销毁的 Hyper-V 或远程 VM 后端。
+残余风险：WSL2 不等价于独立管理的远程机器；高价值或敌意负载建议使用可销毁的 Hyper-V 或远程 VM 后端。
 
 ## 环境要求
 
@@ -239,6 +239,7 @@ python -m pytest
 ## 项目状态与边界
 
 - **研究阶段、dynamic-only**：仓库不携带预置任务包；是否可正式运行以最新 `autonomy-preflight` 为准。
+- **非 RL 的进化**：不动权重、没有梯度；选择压力来自对抗式评审与证据门控的激活决策，全部基于行为表现。
 - **诚实负结果**：归因报告对 `invalid-design` / `confounded`、候选的拒绝与小额样本的功效局限都如实记录，不粉饰。
 - **宿主绑定**：当前面向 Windows 宿主机 + 专用 WSL2 + rootless Podman 开发与验收。
 - **许可**：Proprietary（未开源）。
