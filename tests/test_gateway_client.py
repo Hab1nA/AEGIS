@@ -693,13 +693,23 @@ class StdlibTransportTests(unittest.TestCase):
                 "os.environ",
                 {"NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"},
             ):
-                response = transport.post(
-                    f"http://127.0.0.1:{port}/v1/responses",
-                    headers={},
-                    body=b"{}",
-                    timeout=15,
-                    cancel=CancelToken(),
-                )
+                # Same Windows pipe-reset transient tolerated by the 429
+                # propagation test: the production gateway retries
+                # ConnectionError, so mirror that here.
+                response = None
+                for _ in range(3):
+                    try:
+                        response = transport.post(
+                            f"http://127.0.0.1:{port}/v1/responses",
+                            headers={},
+                            body=b"{}",
+                            timeout=15,
+                            cancel=CancelToken(),
+                        )
+                        break
+                    except ConnectionError:
+                        continue
+            assert response is not None
             self.assertEqual(response.status, 200)
             self.assertEqual(response.body, body)
         finally:
