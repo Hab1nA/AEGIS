@@ -18,17 +18,6 @@ from aegis.evolution.source import is_local_source_mirror
 
 AUTONOMY_ACCEPTANCE_PROFILES = frozenset({"autonomous_evolution_v1", "autonomous_evolution_v2"})
 
-NETWORK_ALLOWLIST_DOMAINS = (
-    "github.com",
-    "raw.githubusercontent.com",
-    "api.github.com",
-    "pypi.org",
-    "files.pythonhosted.org",
-    "arxiv.org",
-    "huggingface.co",
-    "cdn-lfs.huggingface.co",
-)
-
 
 class ConfigError(ValueError):
     """Raised when a campaign configuration is incomplete or unsafe."""
@@ -94,12 +83,7 @@ class AutonomyV2Config:
     objective_history_window: int = 3
     objective_probation_cycles: int = 2
     public_repo_url: str | None = None
-    public_stable_branch: str = "stable"
-    candidate_branch_prefix: str = "candidate"
-    builder_public_internet: bool = True
     builder_block_private_networks: bool = True
-    runtime_network: str = "none"
-    network_allowlist_domains: tuple[str, ...] = NETWORK_ALLOWLIST_DOMAINS
     external_writes_via_connectors: bool = True
     role_activation_automatic: bool = True
     immutable_safety_constitution: bool = True
@@ -134,12 +118,7 @@ class AutonomyV2Config:
             "objective_history_window",
             "objective_probation_cycles",
             "public_repo_url",
-            "public_stable_branch",
-            "candidate_branch_prefix",
-            "builder_public_internet",
             "builder_block_private_networks",
-            "runtime_network",
-            "network_allowlist_domains",
             "external_writes_via_connectors",
             "role_activation_automatic",
             "immutable_safety_constitution",
@@ -172,64 +151,12 @@ class AutonomyV2Config:
         dynamic_only = _bool(raw.get("dynamic_only", True), "autonomy_v2.dynamic_only")
         if enabled and not dynamic_only:
             raise ConfigError("autonomy_v2.dynamic_only must remain true for the selected v2 design")
-        stable = raw.get("public_stable_branch", "stable")
-        prefix = raw.get("candidate_branch_prefix", "candidate")
-        for name, value in (("public_stable_branch", stable), ("candidate_branch_prefix", prefix)):
-            if (
-                not isinstance(value, str)
-                or not value
-                or value != value.strip()
-                or any(
-                    character
-                    not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_/"
-                    for character in value
-                )
-                or ".." in value
-                or value.startswith("/")
-                or value.endswith("/")
-            ):
-                raise ConfigError(f"autonomy_v2.{name} is not a safe Git ref component")
-        builder_public = _bool(
-            raw.get("builder_public_internet", True), "autonomy_v2.builder_public_internet"
-        )
         block_private = _bool(
             raw.get("builder_block_private_networks", True),
             "autonomy_v2.builder_block_private_networks",
         )
         if enabled and not block_private:
             raise ConfigError("autonomy_v2 may not allow builder access to private networks")
-        runtime_network = raw.get("runtime_network", "none")
-        if runtime_network not in {"none", "allowlist"}:
-            raise ConfigError("autonomy_v2.runtime_network must be 'none' or 'allowlist'")
-        allowlist = raw.get("network_allowlist_domains", NETWORK_ALLOWLIST_DOMAINS)
-        if (
-            not isinstance(allowlist, (list, tuple))
-            or not allowlist
-            or len(allowlist) != len(set(allowlist))
-        ):
-            raise ConfigError(
-                "autonomy_v2.network_allowlist_domains must be a unique non-empty list"
-            )
-        normalized_allowlist: list[str] = []
-        for domain in allowlist:
-            if (
-                not isinstance(domain, str)
-                or not domain
-                or domain != domain.strip().lower()
-                or any(
-                    character
-                    not in "abcdefghijklmnopqrstuvwxyz0123456789.-"
-                    for character in domain
-                )
-                or domain.startswith(".")
-                or domain.endswith(".")
-                or ".." in domain
-                or "://" in domain
-            ):
-                raise ConfigError(
-                    "autonomy_v2.network_allowlist_domains entries must be plain domain names"
-                )
-            normalized_allowlist.append(domain)
         harness_enabled = _bool(
             raw.get("harness_evolution_enabled", False),
             "autonomy_v2.harness_evolution_enabled",
@@ -362,12 +289,7 @@ class AutonomyV2Config:
             public_repo_url=_optional_public_github_url(
                 raw.get("public_repo_url"), "autonomy_v2.public_repo_url"
             ),
-            public_stable_branch=stable,
-            candidate_branch_prefix=prefix,
-            builder_public_internet=builder_public,
             builder_block_private_networks=block_private,
-            runtime_network=runtime_network,
-            network_allowlist_domains=tuple(normalized_allowlist),
             external_writes_via_connectors=connectors,
             role_activation_automatic=automatic,
             immutable_safety_constitution=immutable,
@@ -403,12 +325,7 @@ class AutonomyV2Config:
             "objective_history_window": self.objective_history_window,
             "objective_probation_cycles": self.objective_probation_cycles,
             "public_repo_url": self.public_repo_url,
-            "public_stable_branch": self.public_stable_branch,
-            "candidate_branch_prefix": self.candidate_branch_prefix,
-            "builder_public_internet": self.builder_public_internet,
             "builder_block_private_networks": self.builder_block_private_networks,
-            "runtime_network": self.runtime_network,
-            "network_allowlist_domains": list(self.network_allowlist_domains),
             "external_writes_via_connectors": self.external_writes_via_connectors,
             "role_activation_automatic": self.role_activation_automatic,
             "immutable_safety_constitution": self.immutable_safety_constitution,
