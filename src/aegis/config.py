@@ -140,7 +140,15 @@ class AutonomyV2Config:
         }
     )
     _EVOLUTION_SURFACES = frozenset(
-        {"workflow", "subject", "plugin", "environment", "harness-code"}
+        {
+            "workflow",
+            "subject",
+            "plugin",
+            "environment",
+            "harness-code",
+            "mcp",
+            "control-core",
+        }
     )
 
     @classmethod

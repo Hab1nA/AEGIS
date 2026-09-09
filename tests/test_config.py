@@ -209,6 +209,41 @@ class ConfigTests(unittest.TestCase):
                 )
             )
 
+    def test_evolution_surfaces_accept_every_known_surface_and_reject_unknown(self):
+        roles = {
+            "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},
+            "judge": {"model": "j", "budget_share": 0.225, "max_output_tokens": 4096},
+            "prosecutor": {"model": "p", "budget_share": 0.225, "max_output_tokens": 4096},
+        }
+        every_surface = (
+            "workflow",
+            "subject",
+            "plugin",
+            "environment",
+            "harness-code",
+            "mcp",
+            "control-core",
+        )
+        config = CampaignConfig.from_mapping(
+            valid_config(
+                acceptance_profile="autonomous_evolution_v2",
+                roles=roles,
+                task_pack_paths=[],
+                autonomy_v2={"evolution_surfaces": list(every_surface)},
+            )
+        )
+        assert config.autonomy_v2 is not None
+        self.assertEqual(config.autonomy_v2.evolution_surfaces, every_surface)
+        with self.assertRaisesRegex(ConfigError, "unknown surface"):
+            CampaignConfig.from_mapping(
+                valid_config(
+                    acceptance_profile="autonomous_evolution_v2",
+                    roles=roles,
+                    task_pack_paths=[],
+                    autonomy_v2={"evolution_surfaces": ["workflow", "self-modify"]},
+                )
+            )
+
     def test_dynamic_v2_cannot_relax_the_safety_constitution(self):
         roles = {
             "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},

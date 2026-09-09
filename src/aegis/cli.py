@@ -601,7 +601,15 @@ def _run_autonomy_preflight(campaign_id: str) -> dict[str, Any]:
 
     autonomy = config.autonomy_v2
     known_surfaces = frozenset(
-        {"workflow", "subject", "plugin", "environment", "harness-code"}
+        {
+            "workflow",
+            "subject",
+            "plugin",
+            "environment",
+            "harness-code",
+            "mcp",
+            "control-core",
+        }
     )
     if autonomy is None:
         _check("evolution_surfaces_valid", False, "autonomy_v2 is not configured")
