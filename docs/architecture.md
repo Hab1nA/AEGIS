@@ -34,6 +34,13 @@ has a strict JSON shape and a grant rule:
 | subject | Warrior proposes; targets the Warrior | `subject` |
 | plugin | Warrior proposes; targets the Warrior; sandbox-executed ABI only (no EXTERNAL) | `plugin` |
 | environment | Warrior proposes; targets the Warrior; offline or brokered-public recipe | `environment` |
+| harness-code | Warrior proposes a real code patch; requires `harness_evolution_enabled` plus an explicit harness repo; evaluation/sandbox/publishing/attribution roots are hard-forbidden | `harness-code` |
+| mcp | Warrior proposes a self-contained MCP candidate; never enabled by default | `mcp` |
+| control-core | Warrior proposes the narrow in-WSL control policy; host/credential/network boundaries are rejected by field name; never enabled by default | `control-core` |
+
+All non-workflow surfaces must also appear in the campaign
+`autonomy_v2.evolution_surfaces` allowlist to be consumed; `harness-code`,
+`mcp`, and `control-core` are opt-in.
 
 `EvolutionRegistry` persists the candidate lifecycle on the
 `{campaign}:evolution:v2` event stream: `collected -> validated ->
