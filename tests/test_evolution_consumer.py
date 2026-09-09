@@ -113,6 +113,53 @@ class EvolutionConsumerTests(unittest.TestCase):
         self.assertIs(by_surface[EvolutionSurface.SUBJECT].target_role, Role.JUDGE)
         self.assertTrue(all(item.collected and item.validated for item in consumed))
 
+    def test_opt_in_surfaces_are_consumed_when_enabled_and_rejected_when_not(self) -> None:
+        from aegis.evolution.control_core import DEFAULT_CONTROL_CORE_POLICY
+
+        submission = {
+            "role": "warrior",
+            "submission": {
+                "evolution_requests": [
+                    {
+                        "objective": "tune inner promotion gate",
+                        "rationale": "evidence",
+                        "source_refs": [],
+                        "proposal": {
+                            "surface": "control-core",
+                            "target_role": "warrior",
+                            "content": DEFAULT_CONTROL_CORE_POLICY.to_mapping(),
+                        },
+                    }
+                ]
+            },
+        }
+        enabled = consume_cycle_proposals(
+            registry=self.registry,
+            artifacts=self.artifacts,
+            submission=submission,
+            prosecutor_audit={},
+            objective_id=self.objective,
+            collection_evidence_id="cycle:1:eval",
+            enabled_surfaces=["workflow", "subject", "plugin", "environment", "control-core"],
+        )
+        self.assertEqual(len(enabled), 1)
+        self.assertTrue(enabled[0].collected)
+        self.assertTrue(enabled[0].validated)
+        self.assertIs(enabled[0].surface, EvolutionSurface.CONTROL_CORE)
+
+        disabled = consume_cycle_proposals(
+            registry=EvolutionRegistry(self.store, "campaign-b"),
+            artifacts=ContentAddressedArtifactStore(self.root / "artifacts-b"),
+            submission=submission,
+            prosecutor_audit={},
+            objective_id=self.objective,
+            collection_evidence_id="cycle:1:eval",
+            enabled_surfaces=["workflow", "subject", "plugin", "environment"],
+        )
+        self.assertEqual(len(disabled), 1)
+        self.assertFalse(disabled[0].collected)
+        self.assertIn("not enabled", disabled[0].error or "")
+
     def test_rejects_invalid_and_non_materializable_proposals(self) -> None:
         submission = {
             "role": "warrior",
