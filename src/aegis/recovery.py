@@ -32,16 +32,6 @@ class RepairDisposition(StrEnum):
     RETRY_AFTER_FIX = "retry_after_fix"
 
 
-class RecoveryState(StrEnum):
-    HEALTHY = "healthy"
-    FENCING = "fencing"
-    ROLLED_BACK = "rolled_back"
-    DIAGNOSING = "diagnosing"
-    REPAIR_VALIDATING = "repair_validating"
-    PROBATION = "probation"
-    FAILED = "failed"
-
-
 def _aware(value: object, name: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise RecoveryContractError(f"{name} must be timezone-aware")

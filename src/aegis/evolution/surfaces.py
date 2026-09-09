@@ -725,13 +725,6 @@ EVOLUTION_PROTOCOL_SCHEMA: Mapping[str, Any] = {
 }
 
 
-def canonical_artifact_digest(kind: str, payload: Mapping[str, Any]) -> str:
-    """Return the canonical sha256 digest of surface artifact JSON."""
-    from aegis.models import canonical_json
-
-    return canonical_json(payload)
-
-
 def content_digest(kind: str, payload: Mapping[str, Any]) -> str:
     """Return the typed content address for a surface artifact."""
     import hashlib
