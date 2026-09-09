@@ -61,8 +61,10 @@
 | `plugin` | 手上的工具：源码内嵌（`sources` + 空 `image_digest`）或镜像插件，在沙箱内以 stdin/stdout JSON 协议**真实执行**；仅 ABI 动作 | 插件工件 |
 | `environment` | 沙箱运行环境配方（digest-pinned 基础镜像 + 离线/brokered-public 构建，双构建 digest 一致 + Trivy 扫描作为证据） | 环境 receipt 工件 |
 | `harness-code`（受控） | **进化控制代码本身**：Warrior 经 `aegis.propose_harness_change` 提交真实代码补丁；控制面在隔离 clone 上验证 checkpoint 树一致、compile/import 冒烟、基线与候选双金丝雀零回归后才激活并提交到真实 harness 仓库 | Git checkpoint + 补丁 |
+| `mcp`（默认关闭） | 外部工具接入面：自包含 MCP 候选经控制面 JSON-RPC 桥实时校验后注册 | MCP 候选工件 |
+| `control-core`（默认关闭） | WSL 内层控制策略：内层评测权重、晋升门限参数、内层任务沙箱配额；host/凭据/网络边界字段名级拒绝 | 控制策略工件 |
 
-`harness-code` 面是这条理念走得最远的地方：连"决定谁能进化、怎么评测"的那部分代码，本身也在进化射程之内（需 `meta_evolution_enabled` 显式授权，且沙箱/发布/评测/归因边界永不开禁）。候选生命周期沿 `{campaign}:evolution:v2` 事件流推进：`collected → validated → qualified → active`，带每面 champion、父代谱系与回滚记录。
+`harness-code` 面是这条理念走得最远的地方：连"决定谁能进化、怎么评测"的那部分代码，本身也在进化射程之内（面本身需 `harness_evolution_enabled` + 显式 harness 仓库；其触及演化控制文件 `registry.py`/`consumer.py` 的子集再需 `meta_evolution_enabled`，且沙箱/发布/评测/归因边界永不开禁）。`mcp` 与 `control-core` 面机制完备但默认不在 `evolution_surfaces` 白名单中，需显式启用。候选生命周期沿 `{campaign}:evolution:v2` 事件流推进：`collected → validated → qualified → active`，带每面 champion、父代谱系与回滚记录。
 
 ## 进化循环全景
 
@@ -203,7 +205,7 @@ AEGIS_HTTPS_PROXY=http://127.0.0.1:7897
 
    `status`、`report`（`--format json|markdown`）与 `replay` 读取持久的 v2 事件流；`knowledge-search` 查询累积的知识。
 
-战役配置（见 `configs/evolution-smoke.example.json`）声明预算信封（轮数、令牌、请求数、墙钟时间）、`autonomy_v2` 控制面（启用、隔离期、公开仓库 URL、运行时网络策略 `none`、进化面清单、候选步数上限）以及三角色的模型与预算份额。真实 E2E 验收记录见 [docs/autonomous-evolution.md](docs/autonomous-evolution.md)。
+战役配置（见 `configs/evolution-smoke.example.json`）声明预算信封（轮数、令牌、请求数、墙钟时间）、`autonomy_v2` 控制面（启用、隔离期、公开仓库 URL、进化面清单、候选步数上限；运行时沙箱恒为无网络）以及三角色的模型与预算份额。真实 E2E 验收记录见 [docs/autonomous-evolution.md](docs/autonomous-evolution.md)。
 
 ## 运行测试
 
