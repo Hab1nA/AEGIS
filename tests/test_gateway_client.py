@@ -7,6 +7,7 @@ import socket
 import time
 import unittest
 import urllib.error
+from typing import cast
 from unittest.mock import patch
 
 from aegis.gateway.client import GatewayConfig, ModelGateway, RetryPolicy, _user_agent
@@ -637,16 +638,30 @@ class StdlibTransportTests(unittest.TestCase):
                 "os.environ",
                 {"NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"},
             ):
-                with self.assertRaises(GatewayHTTPError) as raised:
-                    transport.post(
-                        f"http://127.0.0.1:{port}/v1/responses",
-                        headers={},
-                        body=b"{}",
-                        timeout=5,
-                        cancel=CancelToken(),
-                    )
-            self.assertEqual(raised.exception.status, 429)
-            self.assertTrue(raised.exception.retryable)
+                # Windows can reset the child pipe right after the child exits,
+                # surfacing ConnectionAbortedError before the parent drains the
+                # relayed outcome; the production gateway already retries that
+                # class, so mirror one retry here around the same transient.
+                outcome: tuple[object, object] | None = None
+                for _ in range(3):
+                    try:
+                        transport.post(
+                            f"http://127.0.0.1:{port}/v1/responses",
+                            headers={},
+                            body=b"{}",
+                            timeout=5,
+                            cancel=CancelToken(),
+                        )
+                    except GatewayHTTPError as exc:
+                        outcome = ("http", exc)
+                        break
+                    except ConnectionError:
+                        continue
+                assert outcome is not None
+            self.assertEqual(outcome[0], "http")
+            raised = cast(GatewayHTTPError, outcome[1])
+            self.assertEqual(raised.status, 429)
+            self.assertTrue(raised.retryable)
         finally:
             server.shutdown()
             server.server_close()
