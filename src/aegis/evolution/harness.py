@@ -216,22 +216,6 @@ class ChangeManifest:
         return {"manifest_id": self.manifest_id, **payload} if include_id else payload
 
 
-def manifest_from_harness_content(content: Mapping[str, Any]) -> ChangeManifest:
-    """Derive the decision manifest from a validated harness_code proposal."""
-    return ChangeManifest.create(
-        surface="harness-code",
-        files=tuple(item["path"] for item in content["changes"]),
-        failure_mode_targeted=content.get("failure_mode_targeted"),
-        expected_fix=content.get("expected_fix", ()),
-        regression_risk=content.get("regression_risk", ()),
-        evidence_ref=content.get("evidence_ref"),
-        base_commit=content["base_commit"],
-        checkpoint_ref=content["checkpoint_ref"],
-        objective=content["objective"],
-        rationale=content["rationale"],
-    )
-
-
 def _digest(payload: Mapping[str, Any]) -> str:
     return "change-manifest-sha256:" + hashlib.sha256(
         canonical_json(payload).encode("utf-8")
@@ -763,6 +747,5 @@ __all__ = [
     "HarnessRollbackExecutor",
     "RollbackOrder",
     "changes_to_git_file_changes",
-    "manifest_from_harness_content",
     "validate_harness_patch_paths",
 ]

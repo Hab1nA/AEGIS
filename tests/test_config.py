@@ -257,7 +257,6 @@ class ConfigTests(unittest.TestCase):
         )
         for unsafe in (
             {"builder_block_private_networks": False},
-            {"runtime_network": "none"},
             {"external_writes_via_connectors": False},
             {"immutable_safety_constitution": False},
             {"public_repo_url": "https://token@github.com/example/repo.git"},

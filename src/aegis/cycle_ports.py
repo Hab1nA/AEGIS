@@ -17,6 +17,7 @@ import math
 import re
 import secrets
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -168,7 +169,6 @@ from aegis.judge import (
     JudgeForecast,
     TaskFailureForecast,
     compute_calibration,
-    estimate_message_tokens,
     sanitize_diagnostic_quality,
 )
 from aegis.mcp import (
@@ -6277,8 +6277,14 @@ def run_v2_cycle(
                         "error": cycle_error[:2000],
                     },
                 )
-            except Exception:
-                pass
+            except Exception as append_error:
+                # The original cycle failure still propagates below; never let
+                # a broken event sink silence the recovery audit trail.
+                print(
+                    f"warning: failed to record cycle_failed_recovery_started for cycle:{target}: "
+                    f"{append_error}",
+                    file=sys.stderr,
+                )
         if (
             isinstance(exc, RuntimeBudgetExceeded)
             and runtime_policy_registry is not None

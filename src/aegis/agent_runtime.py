@@ -85,7 +85,6 @@ class StepLimitExceeded(RuntimeError):
 
 MAX_EVOLUTION_REQUESTS = 1
 MAX_EVOLUTION_SOURCE_REFS = 5
-MAX_RESEARCH_ACTIONS = 10
 
 # Fixed execution safety bounds. These are no longer tunable budget
 # parameters: a role runs until convergence or the step cap, bounded only by
@@ -274,7 +273,7 @@ _ROLE_PROTOCOL_FIELDS: Mapping[str, Mapping[str, Any]] = {
         "action": "evolution.request",
         "warrior_only": True,
         "proposal": {
-            "surface": "workflow|subject|plugin|environment|mcp",
+            "surface": "workflow|subject|plugin|environment|mcp|control-core",
             "target_role": "role name",
             "content": "strict surface-specific JSON; schemas are enforced by the control plane",
         },

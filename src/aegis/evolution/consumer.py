@@ -20,10 +20,6 @@ from .surfaces import (
 )
 
 
-class EvolutionConsumerError(RuntimeError):
-    """Raised when cycle evidence cannot be consumed safely."""
-
-
 @dataclass(frozen=True, slots=True)
 class ConsumedCandidate:
     surface: EvolutionSurface
@@ -587,7 +583,6 @@ def consume_rollback_orders(submission: Mapping[str, Any]) -> tuple[RollbackOrde
 
 __all__ = [
     "ConsumedCandidate",
-    "EvolutionConsumerError",
     "consume_rollback_orders",
     "consume_cycle_proposals",
 ]

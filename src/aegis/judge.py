@@ -55,18 +55,6 @@ def _typed_or_bare_digest(value: object, name: str) -> str:
     raise ValueError(f"{name} must be a sha256 content address or typed content address")
 
 
-def estimate_message_tokens(text: str) -> int:
-    """Content-length token estimate for council transcripts.
-
-    This deliberately measures message content, not provider billing.  Billing
-    usage is tracked separately in role evidence; the council transcript limit
-    is a protocol bound over the messages themselves.
-    """
-    if not isinstance(text, str):
-        raise TypeError("message text must be a string")
-    return max(1, (len(text) + 3) // 4)
-
-
 class EvidenceKind(StrEnum):
     OBSERVED = "observed"
     INFERRED = "inferred"

@@ -267,8 +267,10 @@ class AutonomyV2Config:
             ):
                 raise ConfigError("autonomy_v2.environment_output_repository is invalid")
         scanner_binary = raw.get("scanner_binary", "trivy")
-        if not isinstance(scanner_binary, str) or not scanner_binary or scanner_binary != scanner_binary.strip():
-            raise ConfigError("autonomy_v2.scanner_binary must be a non-empty trimmed string")
+        if scanner_binary != "trivy":
+            # The scanner is hard-wired to trivy in the sandbox backend; the
+            # config field exists for explicitness, not for substitution.
+            raise ConfigError("autonomy_v2.scanner_binary must remain 'trivy'")
         candidate_steps = _positive_int(
             raw.get("candidate_max_extra_steps", 24),
             "autonomy_v2.candidate_max_extra_steps",

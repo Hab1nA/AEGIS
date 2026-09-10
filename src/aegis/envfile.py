@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Mapping, MutableMapping
+from typing import MutableMapping
 
 _ENV_FILE = ".aegis.env"
 _RELAY_KEYS = frozenset(
@@ -74,11 +74,4 @@ def load_aegis_env(
     return applied
 
 
-def relay_env(cwd: Path | None = None) -> Mapping[str, str]:
-    """Return the effective relay environment after applying ``.aegis.env``."""
-    loaded = dict(os.environ)
-    load_aegis_env(cwd=cwd, env=loaded)
-    return loaded
-
-
-__all__ = ["load_aegis_env", "relay_env"]
+__all__ = ["load_aegis_env"]

@@ -5,7 +5,6 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 
 SOURCE_MIRROR_PATH = "/var/lib/aegis/source-mirror.git"
-SOURCE_MIRROR_URL = "file://" + SOURCE_MIRROR_PATH
 
 
 def is_local_source_mirror(value: str) -> bool:

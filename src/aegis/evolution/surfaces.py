@@ -38,8 +38,6 @@ from aegis.plugins.abi import (
 
 from .control_core import ControlCorePolicy, ControlCorePolicyError
 
-SURFACE_SCHEMA_VERSION = 2
-
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _OCI_DIGEST = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9-]{0,63}-sha256:[0-9a-f]{64}\Z")
@@ -725,22 +723,11 @@ EVOLUTION_PROTOCOL_SCHEMA: Mapping[str, Any] = {
 }
 
 
-def content_digest(kind: str, payload: Mapping[str, Any]) -> str:
-    """Return the typed content address for a surface artifact."""
-    import hashlib
-
-    from aegis.models import canonical_json
-
-    digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
-    return f"{kind}-sha256:{digest}"
-
-
 __all__ = [
     "EVOLUTION_PROTOCOL_SCHEMA",
     "MAX_SUBJECT_MARKDOWN_BYTES",
     "MAX_SUBJECT_RATIONALE_BYTES",
     "PLUGIN_ALLOWED_EFFECTS",
-    "SURFACE_SCHEMA_VERSION",
     "EvolutionProposal",
     "EvolutionSurface",
     "EvolutionSurfaceError",
@@ -754,7 +741,6 @@ __all__ = [
     "MAX_HARNESS_CHANGES",
     "MAX_HARNESS_FILE_BYTES",
     "MAX_HARNESS_TEXT_BYTES",
-    "content_digest",
     "validate_harness_code_content",
     "validate_harness_path",
     "validate_control_core_content",
