@@ -12,7 +12,7 @@ import json
 import math
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
@@ -281,6 +281,7 @@ class CandidateGateReport:
     policy: CandidateGatePolicy
     seed_results: tuple[CandidateSeedResult, ...]
     total_cost_change: float | None
+    bootstrap: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.reason or self.reason != self.reason.strip():
@@ -294,9 +295,14 @@ class CandidateGateReport:
             self.total_cost_change
         ):
             raise ValueError("total_cost_change must be finite or null")
-        expected = _content_id(
-            "candidate-gate-report-sha256:", self.to_mapping(include_id=False)
-        )
+        # The bootstrap annex is power evidence, not part of the decision
+        # identity: legacy reports without it keep their original id.
+        identity = {
+            key: value
+            for key, value in self.to_mapping(include_id=False).items()
+            if key != "bootstrap"
+        }
+        expected = _content_id("candidate-gate-report-sha256:", identity)
         if self.report_id != expected:
             raise ValueError("report_id does not match candidate gate evidence")
 
@@ -317,6 +323,8 @@ class CandidateGateReport:
                 else round(self.total_cost_change, 12)
             ),
         }
+        if self.bootstrap is not None:
+            payload["bootstrap"] = dict(self.bootstrap)
         return {"report_id": self.report_id, **payload} if include_id else payload
 
     @classmethod
@@ -330,7 +338,9 @@ class CandidateGateReport:
             "seed_results",
             "total_cost_change",
         }
-        if set(value) != expected:
+        optional = {"bootstrap"}
+        unknown = set(value) - expected - optional
+        if unknown or not expected <= set(value):
             raise ValueError("candidate gate report has missing or unknown fields")
         pair_ids = value["pair_ids"]
         policy = value["policy"]
@@ -350,6 +360,9 @@ class CandidateGateReport:
             isinstance(cost_change, bool) or not isinstance(cost_change, (int, float))
         ):
             raise TypeError("total_cost_change must be numeric or null")
+        bootstrap = value.get("bootstrap")
+        if bootstrap is not None and not isinstance(bootstrap, Mapping):
+            raise TypeError("bootstrap must be an object or null")
         return cls(
             report_id=value["report_id"],
             disposition=CandidateGateDisposition(value["disposition"]),
@@ -358,6 +371,7 @@ class CandidateGateReport:
             policy=CandidateGatePolicy.from_mapping(policy),
             seed_results=tuple(CandidateSeedResult.from_mapping(item) for item in results),
             total_cost_change=(None if cost_change is None else float(cost_change)),
+            bootstrap=None if bootstrap is None else dict(bootstrap),
         )
 
 
@@ -369,6 +383,7 @@ def _report(
     *,
     results: tuple[CandidateSeedResult, ...] = (),
     total_cost_change: float | None = None,
+    bootstrap: Mapping[str, Any] | None = None,
 ) -> CandidateGateReport:
     pair_ids = tuple(sorted({item.pair_id for item in pairs}))
     normalized_results = tuple(
@@ -405,20 +420,36 @@ def _report(
         policy,
         normalized_results,
         normalized_cost_change,
+        bootstrap,
     )
 
 
 def evaluate_candidate_gate(
     evidence: Iterable[SealedCandidatePair],
     policy: CandidateGatePolicy | None = None,
+    *,
+    task_deltas: Sequence[float] = (),
 ) -> CandidateGateReport:
     """Apply non-compensable gates to the paired sealed seed evidence.
 
     Fresh improvement and regression noninferiority are judged on the seed
     mean, with a per-seed floor guarding against a catastrophic single seed
     hiding inside an acceptable mean.  Cost is checked once over the total
-    paired usage.
+    paired usage.  ``task_deltas`` (one per task, mean candidate-minus-
+    champion quality across seeds) only produces a bootstrap power annex on
+    the report; the disposition itself never depends on it.
     """
+    bootstrap: Mapping[str, Any] | None = None
+    if task_deltas:
+        from aegis.evaluation.promotion import bootstrap_paired_delta
+
+        lower, upper = bootstrap_paired_delta(list(task_deltas))
+        bootstrap = {
+            "task_count": len(task_deltas),
+            "quality_lower": round(lower, 12),
+            "quality_upper": round(upper, 12),
+            "samples": 10_000,
+        }
 
     applied = policy or CandidateGatePolicy()
     pairs = tuple(sorted(evidence, key=lambda item: (item.seed, item.pair_id)))
@@ -538,6 +569,7 @@ def evaluate_candidate_gate(
             "candidate total cost exceeds the permitted increase",
             results=results,
             total_cost_change=total_cost_change,
+            bootstrap=bootstrap,
         )
     # Qualification paths.  Fresh improvement is the primary measure, but a
     # trivial fresh task saturates both arms at 1.0 and makes any improvement
@@ -559,6 +591,7 @@ def evaluate_candidate_gate(
             ),
             results=results,
             total_cost_change=total_cost_change,
+            bootstrap=bootstrap,
         )
     if (
         fresh_saturated
@@ -574,6 +607,7 @@ def evaluate_candidate_gate(
             ),
             results=results,
             total_cost_change=total_cost_change,
+            bootstrap=bootstrap,
         )
     if (
         total_cost_change is not None
@@ -592,6 +626,7 @@ def evaluate_candidate_gate(
             ),
             results=results,
             total_cost_change=total_cost_change,
+            bootstrap=bootstrap,
         )
     return _report(
         pairs,

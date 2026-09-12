@@ -512,6 +512,36 @@ class CyclePortsTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_should_expand_seeds_only_in_noise_band(self) -> None:
+        from types import SimpleNamespace as _NS
+
+        from aegis.attribution import (
+            CandidateGateDisposition,
+            CandidateGatePolicy,
+        )
+        from aegis.cycle_ports import _should_expand_seeds
+        from statistics import fmean as _fmean
+
+        def report(disposition: CandidateGateDisposition, fresh_deltas: tuple[float, ...]):
+            return _NS(
+                qualified=disposition is CandidateGateDisposition.QUALIFIED,
+                seed_results=[
+                    _NS(seed=index, fresh_delta=delta)
+                    for index, delta in enumerate(fresh_deltas, start=11)
+                ],
+                policy=CandidateGatePolicy(),
+            )
+
+        band = report(CandidateGateDisposition.FRESH_REJECTED, (0.01, 0.015))
+        self.assertTrue(_should_expand_seeds(band, seed_count=2, expansion_used=False))
+        self.assertFalse(_should_expand_seeds(band, seed_count=2, expansion_used=True))
+        self.assertFalse(_should_expand_seeds(band, seed_count=4, expansion_used=False))
+        qualified = report(CandidateGateDisposition.QUALIFIED, (0.03, 0.03))
+        self.assertFalse(_should_expand_seeds(qualified, seed_count=2, expansion_used=False))
+        clear_reject = report(CandidateGateDisposition.FRESH_REJECTED, (-0.05, -0.04))
+        self.assertFalse(_should_expand_seeds(clear_reject, seed_count=2, expansion_used=False))
+        del _fmean
+
     def test_taskpack_content_hash_is_recomputed_by_control_plane(self) -> None:
         """A structurally complete manifest with a wrong hash is repaired."""
         source = Path("taskpacks/python/01_clamp_range")

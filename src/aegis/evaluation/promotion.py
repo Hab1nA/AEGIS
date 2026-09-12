@@ -85,6 +85,31 @@ def _validate_design(rows: Sequence[PairedObservation], policy: PromotionPolicy)
     return None
 
 
+def bootstrap_paired_delta(
+    task_deltas: Sequence[float],
+    *,
+    samples: int = 10_000,
+    seed: int = 0xAE615,
+    confidence: float = 0.95,
+) -> tuple[float, float]:
+    """Task-clustered bootstrap confidence interval over a paired mean delta.
+
+    Each entry is one task's mean candidate-minus-champion delta; resampling
+    is over task clusters so duplicated or correlated seeds cannot manufacture
+    a narrower bound.  Returns the (lower, upper) percentile bounds.
+    """
+    if not task_deltas:
+        raise ValueError("task_deltas must not be empty")
+    size = len(task_deltas)
+    rng = random.Random(seed)
+    boot: list[float] = []
+    for _ in range(samples):
+        indices = [rng.randrange(size) for _ in range(size)]
+        boot.append(fmean(task_deltas[index] for index in indices))
+    alpha = (1.0 - confidence) / 2.0
+    return _percentile(boot, alpha), _percentile(boot, 1.0 - alpha)
+
+
 def decide_promotion(
     observations: Iterable[PairedObservation], policy: PromotionPolicy | None = None
 ) -> PromotionDecision:
@@ -116,17 +141,18 @@ def decide_promotion(
     candidate_total = sum(row.candidate_tokens for row in rows)
     champion_total = sum(row.champion_tokens for row in rows)
     token_change = round(candidate_total / champion_total - 1.0, 12)
-    rng = random.Random(policy.bootstrap_seed)
-    boot_quality: list[float] = []
-    boot_saving: list[float] = []
-    size = len(task_deltas)
-    for _ in range(policy.bootstrap_samples):
-        indices = [rng.randrange(size) for _ in range(size)]
-        boot_quality.append(fmean(task_deltas[index] for index in indices))
-        boot_saving.append(fmean(task_savings[index] for index in indices))
-    alpha = (1.0 - policy.confidence) / 2.0
-    quality_lower = _percentile(boot_quality, alpha)
-    saving_lower = _percentile(boot_saving, alpha)
+    quality_lower, saving_lower_ci = bootstrap_paired_delta(
+        task_deltas,
+        samples=policy.bootstrap_samples,
+        seed=policy.bootstrap_seed,
+        confidence=policy.confidence,
+    )
+    saving_lower, _ = bootstrap_paired_delta(
+        task_savings,
+        samples=policy.bootstrap_samples,
+        seed=policy.bootstrap_seed,
+        confidence=policy.confidence,
+    )
     quality_win = quality_lower > policy.quality_improvement and candidate_total <= champion_total * (
         1.0 + policy.max_token_increase
     )

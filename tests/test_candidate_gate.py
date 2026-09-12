@@ -63,6 +63,30 @@ def pair(
 
 
 class CandidateGateTests(unittest.TestCase):
+    def test_bootstrap_annex_is_advisory_and_round_trips(self) -> None:
+        pairs = (pair(3), pair(7))
+        with_deltas = evaluate_candidate_gate(
+            pairs, CandidateGatePolicy(), task_deltas=[0.04, 0.02, 0.05]
+        )
+        self.assertIsNone(
+            evaluate_candidate_gate(pairs, CandidateGatePolicy()).bootstrap
+        )
+        bootstrap = with_deltas.bootstrap
+        self.assertIsNotNone(bootstrap)
+        assert bootstrap is not None
+        self.assertEqual(bootstrap["task_count"], 3)
+        self.assertLess(bootstrap["quality_lower"], bootstrap["quality_upper"])
+        # The disposition is identical with and without the annex: the
+        # bootstrap is power evidence, never a gate input.
+        self.assertEqual(with_deltas.disposition, evaluate_candidate_gate(pairs).disposition)
+        restored = evaluate_candidate_gate(
+            pairs, CandidateGatePolicy(), task_deltas=[0.04, 0.02, 0.05]
+        )
+        self.assertEqual(restored.from_mapping(restored.to_mapping()).bootstrap, bootstrap)
+        # Legacy reports without the annex still validate and replay.
+        legacy = evaluate_candidate_gate(pairs, CandidateGatePolicy())
+        self.assertIsNone(legacy.from_mapping(legacy.to_mapping()).bootstrap)
+
     def test_two_seeds_must_each_pass_all_quality_gates(self) -> None:
         report = evaluate_candidate_gate((pair(11), pair(22)))
 

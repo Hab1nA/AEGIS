@@ -19,6 +19,7 @@ import secrets
 import subprocess
 import sys
 import tarfile
+from statistics import fmean
 import tempfile
 import threading
 from contextvars import ContextVar
@@ -110,6 +111,7 @@ from aegis.evolution.arm_evaluation import (
     evaluate_frozen_workspace,
     freeze_workspace_bytes,
     stage_cohort_workspace,
+    task_score,
 )
 from aegis.evolution.consumer import (
     consume_cycle_proposals,
@@ -294,6 +296,26 @@ def evaluation_seeds_for(campaign_id: str, cycle_number: int, count: int) -> tup
         ).digest()
         seeds.append(1 + int.from_bytes(digest[:4], "big") % (2**31 - 1))
     return tuple(seeds)
+
+
+def _should_expand_seeds(
+    gate_report: Any, *, seed_count: int, expansion_used: bool
+) -> bool:
+    """True when one extra derived seed slot can sharpen a noise-band result.
+
+    Noise band: the fresh mean is positive yet below the improvement
+    threshold, i.e. the candidate looks promising but the evidence is too
+    thin to clear the gate.  Expansion happens at most once and never past
+    four seeds.
+    """
+    if expansion_used or seed_count >= 4:
+        return False
+    if gate_report.qualified or not gate_report.seed_results:
+        return False
+    from statistics import fmean as _fmean
+
+    mean_fresh = _fmean(item.fresh_delta for item in gate_report.seed_results)
+    return 0.0 < mean_fresh < gate_report.policy.fresh_improvement
 
 
 def _difficulty_signal_rows(quality_lock_data: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -4436,71 +4458,72 @@ class ModelCyclePorts:
             if self._runtime_policy_registry is not None
             else "runtime-policy-sha256:" + self._budget_policy_sha256
         )
-        evaluation_seeds = evaluation_seeds_for(snapshot.campaign_id, snapshot.cycle_number, seed_count)
-        design = CandidateEvaluationDesign.create(
-            campaign_id=snapshot.campaign_id,
-            cycle_id=f"cycle:{snapshot.cycle_number}",
-            snapshot_id=snapshot.snapshot_id,
-            objective_id=snapshot.objective.objective_id,
-            candidate_id=candidate.candidate_id,
-            surface=candidate.surface.value,
-            target_role=candidate.target_role.value,
-            cohort_id=evaluation_cohort.cohort_id,
-            tasks=tuple(
-                sorted(
-                    (
-                        EvaluationTaskBinding(
-                            str(item["task_id"]),
-                            str(item["artifact_id"]),
-                            int(item["task_version"]),
-                            (
-                                EvaluationTier.FRESH
-                                if item["tier"] == "fresh-holdout"
-                                else EvaluationTier.REGRESSION
-                            ),
-                            str(item["content_hash"]),
-                        )
-                        for item in tasks
-                    ),
-                    key=lambda item: (item.artifact_id, item.revision),
-                )
-            ),
-            seeds=evaluation_seeds,
-            baseline_runtime_id=active_roles.for_role(Role.WARRIOR).role_version_id,
-            candidate_runtime_id=candidate.candidate_id,
-            runtime_policy_id=design_runtime_policy_id,
-            evaluator_fingerprint=evaluator_fingerprint,
-            public_weight=active_control_core.sealed_evaluator.public_weight,
-            hidden_weight=active_control_core.sealed_evaluator.hidden_weight,
-            gate_policy_sha256=hashlib.sha256(
-                canonical_json(gate_policy.to_mapping()).encode("utf-8")
-            ).hexdigest(),
-        )
-        design_ref = self._artifacts.put_json(
-            "candidate-evaluation-design", design.to_mapping(include_id=False)
-        )
-        if design_ref.artifact_id != design.design_id:
-            raise RuntimeError("candidate evaluation design CAS identity mismatch")
-        if self._runtime_policy_registry is not None:
-            self._runtime_policy_registry.freeze_for_paired_design(
-                design.design_id,
-                snapshot.cycle_number,
-                boundary=design_boundary,
+        def _build_design(seed_tuple: tuple[int, ...]) -> CandidateEvaluationDesign:
+            return CandidateEvaluationDesign.create(
+                campaign_id=snapshot.campaign_id,
+                cycle_id=f"cycle:{snapshot.cycle_number}",
+                snapshot_id=snapshot.snapshot_id,
+                objective_id=snapshot.objective.objective_id,
+                candidate_id=candidate.candidate_id,
+                surface=candidate.surface.value,
+                target_role=candidate.target_role.value,
+                cohort_id=evaluation_cohort.cohort_id,
+                tasks=tuple(
+                    sorted(
+                        (
+                            EvaluationTaskBinding(
+                                str(item["task_id"]),
+                                str(item["artifact_id"]),
+                                int(item["task_version"]),
+                                (
+                                    EvaluationTier.FRESH
+                                    if item["tier"] == "fresh-holdout"
+                                    else EvaluationTier.REGRESSION
+                                ),
+                                str(item["content_hash"]),
+                            )
+                            for item in tasks
+                        ),
+                        key=lambda item: (item.artifact_id, item.revision),
+                    )
+                ),
+                seeds=seed_tuple,
+                baseline_runtime_id=active_roles.for_role(Role.WARRIOR).role_version_id,
+                candidate_runtime_id=candidate.candidate_id,
+                runtime_policy_id=design_runtime_policy_id,
+                evaluator_fingerprint=evaluator_fingerprint,
+                public_weight=active_control_core.sealed_evaluator.public_weight,
+                hidden_weight=active_control_core.sealed_evaluator.hidden_weight,
+                gate_policy_sha256=hashlib.sha256(
+                    canonical_json(gate_policy.to_mapping()).encode("utf-8")
+                ).hexdigest(),
             )
-        result["evaluation_design"] = {
-            **design.to_mapping(),
-            "artifact_id": design_ref.artifact_id,
-        }
+
+        def _persist_design(design: CandidateEvaluationDesign) -> ArtifactRef:
+            design_ref = self._artifacts.put_json(
+                "candidate-evaluation-design", design.to_mapping(include_id=False)
+            )
+            if design_ref.artifact_id != design.design_id:
+                raise RuntimeError("candidate evaluation design CAS identity mismatch")
+            if self._runtime_policy_registry is not None:
+                self._runtime_policy_registry.freeze_for_paired_design(
+                    design.design_id,
+                    snapshot.cycle_number,
+                    boundary=design_boundary,
+                )
+            return design_ref
+
         observations: list[PairedObservation] = []
         gate_pairs: list[SealedCandidatePair] = []
         arm_rows: list[dict[str, Any]] = []
         shadow_rows: list[dict[str, Any]] = []
+        task_delta_rows: dict[str, list[float]] = {}
         candidate_evaluation_policy = ControlCorePolicy(
             active_control_core.sealed_evaluator,
             active_control_core.promotion_gate,
             candidate_runtime.control_core.task_sandbox,
         )
-        for seed in evaluation_seeds:
+        def _run_seed_arm(seed: int, design: CandidateEvaluationDesign) -> None:
             champion_label = f"candidate-baseline-{seed}"
             candidate_label = f"candidate-shadow-{seed}"
             baseline_solve: Mapping[str, Any] | None = None
@@ -4677,9 +4700,49 @@ class ModelCyclePorts:
                     "treatment_integrity_passed": treatment_integrity_passed,
                 }
             )
-        policy = QualificationPolicy(minimum_pairs=seed_count)
-        report = qualify_attribution(observations, policy)
-        gate_report = evaluate_candidate_gate(gate_pairs, gate_policy)
+            baseline_scores = {
+                item.task_id: task_score(item, active_control_core)
+                for item in baseline_eval.task_results
+            }
+            for item in candidate_eval.task_results:
+                task_delta_rows.setdefault(item.task_id, []).append(
+                    task_score(item, candidate_evaluation_policy)
+                    - baseline_scores.get(item.task_id, 0.0)
+                )
+        # Sequential seed expansion: one extra derived slot when the fresh
+        # mean is positive but below threshold (noise-band evidence), bounded
+        # to 4 seeds and a single expansion per evaluation.
+        expansion_used = False
+        consumed_slots = 0
+        while True:
+            evaluation_seeds = evaluation_seeds_for(
+                snapshot.campaign_id, snapshot.cycle_number, seed_count
+            )
+            design = _build_design(evaluation_seeds)
+            design_ref = _persist_design(design)
+            result["evaluation_design"] = {
+                **design.to_mapping(),
+                "artifact_id": design_ref.artifact_id,
+            }
+            for seed in evaluation_seeds[consumed_slots:]:
+                _run_seed_arm(seed, design)
+            consumed_slots = len(evaluation_seeds)
+            policy = QualificationPolicy(minimum_pairs=seed_count)
+            report = qualify_attribution(observations, policy)
+            gate_report = evaluate_candidate_gate(
+                gate_pairs,
+                gate_policy,
+                task_deltas=[
+                    fmean(deltas) for deltas in task_delta_rows.values()
+                ],
+            )
+            if not _should_expand_seeds(
+                gate_report, seed_count=seed_count, expansion_used=expansion_used
+            ):
+                break
+            expansion_used = True
+            seed_count += 1
+            gate_policy = replace(gate_policy, required_seeds=seed_count)
         if not gate_report.qualified and report.qualified:
             report = AttributionReport.create(
                 disposition=AttributionDisposition.NOT_QUALIFIED,

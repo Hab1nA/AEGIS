@@ -353,13 +353,17 @@ def _evaluation_tier(value: object) -> EvaluationTier:
     raise ArmEvaluationError(f"unsupported cohort tier: {value!r}")
 
 
-def _task_score(result: TaskArmResult, policy: ControlCorePolicy) -> float:
+def task_score(result: TaskArmResult, policy: ControlCorePolicy) -> float:
+    """Per-task sealed quality: integrity failure scores zero."""
     if not result.integrity_passed:
         return 0.0
     return (
         policy.sealed_evaluator.public_weight * result.public_score
         + policy.sealed_evaluator.hidden_weight * result.hidden_score
     )
+
+
+_task_score = task_score
 
 
 def _tier_evaluation(
@@ -454,4 +458,5 @@ __all__ = [
     "evaluate_frozen_workspace",
     "freeze_workspace_bytes",
     "stage_cohort_workspace",
+    "task_score",
 ]

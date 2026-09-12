@@ -48,6 +48,20 @@ class ScoringTests(unittest.TestCase):
 class PromotionTests(unittest.TestCase):
     policy = PromotionPolicy(bootstrap_samples=1000)
 
+    def test_bootstrap_paired_delta_is_deterministic_and_ordered(self) -> None:
+        from aegis.evaluation.promotion import bootstrap_paired_delta
+
+        first = bootstrap_paired_delta([0.06] * 10, samples=500, seed=7)
+        second = bootstrap_paired_delta([0.06] * 10, samples=500, seed=7)
+        self.assertEqual(first, second)
+        lower, upper = first
+        self.assertLessEqual(lower, upper)
+        # All-constant deltas produce a degenerate interval at the constant.
+        self.assertAlmostEqual(lower, 0.06, places=9)
+        self.assertAlmostEqual(upper, 0.06, places=9)
+        with self.assertRaises(ValueError):
+            bootstrap_paired_delta([])
+
     def test_quality_improvement_promotes_with_fixed_seed(self) -> None:
         observations = rows(
             candidate_quality=0.86, champion_quality=0.80, candidate_tokens=110, champion_tokens=100
