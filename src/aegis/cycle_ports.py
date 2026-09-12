@@ -279,6 +279,23 @@ def _strip_forbidden(value: Any, *, path: str = "evidence") -> Any:
     return value
 
 
+def evaluation_seeds_for(campaign_id: str, cycle_number: int, count: int) -> tuple[int, ...]:
+    """Deterministic per-cycle evaluation seeds: anchor 0 plus rotating slots.
+
+    Slot 0 stays the literal anchor seed so the champion's main-solve evidence
+    remains reusable; every other slot is derived from (campaign, cycle,
+    slot) so a lineage cannot overfit one fixed seed set across generations.
+    Values live in [1, 2**31 - 1] because the gateway rejects negative seeds.
+    """
+    seeds = [0]
+    for index in range(max(0, count - 1)):
+        digest = hashlib.sha256(
+            f"evaluation-seed:{campaign_id}:{cycle_number}:{index}".encode("utf-8")
+        ).digest()
+        seeds.append(1 + int.from_bytes(digest[:4], "big") % (2**31 - 1))
+    return tuple(seeds)
+
+
 def _difficulty_signal_rows(quality_lock_data: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Per-task discriminating-power rows from one quality-lock artifact.
 
@@ -870,6 +887,7 @@ class ModelCyclePorts:
         default_image: str | None = None,
         evaluate_candidates_enabled: bool = True,
         candidate_max_extra_steps: int = 24,
+        evaluation_seed_count: int = 2,
         evolution_surfaces: Sequence[str] | None = None,
         budget_policy_sha256: str | None = None,
         harness_repo: HarnessRepo | None = None,
@@ -941,6 +959,11 @@ class ModelCyclePorts:
         self._default_image = default_image
         self._evaluate_candidates_enabled = evaluate_candidates_enabled
         self._candidate_max_extra_steps = candidate_max_extra_steps
+        if isinstance(evaluation_seed_count, bool) or not isinstance(
+            evaluation_seed_count, int
+        ) or not 2 <= evaluation_seed_count <= 4:
+            raise ValueError("evaluation_seed_count must be an integer in [2, 4]")
+        self._evaluation_seed_count = evaluation_seed_count
         self._enabled_surfaces: frozenset[str] | None = (
             frozenset(evolution_surfaces) if evolution_surfaces is not None else None
         )
@@ -4370,8 +4393,11 @@ class ModelCyclePorts:
         tasks = _sealed_tasks(self._dynamic, evaluation_cohort)
         active_control_core = champion_binding.control_core
         promotion = active_control_core.promotion_gate
+        seed_count = self._evaluation_seed_count
         gate_policy = CandidateGatePolicy(
-            required_seeds=promotion.required_seeds,
+            # The control plane owns the evaluation design: the configured
+            # seed count supersedes whatever a control-core candidate claims.
+            required_seeds=seed_count,
             fresh_improvement=(
                 0.0
                 if candidate.surface is EvolutionSurface.CONTROL_CORE
@@ -4410,6 +4436,7 @@ class ModelCyclePorts:
             if self._runtime_policy_registry is not None
             else "runtime-policy-sha256:" + self._budget_policy_sha256
         )
+        evaluation_seeds = evaluation_seeds_for(snapshot.campaign_id, snapshot.cycle_number, seed_count)
         design = CandidateEvaluationDesign.create(
             campaign_id=snapshot.campaign_id,
             cycle_id=f"cycle:{snapshot.cycle_number}",
@@ -4438,7 +4465,7 @@ class ModelCyclePorts:
                     key=lambda item: (item.artifact_id, item.revision),
                 )
             ),
-            seeds=(0, 1),
+            seeds=evaluation_seeds,
             baseline_runtime_id=active_roles.for_role(Role.WARRIOR).role_version_id,
             candidate_runtime_id=candidate.candidate_id,
             runtime_policy_id=design_runtime_policy_id,
@@ -4473,7 +4500,7 @@ class ModelCyclePorts:
             active_control_core.promotion_gate,
             candidate_runtime.control_core.task_sandbox,
         )
-        for seed in (0, 1):
+        for seed in evaluation_seeds:
             champion_label = f"candidate-baseline-{seed}"
             candidate_label = f"candidate-shadow-{seed}"
             baseline_solve: Mapping[str, Any] | None = None
@@ -4650,7 +4677,7 @@ class ModelCyclePorts:
                     "treatment_integrity_passed": treatment_integrity_passed,
                 }
             )
-        policy = QualificationPolicy(minimum_pairs=2)
+        policy = QualificationPolicy(minimum_pairs=seed_count)
         report = qualify_attribution(observations, policy)
         gate_report = evaluate_candidate_gate(gate_pairs, gate_policy)
         if not gate_report.qualified and report.qualified:
@@ -5982,6 +6009,7 @@ def run_v2_cycle(
     default_image: str | None = None,
     evaluate_candidates_enabled: bool = True,
     candidate_max_extra_steps: int = 24,
+    evaluation_seed_count: int = 2,
     campaign_config: Any = None,
     harness_repo: HarnessRepo | None = None,
     harness_backend: HarnessBackend | None = None,
@@ -6212,6 +6240,7 @@ def run_v2_cycle(
         default_image=default_image,
         evaluate_candidates_enabled=evaluate_candidates_enabled,
         candidate_max_extra_steps=candidate_max_extra_steps,
+        evaluation_seed_count=evaluation_seed_count,
         evolution_surfaces=enabled_surfaces,
         budget_policy_sha256=policy_hash,
         harness_repo=harness_repo,

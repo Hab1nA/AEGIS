@@ -20,6 +20,7 @@ from aegis.cycle_ports import (
     ModelCyclePorts,
     _repair_taskpack_content_hash,
     _usage_summary,
+    evaluation_seeds_for,
     run_v2_cycle,
 )
 from aegis.dynamic_tasks import (
@@ -1513,9 +1514,15 @@ class CyclePortsTests(unittest.TestCase):
                 candidate_evidence = json.loads(
                     artifacts.get(result.candidate_evaluation).decode("utf-8")
                 )
+                rotated = evaluation_seeds_for("cli", 1, 2)
+                self.assertEqual(rotated[0], 0)
+                self.assertNotEqual(rotated[1], 1)
+                self.assertNotEqual(
+                    rotated, evaluation_seeds_for("cli", 2, 2)
+                )
                 self.assertEqual(
                     [row["seed"] for row in candidate_evidence["arms"]["pairs"]],
-                    [0, 1],
+                    list(rotated),
                 )
                 self.assertEqual(
                     candidate_evidence["candidate_gate"]["disposition"], "qualified"
@@ -1524,10 +1531,11 @@ class CyclePortsTests(unittest.TestCase):
                     candidate_evidence["arms"]["pairs"][0]["baseline_source"],
                     {"main-solve", "dedicated-arm"},
                 )
-                self.assertEqual(
-                    [request.seed for request in gateway.requests][-8:],
-                    [0, 0, 0, 1, 1, 1, 1, 1],
-                )
+                tail_seeds = [request.seed for request in gateway.requests]
+                # The main solve runs on anchor seed 0; the rotating slot
+                # drives every dedicated evaluation arm.
+                self.assertEqual(tail_seeds[-6], 0)
+                self.assertEqual(tail_seeds[-5:], [rotated[1]] * 5)
 
                 second_gateway = FakeGateway(
                     gateway_actions(propose_candidate=False, task_id="dynamic-next-2")

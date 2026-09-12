@@ -97,9 +97,15 @@ class PromotionGatePolicy:
     cost_savings_path: float = 0.10
 
     def __post_init__(self) -> None:
-        # The sealed design is fixed to the independently replayed seeds [0,1].
-        if self.required_seeds != 2 or isinstance(self.required_seeds, bool):
-            raise ControlCorePolicyError("promotion_gate.required_seeds must remain exactly 2")
+        # The control plane supersedes this field with autonomy_v2's
+        # evaluation_seed_count at evaluation time; candidates may widen the
+        # range but never shrink it below the sealed minimum of 2.
+        if (
+            isinstance(self.required_seeds, bool)
+            or not isinstance(self.required_seeds, int)
+            or not 2 <= self.required_seeds <= 4
+        ):
+            raise ControlCorePolicyError("promotion_gate.required_seeds must be an integer in [2, 4]")
         _number(self.fresh_improvement, "promotion_gate.fresh_improvement", minimum=0.0, maximum=1.0)
         _number(
             self.regression_noninferiority_margin,

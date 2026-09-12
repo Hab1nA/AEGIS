@@ -209,6 +209,40 @@ class ConfigTests(unittest.TestCase):
                 )
             )
 
+    def test_evaluation_seed_count_is_bounded_to_2_through_4(self):
+        roles = {
+            "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},
+            "judge": {"model": "j", "budget_share": 0.225, "max_output_tokens": 4096},
+            "prosecutor": {"model": "p", "budget_share": 0.225, "max_output_tokens": 4096},
+        }
+        for count, ok in ((2, True), (3, True), (4, True), (1, False), (5, False), ("3", False)):
+            with self.subTest(count=count):
+                payload = {
+                    "evolution_surfaces": ["workflow"],
+                    "evaluation_seed_count": count,
+                }
+                if ok:
+                    config = CampaignConfig.from_mapping(
+                        valid_config(
+                            acceptance_profile="autonomous_evolution_v2",
+                            roles=roles,
+                            task_pack_paths=[],
+                            autonomy_v2=payload,
+                        )
+                    )
+                    assert config.autonomy_v2 is not None
+                    self.assertEqual(config.autonomy_v2.evaluation_seed_count, count)
+                else:
+                    with self.assertRaises(ConfigError):
+                        CampaignConfig.from_mapping(
+                            valid_config(
+                                acceptance_profile="autonomous_evolution_v2",
+                                roles=roles,
+                                task_pack_paths=[],
+                                autonomy_v2=payload,
+                            )
+                        )
+
     def test_evolution_surfaces_accept_every_known_surface_and_reject_unknown(self):
         roles = {
             "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},

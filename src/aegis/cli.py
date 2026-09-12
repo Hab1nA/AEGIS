@@ -339,6 +339,9 @@ def _run_v2_cycle_cli(
                 if autonomy is not None
                 else 12
             ),
+            evaluation_seed_count=(
+                autonomy.evaluation_seed_count if autonomy is not None else 2
+            ),
             campaign_config=config,
             harness_repo=harness_repo,
             harness_backend=harness_backend,
