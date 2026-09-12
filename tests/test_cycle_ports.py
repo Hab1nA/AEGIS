@@ -409,6 +409,65 @@ class CyclePortsTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_prior_authoring_feedback_reads_previous_validation(self) -> None:
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = ContentAddressedArtifactStore(root / "artifacts")
+
+            validation_payload = {
+                "rejected": [
+                    {"task_id": "python-bad", "reasons": ["difficulty-gate: too plain"]},
+                    {"task_id": "python-worse", "reasons": ["schema"]},
+                ],
+                "hypothesis_coverage": [
+                    {"hypothesis_id": "hyp-1", "covered": True},
+                    {"hypothesis_id": "hyp-2", "covered": False},
+                ],
+                "uncovered_hypothesis_ids": ["hyp-2"],
+            }
+            ref = artifacts.put_json("task-validation", validation_payload)
+            event = SimpleNamespace(
+                event_type="cycle_state_changed_v2",
+                payload={
+                    "action": "complete_task_validation",
+                    "evidence_id": ref.artifact_id,
+                },
+            )
+            events = SimpleNamespace(
+                projection=SimpleNamespace(campaign_id="cli"),
+                read=lambda campaign_id: [event],
+            )
+            ports = ModelCyclePorts.__new__(ModelCyclePorts)
+            ports._campaign_event_store = events
+            ports._curriculum = events
+            ports._artifacts = artifacts
+            snapshot = SimpleNamespace(cycle_number=2)
+
+            prior = ports._prior_task_validation(snapshot)
+            self.assertIsNotNone(prior)
+            carried = ports._carried_over_hypotheses(prior)
+            self.assertEqual(
+                [item["hypothesis_id"] for item in carried["carried_over_hypotheses"]],
+                ["hyp-2"],
+            )
+            feedback = ports._prior_authoring_feedback(prior)
+            self.assertEqual(
+                [item["task_id"] for item in feedback["prior_authoring_rejections"]],
+                ["python-bad", "python-worse"],
+            )
+            self.assertEqual(
+                feedback["prior_hypothesis_coverage"],
+                {"covered": 1, "total": 2, "uncovered_ids": ["hyp-2"]},
+            )
+            # Cycle 1 has no prior validation; a missing store is also silent.
+            first = ports._prior_task_validation(SimpleNamespace(cycle_number=1))
+            self.assertIsNone(first)
+            ports._campaign_event_store = None
+            self.assertIsNone(ports._prior_task_validation(snapshot))
+            self.assertEqual(ports._prior_authoring_feedback(None), {})
+
     def test_taskpack_content_hash_is_recomputed_by_control_plane(self) -> None:
         """A structurally complete manifest with a wrong hash is repaired."""
         source = Path("taskpacks/python/01_clamp_range")

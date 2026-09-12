@@ -3105,7 +3105,9 @@ class ModelCyclePorts:
             )
         direction["prior_rejected_tasks"] = prior_rejections[-8:]
         direction["declared_task_ids"] = sorted(set(prior_task_ids))[:64]
-        direction.update(self._carried_over_hypotheses(snapshot))
+        prior_validation = self._prior_task_validation(snapshot)
+        direction.update(self._carried_over_hypotheses(prior_validation))
+        direction.update(self._prior_authoring_feedback(prior_validation))
         audit = _brief(self._artifacts, prosecutor_audit)
         hypotheses = audit.get("curriculum")
         if isinstance(hypotheses, list) and hypotheses:
@@ -3141,21 +3143,19 @@ class ModelCyclePorts:
             )
         return direction
 
-    def _carried_over_hypotheses(
+    def _prior_task_validation(
         self, snapshot: CurriculumSnapshot
-    ) -> Mapping[str, Any]:
-        """Last cycle's uncovered curriculum hypotheses, for the next author.
+    ) -> Mapping[str, Any] | None:
+        """Last cycle's task-validation evidence, via curriculum cycle events.
 
-        task-validation already records which hypotheses the registered tasks
-        covered; the ones it did not cover are the author's obligations next
-        cycle.  Reads the previous generation's validation evidence through
-        the curriculum cycle events (the CAS itself has no kind index).
+        The CAS has no kind index, so the previous generation's validation
+        artifact is recovered through the curriculum cycle event stream.
         """
         if self._campaign_event_store is None:
-            return {}
+            return None
         cycle_number = snapshot.cycle_number
         if cycle_number <= 1:
-            return {}
+            return None
         campaign_id = self._curriculum.projection.campaign_id
         events = self._campaign_event_store.read(campaign_id)
         previous: str | None = None
@@ -3171,10 +3171,22 @@ class ModelCyclePorts:
                     previous = candidate
                 break
         if previous is None:
-            return {}
+            return None
         try:
-            validation = _read_artifact_id(self._artifacts, previous)
+            return _read_artifact_id(self._artifacts, previous)
         except ValueError:
+            return None
+
+    def _carried_over_hypotheses(
+        self, validation: Mapping[str, Any] | None
+    ) -> Mapping[str, Any]:
+        """Last cycle's uncovered curriculum hypotheses, for the next author.
+
+        task-validation already records which hypotheses the registered tasks
+        covered; the ones it did not cover are the author's obligations next
+        cycle.
+        """
+        if validation is None:
             return {}
         uncovered = validation.get("uncovered_hypothesis_ids")
         if not isinstance(uncovered, list) or not uncovered:
@@ -3186,6 +3198,40 @@ class ModelCyclePorts:
             if isinstance(item, Mapping) and str(item.get("hypothesis_id")) in uncovered_ids
         ]
         return {"carried_over_hypotheses": carried[:8]}
+
+    def _prior_authoring_feedback(
+        self, validation: Mapping[str, Any] | None
+    ) -> Mapping[str, Any]:
+        """Last cycle's authoring outcome: rejected specs and coverage score.
+
+        Gives the author the downstream result of its previous strategy —
+        which specs (including difficulty-gate rejections) were refused and
+        how much of the hypothesis space the registered tasks actually
+        covered — so authoring quality compounds across cycles.
+        """
+        if validation is None:
+            return {}
+        feedback: dict[str, Any] = {}
+        rejected = validation.get("rejected")
+        if isinstance(rejected, list) and rejected:
+            feedback["prior_authoring_rejections"] = rejected[-8:]
+        coverage = validation.get("hypothesis_coverage")
+        if isinstance(coverage, list) and coverage:
+            covered = sum(
+                1
+                for item in coverage
+                if isinstance(item, Mapping) and item.get("covered")
+            )
+            feedback["prior_hypothesis_coverage"] = {
+                "covered": covered,
+                "total": len(coverage),
+                "uncovered_ids": [
+                    str(item.get("hypothesis_id"))
+                    for item in coverage
+                    if isinstance(item, Mapping) and not item.get("covered")
+                ][:8],
+            }
+        return feedback
 
     def _evolution_direction(self) -> Mapping[str, Any]:
         """Bounded evolution feedback for the Warrior's proposals.
@@ -3273,8 +3319,11 @@ class ModelCyclePorts:
                     "carried_over_hypotheses lists the hypotheses the previous cycle "
                     "left uncovered — author a task that exercises each one and let "
                     "its clause text reference the hypothesis topic so coverage is "
-                    "measurable. Produce the "
-                    "spec directly in your final message; do not narrate your plan."
+                    "measurable. prior_hypothesis_coverage scores how much of the "
+                    "hypothesis space last cycle's tasks actually covered, and "
+                    "prior_authoring_rejections shows which specs (including "
+                    "difficulty-gate rejections) were refused — avoid those patterns. "
+                    "Produce the spec directly in your final message; do not narrate your plan."
                 ),
                 context={
                     "snapshot": _truncate(snapshot.to_mapping()),
