@@ -365,6 +365,50 @@ def role_configs() -> dict[str, RoleConfig]:
 
 
 class CyclePortsTests(unittest.TestCase):
+    def test_evolution_direction_is_bounded_and_defaults_to_empty(self) -> None:
+        from aegis.evolution.population import PopulationArchive
+        from aegis.evolution.registry import EvolutionRegistry
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = EventStore(root / "events.sqlite3")
+            try:
+                ports = ModelCyclePorts.__new__(ModelCyclePorts)
+                ports._evolution = None
+                ports._population = None
+                self.assertEqual(ports._evolution_direction(), {})
+
+                evolution = EvolutionRegistry(store, "cli")
+                population = PopulationArchive(store, "cli")
+                record = evolution.collect(
+                    EvolutionSurface.WORKFLOW,
+                    Role.WARRIOR,
+                    artifact_id="workflow-sha256:" + "a" * 64,
+                    artifact_sha256="a" * 64,
+                    objective_id="objective-sha256:" + "b" * 64,
+                    collection_evidence_id="evidence:1",
+                )
+                evolution.reject(record.candidate_id, reason="gate said no")
+                for index in range(3):
+                    population.register(
+                        candidate_id=f"evolution-candidate-sha256:{'c' * 63}{'012'[index]}",
+                        cell=(f"surface-{index}",),
+                        fitness=0.5,
+                        evidence_id="evidence:2",
+                        descriptor=(f"surface-{index}",),
+                    )
+                ports._evolution = evolution
+                ports._population = population
+                direction = ports._evolution_direction()
+                self.assertEqual(
+                    [item["reason"] for item in direction["rejected_candidates"]],
+                    ["gate said no"],
+                )
+                self.assertEqual(direction["population_diversity"]["cell_count"], 3)
+                self.assertEqual(len(direction["population_cells"]), 3)
+            finally:
+                store.close()
+
     def test_taskpack_content_hash_is_recomputed_by_control_plane(self) -> None:
         """A structurally complete manifest with a wrong hash is repaired."""
         source = Path("taskpacks/python/01_clamp_range")

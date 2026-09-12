@@ -111,6 +111,25 @@ class EvolutionRegistryTests(unittest.TestCase):
                 materialization_evidence_id="evidence:build",
             )
 
+    def test_rejected_reasons_are_newest_first_and_bounded(self) -> None:
+        first = self._collect(digest="a")
+        second = self._collect(digest="c")
+        self.registry.reject(first, reason="first rejection reason")
+        self.registry.reject(second, reason="second rejection reason")
+        reasons = self.registry.rejected_reasons(8)
+        self.assertEqual(
+            [item["candidate_id"] for item in reasons],
+            [second, first],
+        )
+        self.assertEqual(reasons[0]["surface"], "workflow")
+        self.assertEqual(reasons[1]["reason"], "first rejection reason")
+        self.assertEqual(self.registry.rejected_reasons(1), reasons[:1])
+        self.assertEqual(self.registry.rejected_reasons(0), ())
+        self.assertEqual(
+            self.registry.rejected_reasons(8),
+            self.registry.rejected_reasons(8),
+        )
+
     def test_reject_and_rollback(self) -> None:
         first = self._collect(digest="a")
         self.registry.validate(first, validation_evidence_id="e1")

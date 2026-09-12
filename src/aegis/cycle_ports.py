@@ -1763,7 +1763,9 @@ class ModelCyclePorts:
                 "safe improvement to the harness cycle code that would help future runs, call "
                 "aegis.propose_harness_change with base_commit and checkpoint_ref from the "
                 "snapshot harness source and a bounded changes array; a proposal is candidate-only "
-                "and never writes the host directly."
+                "and never writes the host directly.  Consult evolution_direction before "
+                "proposing: recent rejections explain what the evidence gate already refused, "
+                "and population_cells show where the archive's exploration already sits."
             ),
             context={
                 "snapshot": _truncate(snapshot_context),
@@ -1771,6 +1773,7 @@ class ModelCyclePorts:
                 "tasks": tasks,
                 "arm": arm_label,
                 "evaluation_seed": evaluation_seed,
+                "evolution_direction": _truncate(self._evolution_direction()),
                 "mcp_candidate": (
                     None
                     if mcp_candidate is None
@@ -3183,6 +3186,30 @@ class ModelCyclePorts:
             if isinstance(item, Mapping) and str(item.get("hypothesis_id")) in uncovered_ids
         ]
         return {"carried_over_hypotheses": carried[:8]}
+
+    def _evolution_direction(self) -> Mapping[str, Any]:
+        """Bounded evolution feedback for the Warrior's proposals.
+
+        Mirrors ``_curriculum_direction`` for the candidate dimension: why
+        recent candidates were rejected (the reason carries the per-seed
+        dispersion), where the population archive's cells already sit, and
+        how diverse the archive is.  All advisory, all bounded.
+        """
+        direction: dict[str, Any] = {}
+        if self._evolution is not None:
+            direction["rejected_candidates"] = list(self._evolution.rejected_reasons(8))
+        if self._population is not None:
+            direction["population_diversity"] = _truncate(
+                self._population.diversity_report()
+            )
+            champion_cells = [
+                entry.to_mapping()
+                for entry in sorted(
+                    self._population.cells().values(), key=lambda item: item.sequence
+                )[-12:]
+            ]
+            direction["population_cells"] = champion_cells
+        return direction
 
     def forge_next_tasks(
         self,

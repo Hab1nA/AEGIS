@@ -289,6 +289,35 @@ class EvolutionRegistry:
             if item.state is CandidateState.VALIDATED
         )
 
+    def rejected_reasons(self, limit: int = 8) -> tuple[dict[str, str], ...]:
+        """Most recent rejection events, newest first, for evolution feedback.
+
+        The projection keeps only the state transition, so the reason (which
+        carries the per-seed dispersion) has to be read back from the stream.
+        """
+        reasons: list[dict[str, str]] = []
+        for event in reversed(self._store.read(self._stream_id)):
+            if len(reasons) >= max(0, limit):
+                break
+            if event.event_type != CANDIDATE_REJECTED:
+                continue
+            payload = event.payload
+            if not isinstance(payload, Mapping):
+                continue
+            candidate_id = payload.get("candidate_id")
+            reason = payload.get("reason")
+            if not isinstance(candidate_id, str) or not isinstance(reason, str):
+                continue
+            record = self._projection.candidates.get(candidate_id)
+            reasons.append(
+                {
+                    "candidate_id": candidate_id,
+                    "surface": record.surface.value if record is not None else "unknown",
+                    "reason": reason[:600],
+                }
+            )
+        return tuple(reasons)
+
     def collect(
         self,
         surface: EvolutionSurface,
