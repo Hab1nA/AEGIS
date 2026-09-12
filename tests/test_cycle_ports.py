@@ -542,6 +542,59 @@ class CyclePortsTests(unittest.TestCase):
         self.assertFalse(_should_expand_seeds(clear_reject, seed_count=2, expansion_used=False))
         del _fmean
 
+    def test_rollback_order_dispatches_by_surface(self) -> None:
+        from types import SimpleNamespace
+
+        from aegis.evolution.harness import RollbackOrder
+        from aegis.evolution.surfaces import EvolutionSurface as ES
+
+        order = RollbackOrder.create(
+            candidate_id="evolution-candidate-sha256:" + "a" * 64,
+            reason="prosecutor ordered rollback",
+            analysis="evidence",
+        )
+        ports = ModelCyclePorts.__new__(ModelCyclePorts)
+
+        class FakeRegistry:
+            def __init__(self, record):
+                mapping = {order.candidate_id: record} if record else {}
+                self.projection = SimpleNamespace(candidates=mapping)
+                self.candidates = mapping
+
+        calls: list[str] = []
+        ports._rollback_surface_champion = (
+            lambda o, r, s: calls.append(r.surface) or {"executed": True}
+        )
+        ports._evolution = None
+        outcome = ports._execute_rollback_order(order, SimpleNamespace())
+        self.assertFalse(outcome["executed"])
+
+        ports._evolution = FakeRegistry(None)
+        self.assertFalse(ports._execute_rollback_order(order, SimpleNamespace())["executed"])
+
+        surface_record = SimpleNamespace(surface=ES.WORKFLOW, target_role=Role.WARRIOR)
+        ports._evolution = FakeRegistry(surface_record)
+        snapshot = SimpleNamespace(objective=SimpleNamespace(objective_id="obj"))
+        outcome = ports._execute_rollback_order(order, snapshot)
+        self.assertTrue(outcome["executed"])
+        self.assertEqual(calls, [ES.WORKFLOW])
+
+    def test_probation_observer_stays_silent_without_window_or_store(self) -> None:
+        from types import SimpleNamespace
+
+        ports = ModelCyclePorts.__new__(ModelCyclePorts)
+        ports._campaign_event_store = None
+        ports._evolution = None
+        ports._candidate_probation_cycles = 2
+        snapshot = SimpleNamespace(cycle_number=1)
+        self.assertEqual(ports._observe_candidate_probation(snapshot, None, []), [])
+        ports._candidate_probation_cycles = 0
+        ports._campaign_event_store = SimpleNamespace(
+            read=lambda stream: [],
+            append=lambda *args, **kwargs: None,
+        )
+        self.assertEqual(ports._observe_candidate_probation(snapshot, None, []), [])
+
     def test_taskpack_content_hash_is_recomputed_by_control_plane(self) -> None:
         """A structurally complete manifest with a wrong hash is repaired."""
         source = Path("taskpacks/python/01_clamp_range")

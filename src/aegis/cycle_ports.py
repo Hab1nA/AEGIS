@@ -910,6 +910,7 @@ class ModelCyclePorts:
         evaluate_candidates_enabled: bool = True,
         candidate_max_extra_steps: int = 24,
         evaluation_seed_count: int = 2,
+        candidate_probation_cycles: int = 2,
         evolution_surfaces: Sequence[str] | None = None,
         budget_policy_sha256: str | None = None,
         harness_repo: HarnessRepo | None = None,
@@ -986,6 +987,11 @@ class ModelCyclePorts:
         ) or not 2 <= evaluation_seed_count <= 4:
             raise ValueError("evaluation_seed_count must be an integer in [2, 4]")
         self._evaluation_seed_count = evaluation_seed_count
+        if isinstance(candidate_probation_cycles, bool) or not isinstance(
+            candidate_probation_cycles, int
+        ) or not 0 <= candidate_probation_cycles <= 16:
+            raise ValueError("candidate_probation_cycles must be an integer in [0, 16]")
+        self._candidate_probation_cycles = candidate_probation_cycles
         self._enabled_surfaces: frozenset[str] | None = (
             frozenset(evolution_surfaces) if evolution_surfaces is not None else None
         )
@@ -4017,7 +4023,8 @@ class ModelCyclePorts:
             consume_rollback_orders(audit_data)
         )
         result["rollbacks"] = [
-            self._execute_rollback_order(order) for order in rollback_orders
+            self._execute_rollback_order(order, snapshot)
+            for order in rollback_orders
         ]
         council_reflection_proposals = council_data.get("reflection_proposals")
         if not isinstance(council_reflection_proposals, list):
@@ -4817,6 +4824,9 @@ class ModelCyclePorts:
                 ),
             }
         result["role_generations"] = self._record_role_generations(snapshot)
+        probation = self._observe_candidate_probation(snapshot, evaluation_cohort, tasks)
+        if probation:
+            result["probation"] = probation
         return result
 
     def _register_population(
@@ -4855,11 +4865,29 @@ class ModelCyclePorts:
         )
         return entry.to_mapping()
 
-    def _execute_rollback_order(self, order: RollbackOrder) -> Mapping[str, Any]:
-        """Execute one Prosecutor rollback order against the live harness repo
-        and the evolution registry, fail-closed when the order cannot be
-        verified against the current champion."""
-        if self._harness_rollback is None or self._evolution is None:
+    def _execute_rollback_order(
+        self, order: RollbackOrder, snapshot: CurriculumSnapshot
+    ) -> Mapping[str, Any]:
+        """Execute one Prosecutor rollback order, fail-closed when the order
+        cannot be verified against the current champion.  Harness-code
+        champions roll the real git worktree; surface champions flip the
+        registry back to the parent and re-materialize the role manifest."""
+        if self._evolution is None:
+            return {
+                "order_id": order.order_id,
+                "executed": False,
+                "error": "evolution registry is not configured",
+            }
+        record = self._evolution.projection.candidates.get(order.candidate_id)
+        if record is None:
+            return {
+                "order_id": order.order_id,
+                "executed": False,
+                "error": "rollback candidate is unknown to the evolution registry",
+            }
+        if record.surface is not EvolutionSurface.HARNESS_CODE:
+            return self._rollback_surface_champion(order, record, snapshot)
+        if self._harness_rollback is None:
             return {
                 "order_id": order.order_id,
                 "executed": False,
@@ -4911,6 +4939,228 @@ class ModelCyclePorts:
             "evidence_id": outcome["evidence_id"],
             "analysis": order.analysis[:4000],
         }
+
+    def _rollback_surface_champion(
+        self,
+        order: RollbackOrder,
+        record: Any,
+        snapshot: CurriculumSnapshot,
+    ) -> Mapping[str, Any]:
+        """Roll a workflow/subject/plugin/environment champion back to its
+        registry parent and re-materialize the warrior role version so the
+        parent's artifacts bind again.  Mirrors the activation path: flip the
+        registry champion, rebuild the binding, materialize a fresh
+        role-version manifest, and commit the active set fail-closed."""
+        if record.target_role is not Role.WARRIOR:
+            return {
+                "order_id": order.order_id,
+                "executed": False,
+                "error": "only warrior-surface champions support registry rollback",
+            }
+        try:
+            target = self._evolution.rollback(
+                record.surface,
+                record.target_role,
+                reason=order.reason[:2000],
+                expected_champion_id=order.candidate_id,
+            )
+        except EvolutionRegistryError as exc:
+            return {
+                "order_id": order.order_id,
+                "executed": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        prev_binding = champion_binding_for_role(
+            artifacts=self._artifacts,
+            evolution=self._evolution,
+            role=Role.WARRIOR,
+            role_config=self._role_configs["warrior"],
+            budget_policy_sha256=self._budget_policy_sha256,
+            default_image=self._default_image,
+            default_workflow_ref=self._default_workflow_ref,
+            default_subject_ref=self._default_subject_ref,
+        )
+        manifest = candidate_manifest(
+            champion=prev_binding, candidate=target, artifacts=self._artifacts
+        )
+        if manifest is None:
+            return {
+                "order_id": order.order_id,
+                "executed": False,
+                "error": "restored champion has no materializable manifest",
+            }
+        ref = store_composite_manifest(self._artifacts, manifest)
+        active = self._roles.projection.current_active_set
+        if active is None:
+            return {
+                "order_id": order.order_id,
+                "executed": False,
+                "error": "no active role set to rebind",
+            }
+        current = active.for_role(Role.WARRIOR)
+        identity = RoleVersionIdentity(
+            Role.WARRIOR,
+            current.version + 1,
+            ref.artifact_id,
+            ref.artifact_id.rsplit(":", 1)[1],
+            current.constitution_id,
+            parent_role_version_id=current.role_version_id,
+        )
+        objective_id = snapshot.objective.objective_id
+        self._roles.collect_candidate(
+            identity,
+            objective_id=objective_id,
+            collection_evidence_id=order.order_id,
+        )
+        self._roles.validate_candidate(
+            identity.role_version_id,
+            validation_evidence_id=order.order_id,
+        )
+        self._roles.qualify_candidate(
+            identity.role_version_id,
+            qualification_evidence_id=order.order_id,
+        )
+        self._roles.commit_active_set(
+            {Role.WARRIOR: identity.role_version_id},
+            objective_id=objective_id,
+            joint_evidence_id=order.order_id,
+            expected_current_active_set_id=active.active_role_set_id,
+        )
+        self._bindings[Role.WARRIOR] = prev_binding
+        return {
+            "order_id": order.order_id,
+            "executed": True,
+            "surface": record.surface.value,
+            "restored_candidate_id": target.candidate_id,
+            "role_version_id": identity.role_version_id,
+            "analysis": order.analysis[:4000],
+        }
+
+    def _observe_candidate_probation(
+        self,
+        snapshot: CurriculumSnapshot,
+        evaluation_cohort: DynamicTaskCohort,
+        tasks: Sequence[Mapping[str, Any]],
+    ) -> list[Mapping[str, Any]]:
+        """Cross-cycle probation for non-harness surface champions.
+
+        For each surface champion still inside its probation window, solve the
+        cohort once with the parent champion binding under the anchor seed and
+        compare sealed quality against the champion's own main solve.  A
+        regression beyond the noninferiority margin writes a breach event; a
+        full window without breach writes a graduation event.  State rebuilds
+        from the event stream, so interruptions resume cleanly.
+        """
+        if (
+            self._campaign_event_store is None
+            or self._evolution is None
+            or self._candidate_probation_cycles <= 0
+        ):
+            return []
+        campaign_id = self._curriculum.projection.campaign_id
+        stream = campaign_id + "/evolution-probation"
+        observed: dict[str, list[float]] = {}
+        breached: set[str] = set()
+        for event in self._campaign_event_store.read(stream):
+            payload = event.payload
+            if not isinstance(payload, Mapping):
+                continue
+            candidate_id = payload.get("candidate_id")
+            if not isinstance(candidate_id, str):
+                continue
+            if event.event_type == "evolution_probation_observed_v1":
+                delta = payload.get("delta")
+                if isinstance(delta, (int, float)) and not isinstance(delta, bool):
+                    observed.setdefault(candidate_id, []).append(float(delta))
+            elif event.event_type == "evolution_probation_breached_v1":
+                breached.add(candidate_id)
+        champion_workspace = self._arm_workspaces.get("champion")
+        main_evidence = self._main_solve_evidence
+        if champion_workspace is None or main_evidence is None:
+            return []
+        binding = self._bindings[Role.WARRIOR]
+        champion_eval = evaluate_frozen_workspace(
+            self._dynamic,
+            self._sandbox,
+            champion_workspace,
+            str(main_evidence.get("workspace_digest", "")),
+            tasks,
+            namespace=f"probation-champion-{snapshot.cycle_number}",
+            policy=binding.control_core,
+        )
+        rows: list[Mapping[str, Any]] = []
+        margin = binding.control_core.promotion_gate.regression_noninferiority_margin
+        for surface in (
+            EvolutionSurface.WORKFLOW,
+            EvolutionSurface.SUBJECT,
+            EvolutionSurface.PLUGIN,
+            EvolutionSurface.ENVIRONMENT,
+        ):
+            champion = self._evolution.champion(surface, Role.WARRIOR)
+            if champion is None or champion.candidate_id in breached:
+                continue
+            if len(observed.get(champion.candidate_id, [])) >= self._candidate_probation_cycles:
+                continue
+            history = self._evolution.projection.champion_history.get(
+                (surface, Role.WARRIOR), ()
+            )
+            if len(history) < 2:
+                continue
+            parent_record = self._evolution.projection.candidates.get(history[-2])
+            if parent_record is None:
+                continue
+            parent_binding = candidate_binding(
+                champion=binding,
+                candidate=parent_record,
+                artifacts=self._artifacts,
+                role=Role.WARRIOR,
+            )
+            parent_solve = self._solve_arm(
+                snapshot,
+                evaluation_cohort,
+                tasks,
+                parent_binding,
+                arm_label=f"probation-parent-{surface.value}-{snapshot.cycle_number}",
+                evaluation_seed=0,
+            )
+            parent_eval = evaluate_frozen_workspace(
+                self._dynamic,
+                self._sandbox,
+                self._arm_workspaces[parent_solve["arm"]],
+                str(parent_solve.get("workspace_digest", "")),
+                tasks,
+                namespace=f"probation-parent-{snapshot.cycle_number}",
+                policy=binding.control_core,
+            )
+            delta = round(champion_eval.quality - parent_eval.quality, 12)
+            breached_now = delta < margin
+            payload = {
+                "schema_version": 1,
+                "candidate_id": champion.candidate_id,
+                "surface": surface.value,
+                "parent_candidate_id": parent_record.candidate_id,
+                "cycle": snapshot.cycle_number,
+                "delta": delta,
+            }
+            self._campaign_event_store.append(
+                stream,
+                (
+                    "evolution_probation_breached_v1"
+                    if breached_now
+                    else "evolution_probation_observed_v1"
+                ),
+                payload,
+            )
+            rows.append(
+                {
+                    **payload,
+                    "breached": breached_now,
+                    "observations": len(observed.get(champion.candidate_id, [])) + 1,
+                }
+            )
+            if breached_now:
+                break
+        return rows
 
     def _paired_arm(
         self,
@@ -6073,6 +6323,7 @@ def run_v2_cycle(
     evaluate_candidates_enabled: bool = True,
     candidate_max_extra_steps: int = 24,
     evaluation_seed_count: int = 2,
+    candidate_probation_cycles: int = 2,
     campaign_config: Any = None,
     harness_repo: HarnessRepo | None = None,
     harness_backend: HarnessBackend | None = None,
@@ -6304,6 +6555,7 @@ def run_v2_cycle(
         evaluate_candidates_enabled=evaluate_candidates_enabled,
         candidate_max_extra_steps=candidate_max_extra_steps,
         evaluation_seed_count=evaluation_seed_count,
+        candidate_probation_cycles=candidate_probation_cycles,
         evolution_surfaces=enabled_surfaces,
         budget_policy_sha256=policy_hash,
         harness_repo=harness_repo,

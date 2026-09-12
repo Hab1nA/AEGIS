@@ -107,6 +107,7 @@ class AutonomyV2Config:
     scanner_binary: str = "trivy"
     candidate_max_extra_steps: int = 24
     evaluation_seed_count: int = 2
+    candidate_probation_cycles: int = 2
     require_warrior_strategy_proposal: bool = False
 
     _FIELDS = frozenset(
@@ -138,6 +139,7 @@ class AutonomyV2Config:
             "scanner_binary",
             "candidate_max_extra_steps",
             "evaluation_seed_count",
+            "candidate_probation_cycles",
             "require_warrior_strategy_proposal",
         }
     )
@@ -276,6 +278,9 @@ class AutonomyV2Config:
         seed_count = raw.get("evaluation_seed_count", 2)
         if isinstance(seed_count, bool) or not isinstance(seed_count, int) or not 2 <= seed_count <= 4:
             raise ConfigError("autonomy_v2.evaluation_seed_count must be an integer in [2, 4]")
+        probation = raw.get("candidate_probation_cycles", 2)
+        if isinstance(probation, bool) or not isinstance(probation, int) or not 0 <= probation <= 16:
+            raise ConfigError("autonomy_v2.candidate_probation_cycles must be an integer in [0, 16]")
         candidate_steps = _positive_int(
             raw.get("candidate_max_extra_steps", 24),
             "autonomy_v2.candidate_max_extra_steps",
@@ -325,6 +330,7 @@ class AutonomyV2Config:
             scanner_binary=scanner_binary,
             candidate_max_extra_steps=candidate_steps,
             evaluation_seed_count=seed_count,
+            candidate_probation_cycles=probation,
             require_warrior_strategy_proposal=_bool(
                 raw.get("require_warrior_strategy_proposal", False),
                 "autonomy_v2.require_warrior_strategy_proposal",
@@ -364,6 +370,7 @@ class AutonomyV2Config:
             "scanner_binary": self.scanner_binary,
             "candidate_max_extra_steps": self.candidate_max_extra_steps,
             "evaluation_seed_count": self.evaluation_seed_count,
+            "candidate_probation_cycles": self.candidate_probation_cycles,
             "require_warrior_strategy_proposal": self.require_warrior_strategy_proposal,
         }
 
