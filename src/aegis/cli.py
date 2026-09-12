@@ -81,6 +81,14 @@ def _knowledge() -> KnowledgeStore:
     return KnowledgeStore(root / "knowledge.sqlite3")
 
 
+def _skills() -> Any:
+    from aegis.skill_registry import SkillRegistry
+
+    root = _data_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    return SkillRegistry(root / "skills.sqlite3")
+
+
 def _load(campaign_id: str) -> CampaignConfig:
     config = CampaignConfig.load(_config_path(campaign_id))
     database = _data_dir() / "events.sqlite3"
@@ -207,6 +215,7 @@ def _run_v2_cycle_cli(
     """Execute one full model-driven v2 cycle through the real runtime wiring."""
     store = _store()
     knowledge = _knowledge()
+    skills = _skills()
     dynamic = DynamicTaskRegistry(root / "dynamic_tasks.sqlite3")
     try:
         sandbox: SandboxBackend = (
@@ -287,7 +296,7 @@ def _run_v2_cycle_cli(
             sandbox=sandbox,
             research=_research(config),
             knowledge=knowledge,
-            skills=None,
+            skills=skills,
             pdf_extractor=(
                 None if config.sandbox_backend == "fake" else SandboxPDFExtractor(sandbox)
             ),
@@ -401,6 +410,7 @@ def _run_v2_cycle_cli(
     finally:
         dynamic.close()
         knowledge.close()
+        skills.close()
         store.close()
 
 

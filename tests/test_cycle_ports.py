@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from aegis.agent_runtime import RuntimeLimits
-from aegis.artifacts import ContentAddressedArtifactStore
+from aegis.artifacts import ArtifactRef, ContentAddressedArtifactStore
 from aegis.cli import main
 from aegis.config import RoleConfig
 from aegis.curriculum import CurriculumRegistry, CycleState
@@ -467,6 +467,49 @@ class CyclePortsTests(unittest.TestCase):
             ports._campaign_event_store = None
             self.assertIsNone(ports._prior_task_validation(snapshot))
             self.assertEqual(ports._prior_authoring_feedback(None), {})
+
+    def test_append_arm_mirrors_into_event_stream(self) -> None:
+        from types import SimpleNamespace
+
+        from aegis.event_store import EventStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = EventStore(root / "events.sqlite3")
+            artifacts = ContentAddressedArtifactStore(root / "artifacts")
+            try:
+                ports = ModelCyclePorts.__new__(ModelCyclePorts)
+                ports._attribution_ledger = root / "attribution_arms.jsonl"
+                ports._artifacts = artifacts
+                ports._curriculum = SimpleNamespace(projection=SimpleNamespace(campaign_id="cli"))
+                ports._campaign_event_store = store
+                arm = SimpleNamespace(
+                    to_mapping=lambda: {"cycle_id": "cycle:1", "quality": 0.5}
+                )
+                ports._append_arm(1, arm)
+                self.assertTrue((root / "attribution_arms.jsonl").exists())
+                events = [
+                    event
+                    for event in store.read("cli/attribution")
+                    if event.event_type == "attribution_arm_recorded_v1"
+                ]
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0].payload["cycle"], 1)
+                mirrored = json.loads(
+                    artifacts.get(
+                        ArtifactRef(
+                            events[0].payload["artifact"]["kind"],
+                            events[0].payload["artifact"]["artifact_id"],
+                            events[0].payload["artifact"]["size_bytes"],
+                        )
+                    )
+                )
+                self.assertEqual(mirrored["cycle_id"], "cycle:1")
+                # A missing event store keeps the jsonl as the only ledger.
+                ports._campaign_event_store = None
+                ports._append_arm(2, arm)
+            finally:
+                store.close()
 
     def test_taskpack_content_hash_is_recomputed_by_control_plane(self) -> None:
         """A structurally complete manifest with a wrong hash is repaired."""

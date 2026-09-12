@@ -607,6 +607,53 @@ class HarnessRepo:
         return target
 
 
+# Control-plane-owned mapping from harness change roots to the deterministic
+# test files the canary should exercise.  The control plane selects the tests
+# (a candidate must never supply its own exam); the default single-file suite
+# is always included as the floor, bounded by MAX_CANARY_TESTS.
+CANARY_ROOT_TESTS: Mapping[str, tuple[str, ...]] = {
+    "src/aegis/agent_runtime.py": ("tests/test_agent_runtime.py", "tests/test_cycle_runtime.py"),
+    "src/aegis/plugins/": (
+        "tests/test_plugin_runtime.py",
+        "tests/test_source_plugins.py",
+        "tests/test_agent_runtime_plugins.py",
+    ),
+    "src/aegis/gateway/": ("tests/test_gateway_client.py",),
+    "src/aegis/roles/": ("tests/test_role_registry_v2.py", "tests/test_role_generation_runtime.py"),
+    "src/aegis/research/": ("tests/test_research_http.py", "tests/test_research_security.py"),
+    "src/aegis/evolution/": (
+        "tests/test_evolution_harness.py",
+        "tests/test_evolution_registry.py",
+        "tests/test_evolution_surfaces.py",
+        "tests/test_evolution_consumer.py",
+        "tests/test_evolution_runtime.py",
+    ),
+}
+DEFAULT_CANARY_TEST = "tests/test_evolution_surfaces.py"
+MAX_CANARY_TESTS = 6
+
+
+def _canary_test_args(argv: Sequence[str]) -> tuple[str, ...]:
+    """Trailing argv elements that name test files."""
+    tail: list[str] = []
+    for item in reversed(argv):
+        if not item.startswith("tests/"):
+            break
+        tail.append(item)
+    return tuple(reversed(tail))
+
+
+def _targeted_canary_tests(changes: Sequence[GitFileChange]) -> tuple[str, ...]:
+    selected: list[str] = [DEFAULT_CANARY_TEST]
+    for change in changes:
+        for root, tests in CANARY_ROOT_TESTS.items():
+            if change.path == root or change.path.startswith(root):
+                for test in tests:
+                    if test not in selected:
+                        selected.append(test)
+    return tuple(selected[:MAX_CANARY_TESTS])
+
+
 class HarnessCanaryRunner:
     """Baseline-vs-candidate canary for one harness_code proposal."""
 
@@ -642,16 +689,21 @@ class HarnessCanaryRunner:
             checkpoint_ref=content["checkpoint_ref"],
             changes=changes,
         )
-        baseline_verdict = self._canary_once(base, None)
+        # Both arms run the same control-plane-selected test subset so the
+        # zero-regression claim compares like with like.
+        canary_argv = self._canary_argv_for(changes)
+        canary_tests = _canary_test_args(canary_argv)
+        baseline_verdict = self._canary_once(base, None, canary_argv)
         if not baseline_verdict.passed:
             return baseline_verdict
-        candidate_verdict = self._canary_once(base, changes)
+        candidate_verdict = self._canary_once(base, changes, canary_argv)
         if not candidate_verdict.passed:
             return candidate_verdict
         payload = {
             "passed": True,
             "base_commit": base,
             "checkpoint_commit": checkpoint_commit,
+            "canary_tests": list(canary_tests),
             "baseline": baseline_verdict.to_mapping(),
             "candidate": candidate_verdict.to_mapping(),
         }
@@ -666,8 +718,20 @@ class HarnessCanaryRunner:
             evidence_id,
         )
 
+    def _canary_argv_for(self, changes: Sequence[GitFileChange]) -> tuple[str, ...]:
+        argv = list(self._canary_argv)
+        tail = _canary_test_args(argv)
+        if not tail:
+            # A custom canary command without a trailing tests/ path is used
+            # verbatim; the control plane cannot know where tests would go.
+            return self._canary_argv
+        return tuple(argv[: len(argv) - len(tail)]) + _targeted_canary_tests(changes)
+
     def _canary_once(
-        self, base_commit: str, changes: Sequence[GitFileChange] | None
+        self,
+        base_commit: str,
+        changes: Sequence[GitFileChange] | None,
+        canary_argv: tuple[str, ...],
     ) -> CanaryVerdict:
         with tempfile.TemporaryDirectory(prefix="aegis-harness-canary-") as directory:
             clone = self._repo.clone_at(Path(directory) / "repo", base_commit)
@@ -684,7 +748,7 @@ class HarnessCanaryRunner:
                     "",
                 )
             canary = self._repo.run_canary(
-                clone, self._canary_argv, timeout=self._timeout
+                clone, canary_argv, timeout=self._timeout
             )
             if canary.returncode != 0:
                 return CanaryVerdict(

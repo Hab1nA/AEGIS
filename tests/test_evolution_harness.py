@@ -476,6 +476,43 @@ class HarnessRepoTests(unittest.TestCase):
 
 
 class HarnessCanaryTests(unittest.TestCase):
+    def test_targeted_canary_tests_map_roots_and_stay_bounded(self) -> None:
+        from aegis.evolution.harness import (
+            MAX_CANARY_TESTS,
+            _canary_test_args,
+            _targeted_canary_tests,
+        )
+
+        self.assertEqual(_canary_test_args(("{python}", "-m", "pytest", "tests/a.py")), ("tests/a.py",))
+        self.assertEqual(_canary_test_args(("{python}", "-c", "print()")), ())
+        self.assertEqual(
+            _targeted_canary_tests(()), ("tests/test_evolution_surfaces.py",)
+        )
+        selected = _targeted_canary_tests(
+            changes_to_git_file_changes(
+                [
+                    _change("src/aegis/plugins/tool.py", b"x"),
+                    _change("src/aegis/gateway/x.py", b"y"),
+                ]
+            )
+        )
+        self.assertEqual(
+            selected,
+            (
+                "tests/test_evolution_surfaces.py",
+                "tests/test_gateway_client.py",
+                "tests/test_plugin_runtime.py",
+                "tests/test_source_plugins.py",
+                "tests/test_agent_runtime_plugins.py",
+            ),
+        )
+        flood = _targeted_canary_tests(
+            changes_to_git_file_changes(
+                [_change(f"src/aegis/evolution/m{index}.py", b"x") for index in range(20)]
+            )
+        )
+        self.assertLessEqual(len(flood), MAX_CANARY_TESTS)
+
     def test_good_patch_passes_zero_regression(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = _init_harness_repo(Path(directory))

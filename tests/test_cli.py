@@ -47,6 +47,18 @@ class AnchorRunner:
 
 
 class CliTests(unittest.TestCase):
+    def test_skills_helper_wires_a_real_registry(self) -> None:
+        from aegis.cli import _skills
+        from aegis.skill_registry import SkillRegistry
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("aegis.cli._DATA_DIR_OVERRIDE", Path(directory)):
+                skills = _skills()
+                try:
+                    self.assertIsInstance(skills, SkillRegistry)
+                finally:
+                    skills.close()
+
     def test_all_required_commands_parse(self):
         parser = build_parser()
         self.assertEqual(parser.parse_args(["doctor"]).command, "doctor")

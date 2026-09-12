@@ -5635,6 +5635,22 @@ class ModelCyclePorts:
                 json.dumps({"cycle": cycle_number, "arm": arm.to_mapping()}, sort_keys=True)
                 + "\n"
             )
+        # Mirror into the event stream so the attribution ledger survives a
+        # data-dir rebuild (the jsonl file alone is not replayable).
+        if self._campaign_event_store is not None:
+            ref = self._artifacts.put_json("attribution-arm", arm.to_mapping())
+            self._campaign_event_store.append(
+                self._curriculum.projection.campaign_id + "/attribution",
+                "attribution_arm_recorded_v1",
+                {
+                    "cycle": cycle_number,
+                    "artifact": {
+                        "kind": ref.kind,
+                        "artifact_id": ref.artifact_id,
+                        "size_bytes": ref.size_bytes,
+                    },
+                },
+            )
 
 
 def genesis_constitution() -> Constitution:
