@@ -657,6 +657,16 @@ def _targeted_canary_tests(changes: Sequence[GitFileChange]) -> tuple[str, ...]:
 class HarnessCanaryRunner:
     """Baseline-vs-candidate canary for one harness_code proposal."""
 
+    _DEFAULT_ARGV: tuple[str, ...] = (
+        "{python}",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        DEFAULT_CANARY_TEST,
+    )
+
     def __init__(
         self,
         repo: HarnessRepo,
@@ -668,12 +678,16 @@ class HarnessCanaryRunner:
             "-q",
             "-p",
             "no:cacheprovider",
-            "tests/test_evolution_surfaces.py",
+            DEFAULT_CANARY_TEST,
         ),
         canary_timeout: float = 300.0,
     ) -> None:
         self._repo = repo
         self._canary_argv = tuple(canary_argv)
+        # An explicitly configured canary command is the control plane's own
+        # test selection and is used verbatim; only the built-in default is
+        # widened by the targeted root mapping.
+        self._explicit = self._canary_argv != self._DEFAULT_ARGV
         self._timeout = canary_timeout
 
     def run(
@@ -719,11 +733,11 @@ class HarnessCanaryRunner:
         )
 
     def _canary_argv_for(self, changes: Sequence[GitFileChange]) -> tuple[str, ...]:
+        if self._explicit:
+            return self._canary_argv
         argv = list(self._canary_argv)
         tail = _canary_test_args(argv)
         if not tail:
-            # A custom canary command without a trailing tests/ path is used
-            # verbatim; the control plane cannot know where tests would go.
             return self._canary_argv
         return tuple(argv[: len(argv) - len(tail)]) + _targeted_canary_tests(changes)
 

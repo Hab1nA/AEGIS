@@ -476,6 +476,23 @@ class HarnessRepoTests(unittest.TestCase):
 
 
 class HarnessCanaryTests(unittest.TestCase):
+    def test_explicit_canary_command_is_used_verbatim(self) -> None:
+        from aegis.evolution.harness import HarnessCanaryRunner
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = _init_harness_repo(Path(directory))
+            harness = HarnessRepo(repo)
+            explicit = ("{python}", "-m", "pytest", "-q", "tests/test_evolution_surfaces.py")
+            runner = HarnessCanaryRunner(harness, canary_argv=explicit)
+            changes = changes_to_git_file_changes(
+                [_change("src/aegis/gateway/thing.py", b"CHANGED\n")]
+            )
+            # An explicit control-plane command keeps its own test tail even
+            # when the change roots would map to a different targeted set.
+            self.assertEqual(runner._canary_argv_for(changes), explicit)
+            default_runner = HarnessCanaryRunner(harness)
+            self.assertNotEqual(default_runner._canary_argv_for(changes), default_runner._canary_argv)
+
     def test_targeted_canary_tests_map_roots_and_stay_bounded(self) -> None:
         from aegis.evolution.harness import (
             MAX_CANARY_TESTS,

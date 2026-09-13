@@ -595,6 +595,53 @@ class CyclePortsTests(unittest.TestCase):
         )
         self.assertEqual(ports._observe_candidate_probation(snapshot, None, []), [])
 
+    def test_evaluation_seeds_are_sorted_distinct_and_prefix_stable(self) -> None:
+        from aegis.evolution.sealed_evaluation import (
+            CandidateEvaluationDesign,
+            EvaluationTaskBinding,
+            EvaluationTier,
+        )
+
+        bindings = (
+            EvaluationTaskBinding(
+                "t1", "taskpack-sha256:" + "0" * 63 + "1", 1, EvaluationTier.FRESH, "f" * 64
+            ),
+            EvaluationTaskBinding(
+                "t2", "taskpack-sha256:" + "e" * 64, 1, EvaluationTier.REGRESSION, "f" * 64
+            ),
+        )
+        for cycle in range(1, 201):
+            for count in (2, 3, 4):
+                seeds = evaluation_seeds_for("cli", cycle, count)
+                self.assertEqual(seeds[0], 0)
+                self.assertEqual(seeds, tuple(sorted(set(seeds))))
+                # Raising the count only appends slots: seeds evaluated under
+                # a smaller design keep their values in the larger one.
+                self.assertEqual(
+                    seeds,
+                    evaluation_seeds_for("cli", cycle, 4)[:count],
+                )
+                # The real design constraint accepts every generated tuple.
+                CandidateEvaluationDesign.create(
+                    campaign_id="cli",
+                    cycle_id=f"cycle:{cycle}",
+                    snapshot_id="curriculum-snapshot-sha256:" + "a" * 64,
+                    objective_id="objective-sha256:" + "b" * 64,
+                    candidate_id="evolution-candidate-sha256:" + "c" * 64,
+                    surface="workflow",
+                    target_role="warrior",
+                    cohort_id="cohort-sha256:" + "d" * 64,
+                    tasks=bindings,
+                    seeds=seeds,
+                    baseline_runtime_id="role-version-sha256:" + "1" * 64,
+                    candidate_runtime_id="evolution-candidate-sha256:" + "c" * 64,
+                    runtime_policy_id="runtime-policy-sha256:" + "2" * 64,
+                    evaluator_fingerprint="sealed-evaluator-sha256:" + "3" * 64,
+                    public_weight=0.25,
+                    hidden_weight=0.75,
+                    gate_policy_sha256="a" * 64,
+                )
+
     def test_taskpack_content_hash_is_recomputed_by_control_plane(self) -> None:
         """A structurally complete manifest with a wrong hash is repaired."""
         source = Path("taskpacks/python/01_clamp_range")

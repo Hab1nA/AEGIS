@@ -215,9 +215,10 @@ def _run_v2_cycle_cli(
     """Execute one full model-driven v2 cycle through the real runtime wiring."""
     store = _store()
     knowledge = _knowledge()
-    skills = _skills()
-    dynamic = DynamicTaskRegistry(root / "dynamic_tasks.sqlite3")
+    skills = None
     try:
+        skills = _skills()
+        dynamic = DynamicTaskRegistry(root / "dynamic_tasks.sqlite3")
         sandbox: SandboxBackend = (
             FakeSandboxBackend() if config.sandbox_backend == "fake" else WslSandboxBackend()
         )
@@ -414,9 +415,10 @@ def _run_v2_cycle_cli(
             response["harness_boot_receipt"] = harness_boot_receipt.to_mapping()
         return response
     finally:
+        if skills is not None:
+            skills.close()
         dynamic.close()
         knowledge.close()
-        skills.close()
         store.close()
 
 

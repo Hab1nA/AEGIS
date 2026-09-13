@@ -313,7 +313,14 @@ class EvolutionRegistry:
                 {
                     "candidate_id": candidate_id,
                     "surface": record.surface.value if record is not None else "unknown",
-                    "reason": reason[:600],
+                    # Keep head and tail: gate reasons append their per-seed
+                    # dispersion at the end, which is the most informative
+                    # part for the next proposal.
+                    "reason": (
+                        reason
+                        if len(reason) <= 600
+                        else reason[:420] + " … " + reason[-160:]
+                    ),
                 }
             )
         return tuple(reasons)

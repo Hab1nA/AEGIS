@@ -141,7 +141,7 @@ def decide_promotion(
     candidate_total = sum(row.candidate_tokens for row in rows)
     champion_total = sum(row.champion_tokens for row in rows)
     token_change = round(candidate_total / champion_total - 1.0, 12)
-    quality_lower, saving_lower_ci = bootstrap_paired_delta(
+    quality_lower, _ = bootstrap_paired_delta(
         task_deltas,
         samples=policy.bootstrap_samples,
         seed=policy.bootstrap_seed,

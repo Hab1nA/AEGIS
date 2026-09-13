@@ -287,14 +287,28 @@ def evaluation_seeds_for(campaign_id: str, cycle_number: int, count: int) -> tup
     Slot 0 stays the literal anchor seed so the champion's main-solve evidence
     remains reusable; every other slot is derived from (campaign, cycle,
     slot) so a lineage cannot overfit one fixed seed set across generations.
-    Values live in [1, 2**31 - 1] because the gateway rejects negative seeds.
+    Derived slots are forced strictly increasing (a candidate below the
+    previous slot is re-derived with an attempt salt), which keeps the design
+    constraint (sorted, distinct) satisfied for any count and makes the seed
+    sequence prefix-stable: raising the count only appends slots, so seeds
+    already evaluated under a smaller design keep their values.  Values live
+    in [1, 2**31 - 1] because the gateway rejects negative seeds.
     """
     seeds = [0]
-    for index in range(max(0, count - 1)):
-        digest = hashlib.sha256(
-            f"evaluation-seed:{campaign_id}:{cycle_number}:{index}".encode("utf-8")
-        ).digest()
-        seeds.append(1 + int.from_bytes(digest[:4], "big") % (2**31 - 1))
+    while len(seeds) < max(0, count):
+        index = len(seeds) - 1
+        attempts = 0
+        while True:
+            digest = hashlib.sha256(
+                f"evaluation-seed:{campaign_id}:{cycle_number}:{index}:{attempts}".encode(
+                    "utf-8"
+                )
+            ).digest()
+            value = 1 + int.from_bytes(digest[:4], "big") % (2**31 - 1)
+            if value > seeds[-1]:
+                seeds.append(value)
+                break
+            attempts += 1
     return tuple(seeds)
 
 
@@ -312,9 +326,7 @@ def _should_expand_seeds(
         return False
     if gate_report.qualified or not gate_report.seed_results:
         return False
-    from statistics import fmean as _fmean
-
-    mean_fresh = _fmean(item.fresh_delta for item in gate_report.seed_results)
+    mean_fresh = fmean(item.fresh_delta for item in gate_report.seed_results)
     return 0.0 < mean_fresh < gate_report.policy.fresh_improvement
 
 
@@ -2102,6 +2114,7 @@ class ModelCyclePorts:
                 "judge_review": _brief(self._artifacts, judge_review),
                 "quality_lock": _brief(self._artifacts, quality_lock),
                 "workspace_digest": expected_digest,
+                "probation_breaches": _truncate(self._probation_breaches()),
             },
         )
         sub = evidence.get("submission", {})
@@ -3380,7 +3393,7 @@ class ModelCyclePorts:
                     "snapshot": _truncate(snapshot.to_mapping()),
                     "attempt": attempt,
                     "previous_validation_errors": repair_feedback[:32],
-                    "curriculum_direction": direction,
+                    "curriculum_direction": _truncate(direction),
                     "taskpack_contract": {
                         "language": "python",
                         "deliverable": "submit payload task_specs",
@@ -4718,15 +4731,20 @@ class ModelCyclePorts:
                 )
         # Sequential seed expansion: one extra derived slot when the fresh
         # mean is positive but below threshold (noise-band evidence), bounded
-        # to 4 seeds and a single expansion per evaluation.
+        # to 4 seeds and a single expansion per evaluation.  Every design used
+        # along the way is recorded: sealed evidence for slots already run
+        # under an earlier design keeps that design_id, and durable
+        # qualification accepts the whole lineage.
         expansion_used = False
         consumed_slots = 0
+        design_lineage: list[Mapping[str, Any]] = []
         while True:
             evaluation_seeds = evaluation_seeds_for(
                 snapshot.campaign_id, snapshot.cycle_number, seed_count
             )
             design = _build_design(evaluation_seeds)
             design_ref = _persist_design(design)
+            design_lineage.append(design.to_mapping())
             result["evaluation_design"] = {
                 **design.to_mapping(),
                 "artifact_id": design_ref.artifact_id,
@@ -4750,6 +4768,7 @@ class ModelCyclePorts:
             expansion_used = True
             seed_count += 1
             gate_policy = replace(gate_policy, required_seeds=seed_count)
+        result["evaluation_design_lineage"] = list(design_lineage)
         if not gate_report.qualified and report.qualified:
             report = AttributionReport.create(
                 disposition=AttributionDisposition.NOT_QUALIFIED,
@@ -5078,6 +5097,20 @@ class ModelCyclePorts:
         main_evidence = self._main_solve_evidence
         if champion_workspace is None or main_evidence is None:
             return []
+        evaluation_task_ids = frozenset(
+            str(item.get("artifact_id", "")) for item in tasks
+        )
+        if not self._baseline_reusable(evaluation_task_ids, self._main_solve_task_ids):
+            # The champion main solve did not cover this cohort (e.g. anchor
+            # backfill); scoring it against these tasks would fabricate a
+            # regression.  Skip the whole window rather than risk a spurious
+            # breach.
+            return [
+                {
+                    "cycle": snapshot.cycle_number,
+                    "skipped": "champion main solve does not cover the evaluation cohort",
+                }
+            ]
         binding = self._bindings[Role.WARRIOR]
         champion_eval = evaluate_frozen_workspace(
             self._dynamic,
@@ -5099,7 +5132,8 @@ class ModelCyclePorts:
             champion = self._evolution.champion(surface, Role.WARRIOR)
             if champion is None or champion.candidate_id in breached:
                 continue
-            if len(observed.get(champion.candidate_id, [])) >= self._candidate_probation_cycles:
+            observations_so_far = len(observed.get(champion.candidate_id, []))
+            if observations_so_far >= self._candidate_probation_cycles:
                 continue
             history = self._evolution.projection.champion_history.get(
                 (surface, Role.WARRIOR), ()
@@ -5155,12 +5189,39 @@ class ModelCyclePorts:
                 {
                     **payload,
                     "breached": breached_now,
-                    "observations": len(observed.get(champion.candidate_id, [])) + 1,
+                    "observations": observations_so_far + 1,
                 }
             )
             if breached_now:
                 break
+            if observations_so_far + 1 >= self._candidate_probation_cycles:
+                self._campaign_event_store.append(
+                    stream,
+                    "evolution_probation_graduated_v1",
+                    payload,
+                )
+                rows[-1]["graduated"] = True
         return rows
+
+    def _probation_breaches(self, limit: int = 4) -> list[Mapping[str, Any]]:
+        """Unresolved probation breaches, for the Prosecutor's rollback duty.
+
+        A breach event means a champion regressed beyond the noninferiority
+        margin during its probation window; the Prosecutor is expected to
+        respond with an ``aegis.order_rollback`` against that candidate.
+        """
+        if self._campaign_event_store is None:
+            return []
+        stream = self._curriculum.projection.campaign_id + "/evolution-probation"
+        breaches: list[Mapping[str, Any]] = []
+        for event in self._campaign_event_store.read(stream):
+            if event.event_type != "evolution_probation_breached_v1":
+                continue
+            payload = event.payload
+            if not isinstance(payload, Mapping):
+                continue
+            breaches.append(payload)
+        return breaches[-limit:]
 
     def _paired_arm(
         self,
@@ -5524,6 +5585,17 @@ class ModelCyclePorts:
         pairs_value = arms_value.get("pairs")
         if not isinstance(pairs_value, list) or len(pairs_value) != len(design.seeds):
             raise RuntimeError("candidate evaluation has incomplete paired arm evidence")
+        # Seed expansion may have grown the design after earlier slots ran;
+        # sealed evidence for those slots carries the earlier design_id.  The
+        # lineage records every design used, and each earlier design's seeds
+        # are a prefix of the final one, so accepting any lineage member keeps
+        # the check exact without weakening seed binding.
+        lineage_ids = {
+            entry.get("design_id")
+            for entry in candidate_evidence.get("evaluation_design_lineage") or []
+            if isinstance(entry, Mapping) and isinstance(entry.get("design_id"), str)
+        }
+        lineage_ids.add(design.design_id)
         observed_pair_ids: list[str] = []
         for row in pairs_value:
             if not isinstance(row, Mapping):
@@ -5547,8 +5619,8 @@ class ModelCyclePorts:
             )
             if (
                 seed not in design.seeds
-                or baseline.design_id != design.design_id
-                or candidate_arm.design_id != design.design_id
+                or baseline.design_id not in lineage_ids
+                or candidate_arm.design_id not in lineage_ids
                 or baseline.seed != seed
                 or candidate_arm.seed != seed
                 or baseline.arm != "baseline"
@@ -5568,8 +5640,8 @@ class ModelCyclePorts:
                 or not isinstance(candidate_payload, Mapping)
                 or baseline_payload.get("evidence_id") != baseline_id
                 or candidate_payload.get("evidence_id") != candidate_id
-                or baseline_payload.get("design_id") != design.design_id
-                or candidate_payload.get("design_id") != design.design_id
+                or baseline_payload.get("design_id") not in lineage_ids
+                or candidate_payload.get("design_id") not in lineage_ids
             ):
                 raise RuntimeError("sealed pair does not bind its exact arm evidence")
             observed_pair_ids.append(
