@@ -6,6 +6,27 @@ from dataclasses import dataclass, field
 from threading import Event
 from typing import Any, Mapping, Protocol
 
+# TokenUsage is frozen usage accounting: its definition lives outside every
+# harness-code evolvable root (see aegis.evolution.surfaces) so an evolving
+# agent cannot edit the shape or semantics of its own usage figures.
+# Re-exported here so every existing import site keeps working.
+from aegis.usage_accounting import TokenUsage
+
+__all__ = [
+    "GatewayError",
+    "GatewayCancelled",
+    "GatewayHTTPError",
+    "GatewayTruncationError",
+    "CancelToken",
+    "Message",
+    "GatewayRequest",
+    "TokenUsage",
+    "GatewayResponse",
+    "GatewayAttempt",
+    "GatewayAttemptResult",
+    "GatewayAttemptObserver",
+]
+
 
 class GatewayError(RuntimeError):
     """Base model gateway error."""
@@ -90,23 +111,6 @@ class GatewayRequest:
             raise ValueError("seed must be null or an integer in [0, 2147483647]")
         if self.reasoning_effort not in {None, "none", "low", "medium", "high", "max"}:
             raise ValueError("unsupported reasoning_effort")
-
-
-@dataclass(frozen=True, slots=True)
-class TokenUsage:
-    input_tokens: int
-    output_tokens: int
-    cached_tokens: int = 0
-    reasoning_tokens: int = 0
-    verified: bool = True
-
-    def __post_init__(self) -> None:
-        if min(self.input_tokens, self.output_tokens, self.cached_tokens, self.reasoning_tokens) < 0:
-            raise ValueError("token counts cannot be negative")
-
-    @property
-    def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
 
 
 @dataclass(frozen=True, slots=True)

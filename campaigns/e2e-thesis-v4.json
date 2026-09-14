@@ -1,0 +1,58 @@
+{
+  "campaign_id": "e2e-thesis-v4",
+  "objective": "冻结模型权重，在隔离沙箱与不可变安全宪法围栏内，通过『出题—解题—证据门控』的对抗进化循环，持续提升解题者（Warrior）对动态 Python 工程任务的求解能力：任务通过率与解的质量必须可验证地提升，泛化与保持能力同步增长，解题效率不退化；每一次 harness 进化（工作流/主题/插件/环境）都必须可归因、可审查、可回滚，且不引入越权能力。",
+  "max_rounds": 64,
+  "total_tokens": 60000000,
+  "max_requests": 2000,
+  "wall_time_seconds": 28800,
+  "task_pack_paths": [],
+  "acceptance_profile": "autonomous_evolution_v2",
+  "autonomy_v2": {
+    "enabled": true,
+    "task_holdout_delay_cycles": 1,
+    "council_max_messages": 24,
+    "council_max_tokens": 4194304,
+    "objective_history_window": 3,
+    "objective_probation_cycles": 2,
+    "public_repo_url": "https://github.com/Hab1nA/AEGIS",
+    "builder_block_private_networks": true,
+    "external_writes_via_connectors": true,
+    "role_activation_automatic": true,
+    "immutable_safety_constitution": true,
+    "evolution_surfaces": [
+      "workflow",
+      "subject",
+      "plugin",
+      "environment"
+    ],
+    "environment_output_repository": "localhost/aegis-evolution",
+    "scanner_binary": "trivy",
+    "candidate_max_extra_steps": 24
+  },
+  "sandbox_backend": "wsl",
+  "test_mode": false,
+  "demo_mode": false,
+  "offline_research": false,
+  "research_enabled": true,
+  "max_agent_steps": 96,
+  "roles": {
+    "warrior": {
+      "model": "agnes-2.5-flash",
+      "budget_share": 0.55,
+      "max_output_tokens": 65536,
+      "reasoning_effort": "max"
+    },
+    "judge": {
+      "model": "agnes-2.5-flash",
+      "budget_share": 0.225,
+      "max_output_tokens": 65536,
+      "reasoning_effort": "max"
+    },
+    "prosecutor": {
+      "model": "agnes-2.5-flash",
+      "budget_share": 0.225,
+      "max_output_tokens": 65536,
+      "reasoning_effort": "max"
+    }
+  }
+}

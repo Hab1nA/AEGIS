@@ -85,6 +85,25 @@ def _record_candidate(
             validated=False,
             error="surface is not enabled by the campaign evolution_surfaces config",
         )
+    if target_role is not Role.WARRIOR:
+        # Only Warrior-target candidates can run a Warrior-solve shadow arm.
+        # Reject at collection so the proposal is visible without spending a
+        # materialization slot or lingering in VALIDATED until the gate.
+        return ConsumedCandidate(
+            surface,
+            target_role,
+            "",
+            "",
+            source,
+            proposal_id,
+            rationale,
+            collected=False,
+            validated=False,
+            error=(
+                "only Warrior-target candidates are shadow-evaluated and "
+                "activated in this release"
+            ),
+        )
     artifact_id, artifact_sha256 = _materialize(artifacts, surface, content_json)
     try:
         registry.collect(

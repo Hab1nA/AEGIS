@@ -197,6 +197,28 @@ class WslHarnessBackend:
     def status(self, campaign_id: str, operation_id: str) -> HarnessReceipt:
         return self._request("status", campaign_id, operation_id)
 
+    def sync_mirror(
+        self, campaign_id: str, source_url: str, source_ref: str, operation_id: str
+    ) -> HarnessReceipt:
+        """Refresh the distro's shared source mirror and verify the pinned ref.
+
+        Closes the harness-drift loop: the mirror that every campaign worktree
+        is cut from is brought up to the operator-pinned ref (which must be
+        reachable from the campaign's public source URL), failing closed when
+        it does not resolve.  Requires a distro harness agent that knows the
+        ``sync_mirror`` operation.
+        """
+        _validate_source_url(source_url)
+        if _PINNED_COMMIT.fullmatch(source_ref) is None:
+            raise ValueError("source_ref must be a full pinned Git commit id")
+        return self._request(
+            "sync_mirror",
+            campaign_id,
+            operation_id,
+            source_url=source_url,
+            source_ref=source_ref,
+        )
+
     def checkpoint(
         self,
         campaign_id: str,

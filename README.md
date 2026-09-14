@@ -64,7 +64,9 @@
 | `mcp`（默认关闭） | 外部工具接入面：自包含 MCP 候选经控制面 JSON-RPC 桥实时校验后注册 | MCP 候选工件 |
 | `control-core`（默认关闭） | WSL 内层控制策略：内层评测权重、晋升门限参数、内层任务沙箱配额；host/凭据/网络边界字段名级拒绝 | 控制策略工件 |
 
-`harness-code` 面是这条理念走得最远的地方：连"决定谁能进化、怎么评测"的那部分代码，本身也在进化射程之内（面本身需 `harness_evolution_enabled` + 显式 harness 仓库；其触及演化控制文件 `registry.py`/`consumer.py` 的子集再需 `meta_evolution_enabled`，且沙箱/发布/评测/归因边界永不开禁）。`mcp` 与 `control-core` 面机制完备但默认不在 `evolution_surfaces` 白名单中，需显式启用。候选生命周期沿 `{campaign}:evolution:v2` 事件流推进：`collected → validated → qualified → active`，带每面 champion、父代谱系与回滚记录。
+`harness-code` 面是这条理念走得最远的地方：连"决定谁能进化、怎么评测"的那部分代码，本身也在进化射程之内（面本身需 `harness_evolution_enabled` + 显式 harness 仓库；其触及演化控制机器——`evolution/registry.py`、`consumer.py`、授权规则本体 `surfaces.py`、金丝雀 `harness.py`，以及恢复链 `cycle_recovery.py`/`repair_runtime.py`——再需 `meta_evolution_enabled` 显式授权，且沙箱/发布/评测/归因边界与用量记账（`usage_accounting.py`，冻结于任何可进化根之外）永不开禁）。`mcp` 与 `control-core` 面机制完备但默认不在 `evolution_surfaces` 白名单中，需显式启用。候选生命周期沿 `{campaign}:evolution:v2` 事件流推进：`collected → validated → qualified → active`，带每面 champion、父代谱系与回滚记录；只有 Warrior 面向的候选会被影子评测，非 Warrior 提名在收集阶段即以明确原因拒绝。
+
+"完全进化形态"（七面全开 + harness/meta 授权 + 环境构建）见 `configs/evolution-full.example.json`；启用 harness-code 前，先以 `aegis harness-sync <campaign_id>` 把 WSL source mirror 刷新到配置钉住的 `harness_source_ref`（须先把宿主仓库推送到 `public_repo_url`）。
 
 ## 进化循环全景
 

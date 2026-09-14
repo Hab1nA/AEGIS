@@ -40,7 +40,6 @@ from aegis.evolution.population import (
 from aegis.evolution.registry import EvolutionRegistry
 from aegis.evolution.surfaces import (
     META_ALLOWED_ROOTS,
-    META_FORBIDDEN_FILES,
     EvolutionSurface,
     EvolutionSurfaceError,
     validate_harness_code_content,
@@ -376,7 +375,7 @@ class HarnessSurfaceTests(unittest.TestCase):
             "src/aegis/gateway/transport.py",
             "src/aegis/roles/prompts.py",
             "src/aegis/research/github_collector.py",
-            "src/aegis/evolution/surfaces.py",
+            "src/aegis/evolution/population.py",
         ):
             with self.subTest(path=path):
                 self.assertEqual(validate_harness_path(path), path)
@@ -860,7 +859,15 @@ class PopulationArchiveTests(unittest.TestCase):
 
 class MetaEvolutionTests(unittest.TestCase):
     def test_control_files_require_explicit_authorization(self) -> None:
-        for path in META_FORBIDDEN_FILES:
+        # The candidate ledger and the evolution rulebook itself are meta
+        # gated: forbidden without meta_evolution_enabled, allowed with it.
+        meta_gated_files = (
+            "src/aegis/evolution/registry.py",
+            "src/aegis/evolution/consumer.py",
+            "src/aegis/evolution/surfaces.py",
+            "src/aegis/evolution/harness.py",
+        )
+        for path in meta_gated_files:
             with self.subTest(path=path):
                 with self.assertRaises(EvolutionSurfaceError):
                     validate_harness_path(path)

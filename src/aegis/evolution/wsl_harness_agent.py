@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 from aegis.models import canonical_json
 
 from .harness import validate_harness_patch_paths
-from .source import is_local_source_mirror
+from .source import SOURCE_MIRROR_PATH, is_local_source_mirror
 
 CAMPAIGNS_ROOT = Path("/var/lib/aegis/campaigns")
 _fcntl: Any | None
@@ -71,6 +71,7 @@ class HarnessAgent:
         if operation not in {
             "ensure_campaign",
             "status",
+            "sync_mirror",
             "checkpoint",
             "validate",
             "activate",
@@ -173,6 +174,54 @@ class HarnessAgent:
             shutil.rmtree(campaign, ignore_errors=True)
             raise
         return self._values("created", resolved, detail="campaign initialized")
+
+    def _sync_mirror(
+        self, campaign: Path, campaign_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Refresh the shared bare source mirror from the campaign's public
+        source URL, then fail closed unless the pinned source_ref resolves.
+
+        This closes the drift loop between the host harness repository and the
+        distro-local mirror that every campaign worktree is cut from.  It
+        deliberately does not touch any campaign's champion binding: syncing
+        only makes newer commits *available*; promoting one to a campaign
+        champion remains an explicit ensure/activate decision.
+        """
+        del campaign, campaign_id
+        source_url = _source_url(request.get("source_url"))
+        source_ref = _commit(request.get("source_ref"), "source_ref")
+        mirror = Path(SOURCE_MIRROR_PATH)
+        local = is_local_source_mirror(source_url)
+        if (mirror / "HEAD").is_file():
+            _git(
+                mirror,
+                "fetch",
+                "--no-tags",
+                "--prune",
+                source_url,
+                "+refs/heads/*:refs/heads/*",
+                timeout=3600,
+                allow_local_mirror=local,
+            )
+        else:
+            mirror.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _git(
+                None,
+                "clone",
+                "--bare",
+                "--filter=blob:none",
+                "--",
+                source_url,
+                str(mirror),
+                timeout=3600,
+                allow_local_mirror=local,
+            )
+        resolved = self._resolve(mirror, source_ref)
+        return self._values(
+            "synced",
+            resolved,
+            detail=f"source mirror refreshed from {source_url} at {source_ref}",
+        )
 
     def _status(
         self, campaign: Path, campaign_id: str, request: Mapping[str, Any]

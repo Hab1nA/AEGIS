@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import math
 import os
 import socket
 import time
@@ -17,6 +16,11 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass
 from typing import Callable, Mapping, cast
+
+# Usage extraction is frozen accounting (outside every harness-code evolvable
+# root): the transport may be evolved, but the code that turns relay payloads
+# into usage figures may not.
+from aegis.usage_accounting import TokenUsage, extract_usage
 
 from .transport import HTTPTransport, StdlibHTTPTransport
 from .types import (
@@ -29,7 +33,6 @@ from .types import (
     GatewayRequest,
     GatewayResponse,
     GatewayTruncationError,
-    TokenUsage,
 )
 
 
@@ -412,33 +415,7 @@ class ModelGateway:
     def _extract_usage(
         data: Mapping[str, object], request: GatewayRequest, text: str
     ) -> TokenUsage:
-        usage = data.get("usage")
-        if isinstance(usage, Mapping):
-            input_tokens = usage.get("input_tokens")
-            output_tokens = usage.get("output_tokens")
-            if isinstance(input_tokens, int) and isinstance(output_tokens, int):
-                cached = 0
-                reasoning = 0
-                details = usage.get("input_tokens_details")
-                if isinstance(details, Mapping) and isinstance(details.get("cached_tokens"), int):
-                    cached = int(details["cached_tokens"])
-                out_details = usage.get("output_tokens_details")
-                if isinstance(out_details, Mapping) and isinstance(out_details.get("reasoning_tokens"), int):
-                    reasoning = int(out_details["reasoning_tokens"])
-                return TokenUsage(input_tokens, output_tokens, cached, reasoning, True)
-            # Some compatibility relays answer the Responses endpoint with
-            # chat-completions-shaped usage (prompt/completion tokens).
-            prompt_tokens = usage.get("prompt_tokens")
-            completion_tokens = usage.get("completion_tokens")
-            if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
-                cached = 0
-                details = usage.get("prompt_tokens_details")
-                if isinstance(details, Mapping) and isinstance(details.get("cached_tokens"), int):
-                    cached = int(details["cached_tokens"])
-                reasoning = usage.get("reasoning_tokens")
-                if not isinstance(reasoning, int):
-                    reasoning = 0
-                return TokenUsage(prompt_tokens, completion_tokens, cached, reasoning, True)
-        # Conservative, explicitly unverified approximation for relays omitting usage.
-        input_chars = sum(len(m.content) for m in request.messages)
-        return TokenUsage(math.ceil(input_chars / 3), math.ceil(len(text) / 3), verified=False)
+        # Frozen accounting: the mapping logic and every verified=True
+        # construction live in aegis.usage_accounting, outside the harness-code
+        # evolvable roots.  The transport cannot alter usage semantics.
+        return extract_usage(data, request, text)

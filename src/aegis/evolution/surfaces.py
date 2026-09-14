@@ -95,15 +95,15 @@ HARNESS_FORBIDDEN_ROOTS: tuple[str, ...] = (
 
 HARNESS_FORBIDDEN_FILES: frozenset[str] = frozenset(
     {
+        # Evolution machinery: the candidate ledger (registry/consumer) and
+        # the rulebook that decides which proposals are valid and how the
+        # canary runs (surfaces/harness).  These are evolvable only with
+        # explicit meta_evolution_enabled authorization — and the host-side
+        # repair channel can never write them.
         "src/aegis/evolution/registry.py",
         "src/aegis/evolution/consumer.py",
-    }
-)
-
-META_FORBIDDEN_FILES: frozenset[str] = frozenset(
-    {
-        "src/aegis/evolution/registry.py",
-        "src/aegis/evolution/consumer.py",
+        "src/aegis/evolution/surfaces.py",
+        "src/aegis/evolution/harness.py",
     }
 )
 
@@ -737,7 +737,6 @@ __all__ = [
     "HARNESS_SECRET_PATH_PARTS",
     "HARNESS_SECRET_SUFFIXES",
     "META_ALLOWED_ROOTS",
-    "META_FORBIDDEN_FILES",
     "MAX_HARNESS_CHANGES",
     "MAX_HARNESS_FILE_BYTES",
     "MAX_HARNESS_TEXT_BYTES",

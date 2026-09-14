@@ -120,6 +120,35 @@ def test_backend_requires_pinned_source_ref() -> None:
         )
 
 
+def test_backend_sync_mirror_builds_typed_request() -> None:
+    requests: list[Mapping[str, Any]] = []
+
+    def transport(request: Mapping[str, Any], timeout: float) -> Mapping[str, Any]:
+        del timeout
+        requests.append(request)
+        return {"ok": True, "receipt": _receipt(request)}
+
+    backend = WslHarnessBackend(transport=transport)
+    receipt = backend.sync_mirror(
+        CAMPAIGN, "https://example.test/repo.git", COMMIT_A, "sync-1"
+    )
+    assert receipt.champion_commit == COMMIT_A
+    assert requests == [
+        {
+            "version": 1,
+            "operation": "sync_mirror",
+            "operation_id": "sync-1",
+            "campaign_id": CAMPAIGN,
+            "source_url": "https://example.test/repo.git",
+            "source_ref": COMMIT_A,
+        }
+    ]
+    with pytest.raises(ValueError):
+        backend.sync_mirror(CAMPAIGN, "https://user:pw@example.test/r.git", COMMIT_A, "s2")
+    with pytest.raises(ValueError, match="pinned"):
+        backend.sync_mirror(CAMPAIGN, "https://example.test/repo.git", "main", "s3")
+
+
 def test_backend_rejects_tampered_or_cross_request_receipt() -> None:
     def tampered(request: Mapping[str, Any], timeout: float) -> Mapping[str, Any]:
         del timeout
@@ -278,3 +307,71 @@ def _run_git(cwd: Path | None, *args: str) -> subprocess.CompletedProcess[str]:
 def _contains_reset_hard() -> bool:
     source = Path(__file__).parents[1] / "src" / "aegis" / "evolution" / "wsl_harness_agent.py"
     return "reset --hard" in source.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="real Git harness agent requires Linux flock")
+def test_linux_agent_sync_mirror_fetches_and_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aegis.evolution import wsl_harness_agent
+    from aegis.evolution.wsl_harness_agent import HarnessAgent
+
+    source = tmp_path / "public"
+    source.mkdir()
+    _run_git(source, "init", "--initial-branch=main")
+    _run_git(source, "config", "user.name", "Test")
+    _run_git(source, "config", "user.email", "test@invalid")
+    (source / "README.md").write_text("base\n", encoding="utf-8")
+    _run_git(source, "add", "README.md")
+    _run_git(source, "commit", "-m", "base")
+    base = _run_git(source, "rev-parse", "HEAD").stdout.strip()
+
+    mirror = tmp_path / "mirror.git"
+    mirror_url = f"file://{mirror}"
+    monkeypatch.setattr(wsl_harness_agent, "SOURCE_MIRROR_PATH", str(mirror))
+    monkeypatch.setattr(wsl_harness_agent, "_source_url", lambda value: str(value))
+    monkeypatch.setattr(wsl_harness_agent, "is_local_source_mirror", lambda value: True)
+
+    agent = HarnessAgent(tmp_path / "campaigns")
+    receipt = agent.handle(
+        {
+            "version": 1,
+            "operation": "sync_mirror",
+            "operation_id": "sync-1",
+            "campaign_id": "sync-campaign",
+            "source_url": mirror_url,
+            "source_ref": base,
+        }
+    )["receipt"]
+    assert receipt["status"] == "synced"
+    assert receipt["champion_commit"] == base
+
+    # A newer public commit becomes available through a second sync.
+    (source / "README.md").write_text("newer\n", encoding="utf-8")
+    _run_git(source, "add", "README.md")
+    _run_git(source, "commit", "-m", "newer")
+    newer = _run_git(source, "rev-parse", "HEAD").stdout.strip()
+    receipt = agent.handle(
+        {
+            "version": 1,
+            "operation": "sync_mirror",
+            "operation_id": "sync-2",
+            "campaign_id": "sync-campaign",
+            "source_url": mirror_url,
+            "source_ref": newer,
+        }
+    )["receipt"]
+    assert receipt["champion_commit"] == newer
+
+    # An unknown ref fails closed instead of reporting a stale resolution.
+    with pytest.raises(wsl_harness_agent.AgentError):
+        agent.handle(
+            {
+                "version": 1,
+                "operation": "sync_mirror",
+                "operation_id": "sync-3",
+                "campaign_id": "sync-campaign",
+                "source_url": mirror_url,
+                "source_ref": "f" * 40,
+            }
+        )

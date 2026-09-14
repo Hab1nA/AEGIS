@@ -618,6 +618,7 @@ def _usage_summary(usages: Sequence[TokenUsage]) -> Mapping[str, int]:
         "cached_tokens": cached_tokens,
         "reasoning_tokens": sum(item.reasoning_tokens for item in usages),
         "cache_hit_ratio": ratio,
+        "usage_anomalies": sum(len(item.anomalies) for item in usages),
     }
 
 
@@ -1077,6 +1078,10 @@ class ModelCyclePorts:
         self._arm_workspaces: dict[str, bytes] = {}
         self._main_solve_evidence: dict[str, Any] | None = None
         self._main_solve_task_ids: frozenset[str] | None = None
+        # Frozen-accounting anomalies (aegis.usage_accounting) seen this
+        # invocation; surfaced to the Prosecutor audit context so tampered
+        # usage reporting becomes visible to the adversarial auditor.
+        self._usage_anomaly_events: list[dict[str, Any]] = []
         workflow_ref, subject_ref = materialize_default_artifacts(artifacts)
         self._default_workflow_ref = workflow_ref
         self._default_subject_ref = subject_ref
@@ -1574,6 +1579,17 @@ class ModelCyclePorts:
                     sum(1 for item in result.observations if item.action == "submit") - 1,
                 ),
             }
+            for item in result.usages:
+                if item.anomalies:
+                    self._usage_anomaly_events.append(
+                        {
+                            "role": role.value,
+                            "accounting_stage": accounting_stage,
+                            "anomalies": list(item.anomalies),
+                            "input_tokens": item.input_tokens,
+                            "output_tokens": item.output_tokens,
+                        }
+                    )
             if self._runtime_policy_registry is not None:
                 evidence["runtime_policy_id"] = (
                     self._runtime_policy_registry.policy_for_paired_design(paired_design_id)
@@ -1818,7 +1834,11 @@ class ModelCyclePorts:
                 "steps, then "
                 "write each solution under tasks/<task_id>/solution.py inside the workspace, run "
                 "the public tests under tasks/<task_id>/tests/public, then submit one payload "
-                "binding per-task artifact_id, solution summary, and public-test results.  Partial "
+                "binding per-task artifact_id, solution summary, and public-test results.  Step "
+                "discipline: process tasks one at a time — read a task's TASK.md (and at most one "
+                "or two of its source files), immediately write its solution.py, run its public "
+                "tests, then move to the next task; never read through the whole workspace before "
+                "writing anything, and reserve the final steps for submit.  Partial "
                 "or imperfect solutions are acceptable and required to advance the cycle; never "
                 "exceed the step budget without submitting.  If plugin_action_schemas are "
                 "advertised in your envelope, use those plugin actions where they genuinely "
@@ -2097,13 +2117,16 @@ class ModelCyclePorts:
                 "usage_verified, risk findings, and curriculum_hypotheses (a list of "
                 "{hypothesis_id, summary, confidence} objects for the next cycle; the control "
                 "plane feeds them to the next task author under that exact key). The envelope "
-                "carries runtime_policy_id and runtime_policy_consumed; if consumed figures show "
+                "carries usage_anomalies: figures flagged by frozen usage accounting (impossible "
+                "token counts, output beyond the reserved budget) — treat any entry as a serious "
+                "integrity finding and name it in your risk findings. The envelope also carries "
+                "runtime_policy_id and runtime_policy_consumed; if consumed figures show "
                 "exhausted budgets or a flow bottleneck, call aegis.adjust_runtime_policy once "
                 "before submit with base_policy_id copied from runtime_policy_id. "
                 "You may nominate one subject candidate per role by declaring role_candidates "
                 "as an object mapping a role name to {content:{content_markdown, rationale}}; "
-                "nominated candidates are collected and evaluated by the same gates as Warrior "
-                "proposals.  Independently decide every "
+                "only Warrior-target nominations are shadow-evaluated — nominations for other "
+                "roles are recorded and rejected with that reason.  Independently decide every "
                 "staged MCP candidate using "
                 "mcp_decisions[{candidate_id,decision,rationale}]; use reject as a veto."
             ),
@@ -2115,6 +2138,7 @@ class ModelCyclePorts:
                 "quality_lock": _brief(self._artifacts, quality_lock),
                 "workspace_digest": expected_digest,
                 "probation_breaches": _truncate(self._probation_breaches()),
+                "usage_anomalies": self._usage_anomalies(),
             },
         )
         sub = evidence.get("submission", {})
@@ -3398,13 +3422,16 @@ class ModelCyclePorts:
                         "language": "python",
                         "deliverable": "submit payload task_specs",
                         "reserved_task_ids": sorted(builder.reserved_task_ids()),
+                        # Every key inside spec_schema is a literal TaskSpec field;
+                        # guidance text lives beside it so the model cannot copy
+                        # a documentation key into a submitted spec.
+                        "step_ops_reference": "legal step op values are: call | method | construct | set_fixture | parallel_method | mutate | snapshot; assertions support expect, raises, expect_args, expect_kwargs, expect_fixtures — use them to build stateful and concurrency stress cases, not just pure calls",
                         "spec_schema": {
                             "task_id": "python-<new-slug>",
                             "prompt": "markdown task description",
                             "public_cases": {"version": 1, "cases": [{"name": "case-name", "clause_ids": ["FUNC.ARITHMETIC"], "steps": [{"op": "call", "symbol": "fn", "args": [1, 2], "expect": 3}]}]},
                             "public_test": "pytest source text",
                             "hidden_cases": {"version": 1, "cases": [{"name": "case-name", "clause_ids": ["FUNC.ARITHMETIC"], "steps": [{"op": "construct", "symbol": "Counter", "args": [], "save": "obj"}, {"op": "parallel_method", "object": "obj", "method": "increment", "args": [], "workers": 8, "repeat": 2000}, {"op": "method", "object": "obj", "method": "value", "args": [], "expect": 16000}]}]},
-                            "step_ops": "call | method | construct | set_fixture | parallel_method | mutate | snapshot; assertions support expect, raises, expect_args, expect_kwargs, expect_fixtures — use them to build stateful and concurrency stress cases, not just pure calls",
                             "clauses": [{"clause_id": "FUNC.ARITHMETIC", "statement": "fn(a,b) returns the arithmetic result", "input_partition": "positive/zero/negative", "expected_outcome": "return", "security_relevant": False}],
                             "defect_clause_ids": ["FUNC.ARITHMETIC"],
                             "reference_solution": "python source text",
@@ -5223,6 +5250,10 @@ class ModelCyclePorts:
             breaches.append(payload)
         return breaches[-limit:]
 
+    def _usage_anomalies(self, limit: int = 8) -> list[Mapping[str, Any]]:
+        """Frozen-accounting anomalies seen in this invocation's role runs."""
+        return self._usage_anomaly_events[-limit:]
+
     def _paired_arm(
         self,
         snapshot: CurriculumSnapshot,
@@ -6711,6 +6742,11 @@ def run_v2_cycle(
             payload = event.payload
             if payload.get("cycle") != target:
                 continue
+            # The task-generation target is pinned while no new task registers,
+            # so "cycle" alone cannot tell in-flight checkpoints from a prior
+            # completed cycle's. Scope resume to this invocation's snapshot.
+            if payload.get("cycle_number") != snapshot.cycle_number:
+                continue
             stage = payload.get("stage")
             artifact_id = payload.get("artifact_id")
             if not isinstance(stage, str) or not isinstance(artifact_id, str):
@@ -6745,6 +6781,7 @@ def run_v2_cycle(
                     "stage_checkpoint_v2",
                     {
                         "cycle": target,
+                        "cycle_number": snapshot.cycle_number,
                         "stage": stage,
                         "artifact_id": ref.artifact_id,
                     },

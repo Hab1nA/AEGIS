@@ -139,8 +139,13 @@ class ActionTests(unittest.TestCase):
     def test_action_envelope_is_exact(self) -> None:
         parsed = Action.parse(json.dumps(call("submit", summary="ok", payload={})))
         self.assertEqual(parsed.name, "submit")
+        # Extra top-level keys are relay commentary and are dropped; the
+        # nested arguments object still faces the per-action validators.
+        relaxed = Action.parse('{"action":"submit","arguments":{"summary":"ok"},"extra":1}')
+        self.assertEqual(relaxed.name, "submit")
+        self.assertEqual(dict(relaxed.arguments), {"summary": "ok"})
         with self.assertRaisesRegex(ActionError, "exactly"):
-            Action.parse('{"action":"submit","arguments":{},"extra":1}')
+            Action.parse('{"arguments":{},"extra":1}')
         with self.assertRaisesRegex(ActionError, "valid JSON"):
             Action.parse("not-json")
 

@@ -111,7 +111,14 @@ class EvolutionConsumerTests(unittest.TestCase):
         self.assertIn(EvolutionSurface.WORKFLOW, by_surface)
         self.assertIn(EvolutionSurface.SUBJECT, by_surface)
         self.assertIs(by_surface[EvolutionSurface.SUBJECT].target_role, Role.JUDGE)
-        self.assertTrue(all(item.collected and item.validated for item in consumed))
+        # The Warrior workflow proposal is collected and validated; the
+        # Prosecutor's JUDGE-target subject nomination is rejected at
+        # collection (only Warrior-target candidates are shadow-evaluated).
+        workflow_item = by_surface[EvolutionSurface.WORKFLOW]
+        self.assertTrue(workflow_item.collected and workflow_item.validated)
+        subject_item = by_surface[EvolutionSurface.SUBJECT]
+        self.assertFalse(subject_item.collected)
+        self.assertIn("only Warrior-target", subject_item.error)
 
     def test_opt_in_surfaces_are_consumed_when_enabled_and_rejected_when_not(self) -> None:
         from aegis.evolution.control_core import DEFAULT_CONTROL_CORE_POLICY

@@ -162,6 +162,52 @@ def _require_healthy_sandbox(sandbox: SandboxBackend) -> None:
         )
 
 
+def _harness_sync(campaign_id: str) -> Mapping[str, Any]:
+    """Refresh the distro source mirror to the campaign's pinned harness ref.
+
+    Fails closed when the campaign does not enable harness evolution or when
+    the installed WSL harness agent predates the sync_mirror operation (the
+    distro package must be refreshed once via provisioning or from the mirror
+    before the drift loop can be driven remotely).
+    """
+    config = _load(campaign_id)
+    autonomy = config.autonomy_v2
+    if (
+        autonomy is None
+        or not autonomy.harness_evolution_enabled
+        or autonomy.public_repo_url is None
+        or autonomy.harness_source_ref is None
+    ):
+        raise RuntimeError(
+            "harness-sync requires a campaign with harness_evolution_enabled, "
+            "public_repo_url, and harness_source_ref"
+        )
+    from aegis.evolution.harness_backend import HarnessBackendError, WslHarnessBackend
+
+    backend = WslHarnessBackend()
+    operation_id = f"sync-{autonomy.harness_source_ref[:24]}-{os.urandom(4).hex()}"
+    try:
+        receipt = backend.sync_mirror(
+            campaign_id,
+            autonomy.public_repo_url,
+            autonomy.harness_source_ref,
+            operation_id,
+        )
+    except HarnessBackendError as exc:
+        if "unsupported harness operation" in str(exc):
+            raise RuntimeError(
+                "the installed WSL harness agent does not know the sync_mirror "
+                "operation; refresh the distro aegis package once (re-provision "
+                "or install from the source mirror checkout) and retry"
+            ) from exc
+        raise
+    return {
+        "campaign_id": campaign_id,
+        "source_ref": autonomy.harness_source_ref,
+        "receipt": receipt.to_mapping(include_digest=False),
+    }
+
+
 def _evolution_cycle(args: argparse.Namespace) -> Mapping[str, Any]:
     """Cold-start and plan one dynamic v2 cycle without running model ports."""
     config = _load(args.campaign_id)
@@ -979,6 +1025,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip candidate collection, shadow evaluation, and activation for this run",
     )
+    sync = sub.add_parser(
+        "harness-sync",
+        help="refresh the WSL source mirror to the campaign's pinned harness ref",
+    )
+    sync.add_argument("campaign_id")
     return parser
 
 
@@ -1100,6 +1151,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             preflight_report = _run_autonomy_preflight(args.campaign_id)
             _print(preflight_report)
             return 0 if preflight_report["passed"] else 2
+        elif args.command == "harness-sync":
+            _print(_harness_sync(args.campaign_id))
         elif args.command == "evolution-cycle":
             with CampaignExecutionLock(
                 _data_dir() / "events.sqlite3", args.campaign_id
