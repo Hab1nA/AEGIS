@@ -83,6 +83,7 @@ _V2_INTEGER_LIMITS = frozenset(
         "candidate_evaluations_per_cycle", "candidate_max_steps", "population_max_cells",
         "council_max_messages", "council_max_tokens", "task_holdout_delay_cycles",
         "objective_history_window", "objective_probation_cycles", "dependency_download_max_bytes",
+        "sandbox_cpus", "sandbox_memory_gib", "sandbox_pids",
     }
 )
 _V2_NUMBER_LIMITS = frozenset(
@@ -126,6 +127,10 @@ _FLOW_FIELD_BOUNDS: Mapping[str, tuple[int, int]] = {
     "candidate_max_steps": (4, 128),
     "council_max_messages": (2, 64),
     "objective_history_window": (1, 5),
+    "candidate_evaluations_per_cycle": (0, 4),
+    "sandbox_cpus": (1, 8),
+    "sandbox_memory_gib": (1, 8),
+    "sandbox_pids": (64, 1024),
 }
 # Backwards-compatible name used by the legacy amendment reader.
 _ALLOWED_FIELDS = _LEGACY_POLICY_FIELDS_V1
@@ -310,11 +315,6 @@ def _validate_values_v2(
             raise RuntimePolicyError(f"{name} must be a non-negative integer")
         if name in _V2_POSITIVE_INTEGER_LIMITS and raw == 0:
             raise RuntimePolicyError(f"{name} must be positive")
-        if name == "candidate_evaluations_per_cycle" and raw > 1:
-            raise RuntimePolicyError(
-                "candidate_evaluations_per_cycle is a bidirectional 0/1 control; "
-                "the cycle state machine records one paired evaluation artifact"
-            )
         normalized[name] = raw
     for name in _V2_NUMBER_LIMITS:
         normalized[name] = _positive_number(value[name], name)

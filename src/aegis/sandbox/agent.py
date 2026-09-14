@@ -50,6 +50,9 @@ OPERATIONS = frozenset(
         "export",
         "destroy",
         "kill",
+        "save_image",
+        "load_image",
+        "image_exists",
     }
 )
 REQUIRED_CHECKS = (
@@ -278,6 +281,10 @@ class SandboxAgent:
             if operation not in sandbox_operations
             else {"version", "operation", "sandbox_id"}
         )
+        if operation == "save_image":
+            required = {"version", "operation", "image", "destination", "allowed_root"}
+        elif operation == "load_image":
+            required = {"version", "operation", "source", "allowed_root"}
         extra = (
             {"command"}
             if operation == "exec"
@@ -310,6 +317,7 @@ class SandboxAgent:
         optional: set[str] = set()
         if operation == "prepare":
             optional.add("image")
+            optional.add("resources")
         if not (required <= set(data) and set(data) <= (required | extra | optional)):
             raise ValueError("request has missing or unknown fields")
         if not optional and set(data) != (required | extra):
@@ -336,6 +344,20 @@ class SandboxAgent:
                 "ok": True,
                 "scan": self.scan_image(data["image"], data["timeout_seconds"]),
             }
+        if operation == "save_image":
+            return {
+                "ok": True,
+                "blob": self.save_image(
+                    data["image"], data["destination"], data["allowed_root"]
+                ),
+            }
+        if operation == "load_image":
+            return {
+                "ok": True,
+                "loaded": self.load_image(data["source"], data["allowed_root"]),
+            }
+        if operation == "image_exists":
+            return {"ok": True, "available": self.image_exists(data["image"])}
         sandbox_id = _sandbox_id(data.get("sandbox_id"))
         if operation == "destroy":
             self.destroy(sandbox_id)
@@ -345,7 +367,7 @@ class SandboxAgent:
             return {"ok": True}
         self._require_healthy()
         if operation == "prepare":
-            self.prepare(sandbox_id, image=data.get("image"))
+            self.prepare(sandbox_id, image=data.get("image"), resources=data.get("resources"))
             return {"ok": True}
         if operation == "exec":
             return {"ok": True, "result": self.execute(sandbox_id, data["command"])}
@@ -375,6 +397,84 @@ class SandboxAgent:
         if operation == "export":
             result["archive_base64"] = base64.b64encode(archive).decode("ascii")
         return result
+
+    @staticmethod
+    def _validated_blob_path(raw: object, allowed_root: object) -> Path:
+        if not isinstance(raw, str) or not isinstance(allowed_root, str):
+            raise ValueError("blob path and allowed root must be text")
+        destination = Path(raw)
+        root = Path(allowed_root)
+        for candidate in (destination, root):
+            if not candidate.is_absolute() or ".." in candidate.parts:
+                raise ValueError("blob paths must be absolute and traversal-free")
+        resolved_root = root.resolve()
+        resolved = destination.resolve()
+        if resolved_root != resolved and resolved_root not in resolved.parents:
+            raise ValueError("blob path escapes the allowed root")
+        return resolved
+
+    def save_image(
+        self, image: object, destination: object, allowed_root: object
+    ) -> dict[str, Any]:
+        """Persist one digest-pinned image as an archive under allowed_root."""
+        if (
+            not isinstance(image, str)
+            or re.search(r"(?:@sha256:|^sha256:)[0-9a-f]{64}$", image) is None
+        ):
+            raise ValueError("image must be pinned by sha256 digest")
+        path = self._validated_blob_path(destination, allowed_root)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not path.is_file():
+            result = self.runner(
+                [self.config.podman, "save", "-o", str(path), image],
+                input=None,
+                timeout=3600,
+                env=self._podman_env(),
+            )
+            if result.returncode != 0:
+                path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    "podman save failed: " + (result.stderr or "")[-2000:]
+                )
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        return {"sha256": digest.hexdigest(), "size_bytes": size}
+
+    def load_image(self, source: object, allowed_root: object) -> dict[str, Any]:
+        """Restore one archived image into the local podman store."""
+        path = self._validated_blob_path(source, allowed_root)
+        if not path.is_file():
+            raise ValueError("image archive does not exist")
+        result = self.runner(
+            [self.config.podman, "load", "-i", str(path)],
+            input=None,
+            timeout=3600,
+            env=self._podman_env(),
+        )
+        if result.returncode != 0:
+            raise RuntimeError("podman load failed: " + (result.stderr or "")[-2000:])
+        return {"size_bytes": path.stat().st_size}
+
+    def image_exists(self, image: object) -> bool:
+        if (
+            not isinstance(image, str)
+            or re.search(r"(?:@sha256:|^sha256:)[0-9a-f]{64}$", image) is None
+        ):
+            raise ValueError("image must be pinned by sha256 digest")
+        for candidate in (image, f"sha256:{image.rsplit(':', 1)[1]}"):
+            result = self.runner(
+                [self.config.podman, "image", "exists", candidate],
+                input=None,
+                timeout=30,
+                env=self._podman_env(),
+            )
+            if result.returncode == 0:
+                return True
+        return False
 
     def doctor(self) -> list[dict[str, Any]]:
         checks: dict[str, tuple[bool, str]] = {}
@@ -448,7 +548,37 @@ class SandboxAgent:
             {"name": name, "passed": checks[name][0], "detail": checks[name][1]} for name in REQUIRED_CHECKS
         ]
 
-    def prepare(self, sandbox_id: str, image: object = None) -> None:
+    @staticmethod
+    def _validated_resources(raw: object) -> dict[str, int] | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping) or set(raw) - {
+            "cpus",
+            "memory_gib",
+            "pids",
+        }:
+            raise ValueError("sandbox resources envelope is invalid")
+        resources: dict[str, int] = {}
+        for name, low, high in (
+            ("cpus", 1, 8),
+            ("memory_gib", 1, 8),
+            ("pids", 64, 1024),
+        ):
+            value = raw.get(name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"sandbox resource {name} must be an integer")
+            if not low <= value <= high:
+                raise ValueError(
+                    f"sandbox resource {name} must be in [{low},{high}]"
+                )
+            resources[name] = value
+        return resources or None
+
+    def prepare(
+        self, sandbox_id: str, image: object = None, resources: object = None
+    ) -> None:
         root = self._sandbox_path(sandbox_id)
         if root.exists():
             if (root / "prepared").is_file():
@@ -938,9 +1068,7 @@ class SandboxAgent:
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--read-only",
-            f"--pids-limit={self.config.pids_limit}",
-            f"--memory={self.config.memory}",
-            f"--cpus={self.config.cpus}",
+            *self._resource_flags(sandbox_id),
             f"--tmpfs=/tmp:rw,nosuid,nodev,noexec,size={self.config.tmpfs_size}",
             "--userns=keep-id",
             "--workdir",
@@ -956,6 +1084,32 @@ class SandboxAgent:
             WORKER_SOURCE,
         ]
         return argv, child_env
+
+    def _resource_flags(self, sandbox_id: str) -> list[str]:
+        """Per-sandbox resource envelope when policy overrode the defaults.
+
+        The defaults stay the operator-fixed constants; a runtime-policy
+        envelope may only raise them within the bounded legal range that the
+        prepare request already validated.
+        """
+        marker = self._sandbox_path(sandbox_id) / "resources.json"
+        resources: dict[str, int] = {}
+        if marker.is_file():
+            try:
+                loaded = json.loads(marker.read_text(encoding="ascii"))
+            except (OSError, ValueError):
+                loaded = {}
+            if isinstance(loaded, dict):
+                resources = {k: v for k, v in loaded.items() if isinstance(v, int)}
+        pids = resources.get("pids", int(self.config.pids_limit))
+        memory_gib = resources.get("memory_gib")
+        cpus = resources.get("cpus")
+        memory = f"{memory_gib}g" if memory_gib else self.config.memory
+        return [
+            f"--pids-limit={pids}",
+            f"--memory={memory}",
+            f"--cpus={cpus if cpus is not None else self.config.cpus}",
+        ]
 
     def build_podman_command(
         self,
@@ -979,9 +1133,7 @@ class SandboxAgent:
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--read-only",
-            f"--pids-limit={self.config.pids_limit}",
-            f"--memory={self.config.memory}",
-            f"--cpus={self.config.cpus}",
+            *self._resource_flags(sandbox_id),
             f"--tmpfs=/tmp:rw,nosuid,nodev,noexec,size={self.config.tmpfs_size}",
             "--userns=keep-id",
             "--workdir",

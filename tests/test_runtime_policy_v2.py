@@ -48,6 +48,9 @@ def values_v2(**updates: Any) -> dict[str, Any]:
         "max_requests": 100,
         "max_model_invocations": 20,
         "max_active_runtime_seconds": 7200.0,
+        "sandbox_cpus": 1,
+        "sandbox_memory_gib": 1,
+        "sandbox_pids": 256,
         "role_token_shares": {"warrior": 0.5, "judge": 0.25, "prosecutor": 0.25},
         "role_max_steps": role_int(20),
         "role_max_output_tokens": role_int(8192),
@@ -118,13 +121,19 @@ def test_v2_has_no_legacy_economic_fields_and_accepts_values_above_old_caps() ->
     assert "max_cost_usd" not in policy.values
     assert policy.values["build_timeout_seconds"] == 100000.0
 
-    with pytest.raises(RuntimePolicyError, match="bidirectional 0/1"):
-        RuntimePolicyVersion.create(
-            parent_policy_id=None,
-            effective_cycle=0,
-            values=values_v2(candidate_evaluations_per_cycle=2),
-            provider_output_limits=provider_limits(),
-        )
+    # The evaluation budget is now a bounded [0,4] flow parameter: accepted
+    # at genesis (operator-controlled) and bound-checked on prosecutor
+    # amendments through _FLOW_FIELD_BOUNDS.
+    accepted = RuntimePolicyVersion.create(
+        parent_policy_id=None,
+        effective_cycle=0,
+        values=values_v2(candidate_evaluations_per_cycle=2),
+        provider_output_limits=provider_limits(),
+    )
+    assert accepted.values["candidate_evaluations_per_cycle"] == 2
+    from aegis.runtime_policy import _FLOW_FIELD_BOUNDS
+
+    assert _FLOW_FIELD_BOUNDS["candidate_evaluations_per_cycle"] == (0, 4)
 
 
 def test_v1_genesis_migrates_once_to_content_addressed_v2_child(tmp_path: Path) -> None:

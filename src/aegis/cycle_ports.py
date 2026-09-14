@@ -1114,6 +1114,8 @@ class ModelCyclePorts:
                 ),
             )
             self._harness_rollback = HarnessRollbackExecutor(harness_repo)
+        self._image_blob_dir: Path = Path(data_dir) / "artifacts" / "blobs"
+        self._image_blob_index_path: Path = Path(data_dir) / "image_blobs.json"
         self._arm_workspaces: dict[str, bytes] = {}
         self._main_solve_evidence: dict[str, Any] | None = None
         self._main_solve_task_ids: frozenset[str] | None = None
@@ -1441,8 +1443,12 @@ class ModelCyclePorts:
         step_limit = policy_max_steps if max_steps is None else min(max_steps, policy_max_steps)
         binding = runtime_binding if runtime_binding is not None else self._bindings[role]
         image = binding.runtime_image
+        if image is not None and not self._image_available(image):
+            # Distribution store lost the image (reinstall, GC); recover from
+            # the persisted archive instead of failing the whole cycle.
+            self._restore_image_blob(image)
         try:
-            self._sandbox.prepare(sandbox_id, image=image)
+            self._sandbox.prepare(sandbox_id, image=image, resources=self._sandbox_resources())
         except Exception:
             # A previous interrupted run can leave an agent-side residue for a
             # reused id.  Destroy and retry once before failing closed.
@@ -4569,8 +4575,41 @@ class ModelCyclePorts:
             # Harness candidates are causal by construction: the evidence is
             # the frozen agent's dual-worktree canary over the real champion
             # and candidate trees, not a shadow solve with an unchanged
-            # binding.  Fresh-holdout availability does not gate them.
-            return self._evaluate_harness_candidate(result, candidate, snapshot)
+            # binding.  Fresh-holdout availability does not gate them, and
+            # the canary path is cheap enough to run within the evaluation
+            # budget for every queued harness candidate in one cycle.
+            primary = self._evaluate_harness_candidate(result, candidate, snapshot)
+            budget = int(self._policy_value("candidate_evaluations_per_cycle", 1))
+            extras: list[Mapping[str, Any]] = []
+            if budget > 1:
+                evaluated_ids = {candidate.candidate_id}
+                for extra in self._evolution.validated_candidates():
+                    if len(extras) >= budget - 1:
+                        break
+                    if (
+                        extra.target_role is not Role.WARRIOR
+                        or extra.candidate_id in evaluated_ids
+                        or extra.surface is not EvolutionSurface.HARNESS_CODE
+                    ):
+                        continue
+                    evaluated_ids.add(extra.candidate_id)
+                    extra_result: dict[str, Any] = {
+                        "surface": extra.surface.value,
+                        "candidate": {
+                            "candidate_id": extra.candidate_id,
+                            "surface": extra.surface.value,
+                            "artifact_id": extra.artifact_id,
+                            "artifact_sha256": extra.artifact_id.rsplit(":", 1)[1],
+                        },
+                    }
+                    extras.append(
+                        self._evaluate_harness_candidate(
+                            extra_result, extra, snapshot
+                        )
+                    )
+            if extras:
+                primary["extra_evaluations"] = extras
+            return primary
         fresh_exempt = candidate.surface in _FRESH_EXEMPT_SURFACES
         evaluation_cohort = self._candidate_gate_cohort(
             cohort, fresh_required=not fresh_exempt
@@ -4644,6 +4683,9 @@ class ModelCyclePorts:
                 "reproducible": build_receipt.reproducible,
                 "scanner_passed": build_receipt.scanner_passed,
             }
+            blob_receipt = self._persist_image_blob(build_receipt.output_image)
+            if blob_receipt is not None:
+                result["environment_build"]["image_blob"] = blob_receipt
             result["candidate"]["artifact_id"] = candidate_environment_artifact_id(
                 candidate
             )
@@ -5143,6 +5185,85 @@ class ModelCyclePorts:
             descriptor=cell,
         )
         return entry.to_mapping()
+
+    def _persist_image_blob(self, output_image: str) -> Mapping[str, Any] | None:
+        """Archive a newly built runtime image beside the CAS store.
+
+        The blob lives under ``data/artifacts/blobs`` and an index maps the
+        image digest to the archive, so a distribution store loss can be
+        recovered by reloading the archive instead of rebuilding the recipe.
+        """
+        save = getattr(self._sandbox, "save_image", None)
+        if not callable(save):
+            return None
+        digest = str(output_image).rsplit("@sha256:", 1)[-1]
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return None
+        try:
+            receipt = save(
+                output_image,
+                self._image_blob_dir / f"{digest}.tar",
+                allowed_root=self._image_blob_dir,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        index = self._read_image_blob_index()
+        index[digest] = {
+            "output_image": output_image,
+            "blob_sha256": str(receipt.get("sha256", "")),
+            "size_bytes": int(receipt.get("size_bytes", 0)),
+        }
+        self._image_blob_index_path.write_text(
+            json.dumps(index, sort_keys=True), encoding="utf-8"
+        )
+        return dict(receipt)
+
+    def _sandbox_resources(self) -> dict[str, int] | None:
+        """Bounded resource envelope from the runtime policy, when configured."""
+        values: dict[str, int] = {}
+        for key, name in (
+            ("sandbox_cpus", "cpus"),
+            ("sandbox_memory_gib", "memory_gib"),
+            ("sandbox_pids", "pids"),
+        ):
+            value = self._policy_value(key, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                values[name] = value
+        return values or None
+
+    def _image_available(self, runtime_image: str) -> bool:
+        exists = getattr(self._sandbox, "image_available", None)
+        if not callable(exists):
+            return True  # backends without the probe keep their own behavior
+        try:
+            return bool(exists(runtime_image))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    def _restore_image_blob(self, runtime_image: str) -> bool:
+        """Reload a persisted image archive when the store lost the image."""
+        load = getattr(self._sandbox, "load_image", None)
+        if not callable(load):
+            return False
+        digest = str(runtime_image).rsplit("@sha256:", 1)[-1]
+        entry = self._read_image_blob_index().get(digest)
+        if not isinstance(entry, Mapping):
+            return False
+        blob_path = self._image_blob_dir / f"{digest}.tar"
+        if not blob_path.is_file():
+            return False
+        try:
+            load(blob_path, allowed_root=self._image_blob_dir)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return True
+
+    def _read_image_blob_index(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self._image_blob_index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     def _execute_rollback_order(
         self, order: RollbackOrder, snapshot: CurriculumSnapshot
@@ -5787,9 +5908,39 @@ class ModelCyclePorts:
             }
         harness_pending = candidate_evidence.get("harness_qualification_pending")
         if isinstance(harness_pending, Mapping):
-            return self._qualify_harness_candidate(
+            qualified = self._qualify_harness_candidate(
                 snapshot, candidate_evaluation, harness_pending
             )
+            extras = candidate_evidence.get("extra_evaluations")
+            extra_activations: list[Mapping[str, Any]] = []
+            if isinstance(extras, list):
+                for extra in extras:
+                    if not isinstance(extra, Mapping):
+                        continue
+                    extra_pending = extra.get("harness_qualification_pending")
+                    if not isinstance(extra_pending, Mapping):
+                        continue
+                    extra_qualified = self._qualify_harness_candidate(
+                        snapshot, candidate_evaluation, extra_pending
+                    )
+                    if extra_qualified.get("qualified"):
+                        extra_activations.append(
+                            {
+                                "candidate_id": extra_qualified["candidate_id"],
+                                "role_version_id": extra_qualified["qualified"][
+                                    Role.WARRIOR.value
+                                ],
+                                "harness_candidate_commit": extra_qualified[
+                                    "harness_candidate_commit"
+                                ],
+                                "harness_expected_champion": extra_qualified[
+                                    "harness_expected_champion"
+                                ],
+                            }
+                        )
+            if extra_activations:
+                qualified["extra_activations"] = extra_activations
+            return qualified
         pending = candidate_evidence.get("qualification_pending")
         if not isinstance(pending, Mapping):
             return {
@@ -6111,6 +6262,42 @@ class ModelCyclePorts:
             record = self._activation_journal.projection.records[intent.intent_id]
             if not record.completed:
                 raise RuntimeError("activation saga did not reach a completed state")
+        extra_activations = evidence.get("extra_activations")
+        extra_intents: list[str] = []
+        if isinstance(extra_activations, list):
+            for extra in extra_activations:
+                if not isinstance(extra, Mapping):
+                    continue
+                extra_candidate_id = extra.get("candidate_id")
+                extra_role_version = extra.get("role_version_id")
+                if not isinstance(extra_candidate_id, str) or not isinstance(
+                    extra_role_version, str
+                ):
+                    continue
+                current_active = self._roles.projection.current_active_set
+                if current_active is None:
+                    raise RuntimeError("activation extras require an active set")
+                extra_intent = ActivationIntent.create(
+                    evolution_candidate_id=extra_candidate_id,
+                    role_candidate_id=extra_role_version,
+                    mcp_candidate_id=None,
+                    objective_id=snapshot.objective.objective_id,
+                    qualification_evidence_id=qualification.artifact_id,
+                    expected_current_active_set_id=current_active.active_role_set_id,
+                    harness_candidate_commit=(
+                        extra["harness_candidate_commit"]
+                        if isinstance(extra.get("harness_candidate_commit"), str)
+                        else None
+                    ),
+                    harness_expected_champion=(
+                        extra["harness_expected_champion"]
+                        if isinstance(extra.get("harness_expected_champion"), str)
+                        else None
+                    ),
+                )
+                self._activation_journal.begin(extra_intent)
+                self._activation_reconciler().reconcile()
+                extra_intents.append(extra_intent.intent_id)
         active = self._roles.projection.current_active_set
         if active is None:
             raise RuntimeError("activation set commit did not produce an active set")
@@ -6119,6 +6306,7 @@ class ModelCyclePorts:
             "active_set": active.active_role_set_id,
             "revision": active.revision,
             "intent_id": intent.intent_id,
+            "extra_intent_ids": extra_intents,
         }
 
     def _activation_reconciler(self) -> ActivationReconciler:
@@ -6598,6 +6786,9 @@ def _runtime_policy_genesis_values(
         "candidate_evaluations_per_cycle": 1,
         "candidate_max_steps": int(getattr(autonomy, "candidate_max_extra_steps", 24)),
         "population_max_cells": 128,
+        "sandbox_cpus": 1,
+        "sandbox_memory_gib": 1,
+        "sandbox_pids": 256,
         "council_max_messages": int(getattr(autonomy, "council_max_messages", 200)),
         "council_max_tokens": int(getattr(autonomy, "council_max_tokens", 4_194_304)),
         "task_holdout_delay_cycles": int(getattr(autonomy, "task_holdout_delay_cycles", 1)),

@@ -220,7 +220,13 @@ class WslSandboxBackend:
             )
         return check
 
-    def prepare(self, sandbox_id: str, *, image: str | None = None) -> PreparedSandbox:
+    def prepare(
+        self,
+        sandbox_id: str,
+        *,
+        image: str | None = None,
+        resources: Mapping[str, int] | None = None,
+    ) -> PreparedSandbox:
         self._require_healthy()
         self._validate_id(sandbox_id)
         payload: dict[str, object] = {
@@ -235,6 +241,12 @@ class WslSandboxBackend:
             ):
                 raise ValueError("sandbox image must be pinned by sha256 digest")
             payload["image"] = image
+        if resources is not None:
+            if not isinstance(resources, Mapping):
+                raise TypeError("resources must be a mapping")
+            payload["resources"] = {
+                str(key): int(value) for key, value in resources.items()
+            }
         self._request(payload, timeout=60)
         return PreparedSandbox(sandbox_id)
 
@@ -460,6 +472,53 @@ class WslSandboxBackend:
         if not isinstance(raw, Mapping):
             raise RuntimeError("sandbox agent omitted scan result")
         return dict(raw)
+
+    def image_available(self, image: str) -> bool:
+        """True when the digest-pinned image exists in the local store."""
+        response = self._request(
+            {"version": 1, "operation": "image_exists", "image": image},
+            timeout=30,
+        )
+        return bool(response.get("available", False))
+
+    def save_image(
+        self, image: str, destination: Path, *, allowed_root: Path
+    ) -> dict[str, Any]:
+        """Persist a digest-pinned image archive under the allowed root."""
+        if not isinstance(destination, Path) or not isinstance(allowed_root, Path):
+            raise TypeError("image blob paths must be Path instances")
+        response = self._request(
+            {
+                "version": 1,
+                "operation": "save_image",
+                "image": image,
+                "destination": str(destination),
+                "allowed_root": str(allowed_root),
+            },
+            timeout=3600,
+        )
+        blob = response.get("blob")
+        if not isinstance(blob, Mapping):
+            raise RuntimeError("sandbox agent omitted image blob receipt")
+        return dict(blob)
+
+    def load_image(self, source: Path, *, allowed_root: Path) -> dict[str, Any]:
+        """Restore an archived image into the local podman store."""
+        if not isinstance(source, Path) or not isinstance(allowed_root, Path):
+            raise TypeError("image blob paths must be Path instances")
+        response = self._request(
+            {
+                "version": 1,
+                "operation": "load_image",
+                "source": str(source),
+                "allowed_root": str(allowed_root),
+            },
+            timeout=3600,
+        )
+        loaded = response.get("loaded")
+        if not isinstance(loaded, Mapping):
+            raise RuntimeError("sandbox agent omitted image load receipt")
+        return dict(loaded)
 
     def _artifact_request(self, operation: str, sandbox_id: str) -> FrozenArtifact:
         self._validate_id(sandbox_id)
