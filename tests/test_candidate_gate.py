@@ -121,6 +121,38 @@ class CandidateGateTests(unittest.TestCase):
 
         self.assertEqual(report.disposition, CandidateGateDisposition.NO_FRESH_EVIDENCE)
 
+    def test_fresh_exempt_surface_qualifies_by_regression_noninferiority(self) -> None:
+        from aegis.attribution.candidate_gate import CandidateGatePolicy
+
+        policy = CandidateGatePolicy(fresh_required=False)
+        report = evaluate_candidate_gate(
+            (
+                pair(11, baseline_fresh=None, regression_delta=-0.004),
+                pair(22, baseline_fresh=None, regression_delta=-0.006),
+            ),
+            policy,
+        )
+
+        self.assertTrue(report.qualified)
+        self.assertEqual(report.disposition, CandidateGateDisposition.QUALIFIED)
+        self.assertIn("regression-only qualification", report.reason)
+
+    def test_fresh_exempt_surface_still_rejects_regression(self) -> None:
+        from aegis.attribution.candidate_gate import CandidateGatePolicy
+
+        policy = CandidateGatePolicy(fresh_required=False)
+        report = evaluate_candidate_gate(
+            (
+                pair(11, baseline_fresh=None, regression_delta=-0.05),
+                pair(22, baseline_fresh=None, regression_delta=-0.05),
+            ),
+            policy,
+        )
+
+        self.assertEqual(
+            report.disposition, CandidateGateDisposition.REGRESSION_REJECTED
+        )
+
     def test_integrity_is_a_non_compensable_hard_gate(self) -> None:
         report = evaluate_candidate_gate(
             (

@@ -330,6 +330,18 @@ def _should_expand_seeds(
     return 0.0 < mean_fresh < gate_report.policy.fresh_improvement
 
 
+# Surfaces whose candidate benefit is capability expansion rather than a
+# fresh-task score improvement: they qualify through regression
+# noninferiority alone and may be evaluated on a HOF/anchor-only cohort.
+_FRESH_EXEMPT_SURFACES = frozenset(
+    {
+        EvolutionSurface.ENVIRONMENT,
+        EvolutionSurface.PLUGIN,
+        EvolutionSurface.MCP,
+    }
+)
+
+
 def _population_fitness(gate_report: Any) -> float:
     """Archive fitness from the qualification path a candidate actually took.
 
@@ -4198,16 +4210,23 @@ class ModelCyclePorts:
         }
 
     def _candidate_gate_cohort(
-        self, cohort: DynamicTaskCohort
+        self, cohort: DynamicTaskCohort, *, fresh_required: bool = True
     ) -> DynamicTaskCohort | None:
-        """Add fixed anchors only when Fresh evidence has no regression peer."""
+        """Add fixed anchors only when Fresh evidence has no regression peer.
+
+        With ``fresh_required=False`` (capability-expansion surfaces) a
+        HOF/anchor-only cohort is a valid evaluation design, so a stalled
+        task supply no longer blocks those surfaces' evolution.
+        """
         eligible = [
             member
             for member in cohort.members
             if self._dynamic.record(member.artifact_id).status
             is not DynamicTaskStatus.REJECTED
         ]
-        if not any(member.tier is CohortTier.FRESH_HOLDOUT for member in eligible):
+        if fresh_required and not any(
+            member.tier is CohortTier.FRESH_HOLDOUT for member in eligible
+        ):
             return None
         if any(member.tier is CohortTier.HALL_OF_FAME for member in eligible):
             return DynamicTaskCohort.create(cohort.target_generation, tuple(eligible))
@@ -4389,6 +4408,36 @@ class ModelCyclePorts:
                 ),
                 None,
             )
+        # Stale pre-rejection: a candidate whose parent is no longer the
+        # current champion can never pass the registry's activation staleness
+        # check, so rejecting it here saves a full paired evaluation slot.
+        if candidate is not None:
+            champion = self._evolution.champion(candidate.surface, candidate.target_role)
+            parent_id = candidate.parent_candidate_id
+            if champion is not None and parent_id != champion.candidate_id:
+                self._evolution.reject(
+                    candidate.candidate_id,
+                    reason=(
+                        "candidate is superseded: its parent is no longer the "
+                        "current champion"
+                    ),
+                )
+                result["rejected"].append(
+                    {
+                        "surface": candidate.surface.value,
+                        "target_role": candidate.target_role.value,
+                        "artifact_id": candidate.artifact_id,
+                        "error": "candidate superseded by a newer champion",
+                    }
+                )
+                candidate = next(
+                    (
+                        item
+                        for item in self._evolution.validated_candidates()
+                        if item.target_role is Role.WARRIOR
+                    ),
+                    None,
+                )
         # Non-Warrior candidates cannot run a Warrior-solve shadow arm; reject
         # them every cycle with an explicit reason instead of letting them
         # linger in VALIDATED (a Warrior candidate in the same cycle must not
@@ -4522,7 +4571,10 @@ class ModelCyclePorts:
             # and candidate trees, not a shadow solve with an unchanged
             # binding.  Fresh-holdout availability does not gate them.
             return self._evaluate_harness_candidate(result, candidate, snapshot)
-        evaluation_cohort = self._candidate_gate_cohort(cohort)
+        fresh_exempt = candidate.surface in _FRESH_EXEMPT_SURFACES
+        evaluation_cohort = self._candidate_gate_cohort(
+            cohort, fresh_required=not fresh_exempt
+        )
         if evaluation_cohort is None:
             result["activation"] = {
                 "activated": False,
@@ -4657,6 +4709,8 @@ class ModelCyclePorts:
             enforce_cost_limit=promotion.enforce_cost_limit,
             min_seed_delta_floor=promotion.min_seed_delta_floor,
             cost_savings_path=promotion.cost_savings_path,
+            fresh_required=candidate.surface
+            not in _FRESH_EXEMPT_SURFACES,
         )
         evaluator_fingerprint = "sealed-evaluator-sha256:" + hashlib.sha256(
             canonical_json(

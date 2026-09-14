@@ -169,6 +169,10 @@ class CandidateGatePolicy:
     enforce_cost_limit: bool = False
     min_seed_delta_floor: float = -0.10
     cost_savings_path: float = 0.10
+    # Surfaces whose benefit is capability expansion rather than fresh-task
+    # score (environment, plugin, mcp) set this False: the gate then judges
+    # regression noninferiority alone and skips the fresh hard rejection.
+    fresh_required: bool = True
 
     def __post_init__(self) -> None:
         if isinstance(self.required_seeds, bool) or not isinstance(self.required_seeds, int):
@@ -188,6 +192,8 @@ class CandidateGatePolicy:
                 raise ValueError(f"{name} must be finite and in [0,1]")
         if not isinstance(self.enforce_cost_limit, bool):
             raise TypeError("enforce_cost_limit must be bool")
+        if not isinstance(self.fresh_required, bool):
+            raise TypeError("fresh_required must be bool")
         floor = self.min_seed_delta_floor
         if isinstance(floor, bool) or not isinstance(floor, (int, float)):
             raise TypeError("min_seed_delta_floor must be numeric")
@@ -205,6 +211,7 @@ class CandidateGatePolicy:
             "enforce_cost_limit": self.enforce_cost_limit,
             "min_seed_delta_floor": float(self.min_seed_delta_floor),
             "cost_savings_path": float(self.cost_savings_path),
+            "fresh_required": self.fresh_required,
         }
 
     @classmethod
@@ -216,7 +223,7 @@ class CandidateGatePolicy:
             "max_total_cost_increase",
             "enforce_cost_limit",
         }
-        optional = {"min_seed_delta_floor", "cost_savings_path"}
+        optional = {"min_seed_delta_floor", "cost_savings_path", "fresh_required"}
         unknown = set(value) - expected - optional
         if unknown:
             raise ValueError("candidate gate policy has unknown fields")
@@ -232,6 +239,7 @@ class CandidateGatePolicy:
             enforce_cost_limit=value["enforce_cost_limit"],
             min_seed_delta_floor=value.get("min_seed_delta_floor", -0.10),
             cost_savings_path=value.get("cost_savings_path", 0.10),
+            fresh_required=value.get("fresh_required", True),
         )
 
 
@@ -468,7 +476,8 @@ def evaluate_candidate_gate(
             CandidateGateDisposition.INTEGRITY_REJECTED,
             "integrity failure is non-compensable",
         )
-    if any(arm.fresh_quality is None for arm in arms):
+    fresh_absent = any(arm.fresh_quality is None for arm in arms)
+    if fresh_absent and applied.fresh_required:
         return _report(
             pairs,
             applied,
@@ -489,13 +498,17 @@ def evaluate_candidate_gate(
         candidate_fresh = pair.candidate.fresh_quality
         baseline_regression = pair.baseline.regression_quality
         candidate_regression = pair.candidate.regression_quality
-        assert baseline_fresh is not None and candidate_fresh is not None
         assert baseline_regression is not None and candidate_regression is not None
+        fresh_delta = (
+            0.0
+            if baseline_fresh is None or candidate_fresh is None
+            else candidate_fresh - baseline_fresh
+        )
         result_rows.append(
             CandidateSeedResult(
                 pair.seed,
                 pair.candidate.overall_quality - pair.baseline.overall_quality,
-                candidate_fresh - baseline_fresh,
+                fresh_delta,
                 candidate_regression - baseline_regression,
             )
         )
@@ -544,6 +557,20 @@ def evaluate_candidate_gate(
                 f"regression delta collapsed below the per-seed floor "
                 f"{applied.min_seed_delta_floor:.4f} for seeds "
                 f"{','.join(map(str, floored_regression))}"
+            ),
+            results=results,
+        )
+    if fresh_absent:
+        # Fresh-exempt surface: noninferior regression across all seeds is
+        # itself the qualification, so capability-expansion candidates (new
+        # environments, plugins, MCP servers) are not blocked by task supply.
+        return _report(
+            pairs,
+            applied,
+            CandidateGateDisposition.QUALIFIED,
+            (
+                "regression-only qualification (fresh evidence not required "
+                f"for this surface): mean regression delta {mean_regression:.4f}"
             ),
             results=results,
         )

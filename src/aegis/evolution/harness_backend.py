@@ -155,6 +155,10 @@ class HarnessBackend(Protocol):
         operation_id: str,
     ) -> HarnessReceipt: ...
 
+    def advance_champion(
+        self, campaign_id: str, target_commit: str, operation_id: str
+    ) -> HarnessReceipt: ...
+
     def cleanup_candidate(
         self, campaign_id: str, candidate_id: str, operation_id: str
     ) -> HarnessReceipt: ...
@@ -336,6 +340,14 @@ class WslHarnessBackend:
             operation_id,
             failed_commit=failed_commit,
             target_commit=target_commit,
+        )
+
+    def advance_champion(
+        self, campaign_id: str, target_commit: str, operation_id: str
+    ) -> HarnessReceipt:
+        _commit(target_commit, "target_commit")
+        return self._request(
+            "advance_champion", campaign_id, operation_id, target_commit=target_commit
         )
 
     def cleanup_candidate(

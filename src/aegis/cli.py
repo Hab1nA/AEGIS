@@ -208,6 +208,60 @@ def _harness_sync(campaign_id: str) -> Mapping[str, Any]:
     }
 
 
+def _harness_advance(campaign_id: str, target_ref: str) -> Mapping[str, Any]:
+    """Advance the running campaign champion to a newer pinned source commit.
+
+    The operator evolves the host repo (frozen files included), pushes it to
+    the public source, updates ``harness_source_ref``, then runs this command:
+    mirror refresh + champion advance + pinned-ref migration happen in one
+    fail-closed step, and the next cycle checkpoints candidates against the
+    new pin.  Destroys nothing: the previous champion stays as
+    last-known-good for rollback.
+    """
+    config = _load(campaign_id)
+    autonomy = config.autonomy_v2
+    if (
+        autonomy is None
+        or not autonomy.harness_evolution_enabled
+        or autonomy.public_repo_url is None
+        or autonomy.harness_source_ref is None
+    ):
+        raise RuntimeError(
+            "harness-advance requires a campaign with harness_evolution_enabled, "
+            "public_repo_url, and harness_source_ref"
+        )
+    from aegis.evolution.harness_backend import HarnessBackendError, WslHarnessBackend
+
+    backend = WslHarnessBackend()
+    sync_receipt = backend.sync_mirror(
+        campaign_id,
+        autonomy.public_repo_url,
+        target_ref,
+        f"sync-{target_ref[:24]}-{os.urandom(4).hex()}",
+    )
+    try:
+        advance_receipt = backend.advance_champion(
+            campaign_id,
+            target_ref,
+            f"advance-{target_ref[:24]}-{os.urandom(4).hex()}",
+        )
+    except HarnessBackendError as exc:
+        if "unsupported harness operation" in str(exc):
+            raise RuntimeError(
+                "the installed WSL harness agent does not know the "
+                "advance_champion operation; refresh the distro aegis package "
+                "once and retry"
+            ) from exc
+        raise
+    return {
+        "campaign_id": campaign_id,
+        "previous_source_ref": autonomy.harness_source_ref,
+        "advanced_to": target_ref,
+        "sync": sync_receipt.to_mapping(include_digest=False),
+        "advance": advance_receipt.to_mapping(include_digest=False),
+    }
+
+
 def _evolution_cycle(args: argparse.Namespace) -> Mapping[str, Any]:
     """Cold-start and plan one dynamic v2 cycle without running model ports."""
     config = _load(args.campaign_id)
@@ -505,6 +559,8 @@ def _run_v2_cycle_wsl_first(config: CampaignConfig) -> Mapping[str, Any]:
         raise RuntimeError("production WSL harness runtime is not enabled")
     if autonomy.public_repo_url is None or autonomy.harness_source_ref is None:
         raise RuntimeError("production harness requires a public URL and pinned source ref")
+    from aegis.evolution.harness_backend import HarnessBackendError
+
     credentials = _gateway_credentials_from_env()
     from aegis.evolution.wsl_deployment import WslEvolutionDeployment
 
@@ -526,6 +582,20 @@ def _run_v2_cycle_wsl_first(config: CampaignConfig) -> Mapping[str, Any]:
         autonomy.harness_source_ref,
         f"ensure-{autonomy.harness_source_ref[:24]}",
     )
+    # Drift loop, automatic: the distro mirror is refreshed to the operator
+    # pin before every launch, so newly advanced host code is available for
+    # candidate checkpointing without a manual harness-sync.  Best-effort: an
+    # older distro agent without the sync operation must not block launches.
+    sync_warning: str | None = None
+    try:
+        backend.sync_mirror(
+            config.campaign_id,
+            autonomy.public_repo_url,
+            autonomy.harness_source_ref,
+            f"sync-{autonomy.harness_source_ref[:24]}-{os.urandom(4).hex()}",
+        )
+    except HarnessBackendError as exc:
+        sync_warning = f"mirror sync skipped: {exc}"[:512]
     status = backend.status(
         config.campaign_id,
         f"status-{os.urandom(8).hex()}",
@@ -578,6 +648,8 @@ def _run_v2_cycle_wsl_first(config: CampaignConfig) -> Mapping[str, Any]:
             response["harness_boot_receipt"] = receipt.to_mapping()
             response["cycle_generation"] = generation
             response["gateway_metering"] = status_response.get("metering")
+            if sync_warning is not None:
+                response["sync_warning"] = sync_warning
             metering = status_response.get("metering")
             if (
                 isinstance(metering, Mapping)
@@ -1101,6 +1173,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="refresh the WSL source mirror to the campaign's pinned harness ref",
     )
     sync.add_argument("campaign_id")
+    advance = sub.add_parser(
+        "harness-advance",
+        help="advance the running campaign champion to a newer pinned source commit",
+    )
+    advance.add_argument("campaign_id")
+    advance.add_argument("target_ref", help="full 40/64-hex commit to advance to")
     return parser
 
 
@@ -1224,6 +1302,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if preflight_report["passed"] else 2
         elif args.command == "harness-sync":
             _print(_harness_sync(args.campaign_id))
+        elif args.command == "harness-advance":
+            _print(_harness_advance(args.campaign_id, args.target_ref))
         elif args.command == "evolution-cycle":
             with CampaignExecutionLock(
                 _data_dir() / "events.sqlite3", args.campaign_id

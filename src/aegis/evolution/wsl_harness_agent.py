@@ -78,6 +78,7 @@ class HarnessAgent:
             "canary",
             "activate",
             "rollback",
+            "advance_champion",
             "cleanup_candidate",
         }:
             raise AgentError("unsupported harness operation")
@@ -492,6 +493,44 @@ class HarnessAgent:
         state["champion_commit"] = target
         _atomic_json(campaign / "state.json", state)
         return self._values("rolled_back", target, previous=failed)
+
+    def _advance_champion(
+        self, campaign: Path, campaign_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Operator action: move the champion to a newer pinned source commit.
+
+        This is how host-side evolution (control-plane fixes to frozen files)
+        enters a running campaign — the reverse of a candidate checkpoint.
+        Fails closed unless the target descends from the current champion and
+        passes the frozen-tree structural checks; the campaign's pinned
+        source_ref moves with it so future candidates diff against the new
+        pin.
+        """
+        del campaign_id
+        repo = self._repo(campaign)
+        target = _commit(request.get("target_commit"), "target_commit")
+        state = _read_object(campaign / "state.json")
+        current = self._resolve(repo, "refs/aegis/champion")
+        if current != target:
+            if not self._is_ancestor(repo, current, target):
+                raise AgentError(
+                    "advance target is not a descendant of the current champion"
+                )
+            self._validate_tree(
+                repo,
+                target,
+                source_ref=self._campaign_source_ref(campaign),
+                meta_evolution_enabled=True,
+            )
+            _git(repo, "update-ref", "refs/aegis/champion", target, current)
+        self._add_worktree(campaign, "champion", target)
+        state["champion_commit"] = target
+        state["last_known_good"] = current if current != target else state.get("last_known_good")
+        state["source_ref"] = target
+        _atomic_json(campaign / "state.json", state)
+        return self._values(
+            "advanced", target, previous=current, detail="champion advanced by operator"
+        )
 
     def _cleanup_candidate(
         self, campaign: Path, campaign_id: str, request: Mapping[str, Any]

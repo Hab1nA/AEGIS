@@ -97,6 +97,10 @@ class _Backend:
         self.calls.append(("ensure", *args))
         return SimpleNamespace()
 
+    def sync_mirror(self, *args: Any) -> SimpleNamespace:
+        self.calls.append(("sync", *args))
+        return SimpleNamespace()
+
     def status(self, *args: Any) -> SimpleNamespace:
         self.calls.append(("status", *args))
         return SimpleNamespace(champion_commit=SOURCE_REF)
@@ -180,6 +184,7 @@ def test_production_cycle_prepares_and_launches_pinned_champion() -> None:
         SOURCE_REF,
         "ensure-" + SOURCE_REF[:24],
     )
+    assert backend.calls[1][0] == "sync"
     args, kwargs = launch_calls[0]
     assert kwargs["gateway_credentials"]["api_key"] == "sk-test"
     assert kwargs["gateway_credentials"]["base_url"].startswith("https://")
