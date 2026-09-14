@@ -297,6 +297,44 @@ WSL 沙箱、`max_agent_steps=24`（运行时 `role_max_steps=24`，与 campaign
   `e2e-forge-20260817` 亦已验证成功注册。重试全真运行时 relay 返回
   “无效的令牌”（HTTP 401），需刷新 `AEGIS_OPENAI_API_KEY` 后重跑。
 
+## 4e. WSL-first 生效链与进化有效性改造（2026-09-14）
+
+针对独立彻底性审计的三重断裂（harness-code 记账有效但运行时无效、双臂同绑定
+零因果、试用期方向反转），实施 WSL-first 架构：
+
+- **双层启动**：Tier 1 严格 boot 探针（mount/pid namespace + setpriv + 微型
+  rlimit）导入 champion entrypoint 并握手；Tier 2 分离执行器以
+  `PYTHONPATH=champion worktree/src` 运行真实全周期（固定 `_CYCLE_BOOTSTRAP`
+  拥有状态文件，champion 只拥有 `run_cycle`）。launch 即返回，宿主经
+  `cycle_status`/`cancel_cycle` 轮询与取消。
+- **受信网关 sidecar**（`aegis.gateway_sidecar`，发行版固定安装）：中继凭据
+  只进 sidecar 进程；champion 只见 loopback URL；每次请求落 JSONL 计量，
+  宿主对账（完成 cycle 计量为零而产物存在 → 拒绝）；上游经
+  `validate_url_target` SSRF 防护并钉住解析 IP（防 DNS rebinding）。
+- **本地传输**：发行版内 `LocalAgentSandboxBackend`/`LocalHarnessBackend`
+  直接调用固定 agent，协议与校验不变。
+- **frozen 字节比对信任锚**：harness agent 对 candidate/champion/回滚目标树
+  与 campaign 钉住的 `source_ref` 做 diff，所有变更路径必须在可进化授予根内
+  （meta 标志经 checkpoint 持久化）。frozen 面（评测/沙箱/发布/记账/控制面）
+  在整树即运行树的前提下依然不可触碰。
+- **harness-code 因果评测**：新增 harness agent `canary` 操作——冻结代理在
+  champion 与 candidate 两个 worktree 双跑确定性测试子集（根映射、显式命令
+  覆盖、零回归门槛），替代同绑定伪影臂；Fresh holdout 不再是 harness 面的
+  前置；资格走 `harness_qualification_pending` durable 分支，激活经 reconciler
+  翻转 champion ref，下一代 boot 探针与检察官回滚令监管实际效果。
+- **去保守**：试用期 breach 修正为真非劣（`delta < -margin`），单面 breach
+  不再阻断其余面观察；MAP-Elites fitness 从硬编码 1.0 改为按合格路径边际
+  （fresh 均值/饱和回归均值/成本节省比）；Fresh 硬依赖按面分派
+  （environment/plugin/mcp 面 `fresh_required=False`，回归非劣即资格，cohort
+  允许 HOF/anchor-only）；stale 预拒绝（superseded 候选不再烧评测名额）；
+  自动 sync_mirror + `harness-advance` 命令（宿主前进的 pinned commit 一步
+  推进运行中 campaign）。
+- **结构容量**：`candidate_evaluations_per_cycle` 放宽为 [0,4] 流程参数
+  （harness 面批量评测 + sequential activation saga）；镜像持久化
+  （save_image/load_image/image_exists 操作 + blobs 目录 + 缺失自动恢复）；
+  资源信封（`sandbox_cpus`/`sandbox_memory_gib`/`sandbox_pids` 有界修正案
+  字段，默认维持 1/1/256）。
+
 ## 5. 信任边界
 
 - 模型不能修改权限、预算、隐藏测试、评分、沙箱或晋升门。

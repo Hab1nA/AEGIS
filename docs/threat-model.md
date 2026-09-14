@@ -19,6 +19,20 @@ Warrior, Judge, Prosecutor, downloaded web content, task code, dependencies, and
 - Request capacity reserved before transport; actual usage is committed or the reservation is released. Production fake sandboxes and unconfigured online research fail closed.
 - Killing the local WSL client is not considered container cleanup. The WSL agent explicitly runs rootless `podman rm --force --time 0` for both the main and sealed evaluator container names on timeout, bounded-output failure, abnormal execution, stop, and kill. Missing containers are idempotent; other Podman cleanup failures remain durable campaign failures.
 
+## Enforced controls (WSL-first, 2026-09-14)
+
+- Gateway credentials live only in the fixed in-distro sidecar process; the
+  champion executor sees a loopback URL, never a key.  The sidecar pins the
+  upstream to SSRF-validated addresses (rebinding-safe) and meters every
+  request to a JSONL ledger the host reconciles after each cycle.
+- The supervisor launches exactly `refs/aegis/champion`: Tier 1 probe with
+  namespace isolation and tiny rlimits, Tier 2 detached executor with
+  generous but bounded rlimits and no credential environment.
+- The harness agent byte-compares every candidate/rollback tree against the
+  campaign's pinned source ref: changed paths must fall inside the evolvable
+  harness grant, so frozen files stay frozen even though the whole tree is
+  what executes.
+
 ## Residual risk
 
 WSL2 is not equivalent to a separately administered remote machine. Hypervisor, kernel, Podman, filesystem, and WSL integration defects remain possible. The bootstrap renderer only stages configuration beneath an explicitly selected root; an operator must install it in a dedicated distribution, enable the service, and verify the independent mount. High-value or hostile workloads should use a disposable Hyper-V or remote VM backend.
