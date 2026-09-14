@@ -36,7 +36,13 @@ Transport = Callable[[Mapping[str, Any], float], Mapping[str, Any]]
 
 @dataclass(frozen=True, slots=True)
 class CycleLaunchReceipt:
-    """Durable evidence for one attempt to boot the active champion."""
+    """Durable evidence for one attempt to launch the active champion.
+
+    ``status="launched"`` receipts are produced by the two-tier supervisor:
+    the boot probe passed and the real cycle executor was spawned detached.
+    Cycle completion is observed through :meth:`WslSupervisor.cycle_status`,
+    not through this receipt.
+    """
 
     operation_id: str
     campaign_id: str
@@ -54,10 +60,12 @@ class CycleLaunchReceipt:
     output_summary: str
     request_sha256: str
     receipt_sha256: str
+    cycle_generation: int | None = None
+    cycle_pid: int | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> CycleLaunchReceipt:
-        fields = {
+        legacy_fields = {
             "operation_id",
             "campaign_id",
             "campaign_key",
@@ -75,7 +83,10 @@ class CycleLaunchReceipt:
             "request_sha256",
             "receipt_sha256",
         }
-        if set(raw) != fields:
+        extended_fields = legacy_fields | {"cycle_generation", "cycle_pid"}
+        if set(raw) == legacy_fields:
+            raw = {**raw, "cycle_generation": None, "cycle_pid": None}
+        elif set(raw) != extended_fields:
             raise WslSupervisorError("cycle launch receipt has missing or unknown fields")
         receipt = cls(
             operation_id=_text(raw["operation_id"], "operation_id", 128),
@@ -94,6 +105,8 @@ class CycleLaunchReceipt:
             output_summary=_bounded_summary(raw["output_summary"]),
             request_sha256=_digest(raw["request_sha256"], "request_sha256"),
             receipt_sha256=_digest(raw["receipt_sha256"], "receipt_sha256"),
+            cycle_generation=_optional_generation(raw["cycle_generation"]),
+            cycle_pid=_optional_pid(raw["cycle_pid"]),
         )
         if receipt.receipt_sha256 != _sha256(receipt.to_mapping(include_digest=False)):
             raise WslSupervisorError("cycle launch receipt digest mismatch")
@@ -101,10 +114,16 @@ class CycleLaunchReceipt:
             not receipt.import_ok or not receipt.heartbeat_ok or receipt.exit_code != 0
         ):
             raise WslSupervisorError("completed receipt lacks a successful boot handshake")
+        if receipt.status == "launched" and (
+            not receipt.import_ok or not receipt.heartbeat_ok or receipt.cycle_pid is None
+        ):
+            raise WslSupervisorError("launched receipt lacks a probe handshake and cycle pid")
         if receipt.status == "boot_failed" and receipt.failure_kind not in {
             "launch_failed",
             "import_failed",
             "heartbeat_failed",
+            "probe_runtime_failed",
+            "output_limit",
         }:
             raise WslSupervisorError("boot_failed receipt lacks a typed boot failure")
         return receipt
@@ -127,6 +146,9 @@ class CycleLaunchReceipt:
             "output_summary": self.output_summary,
             "request_sha256": self.request_sha256,
         }
+        if self.cycle_generation is not None or self.cycle_pid is not None:
+            value["cycle_generation"] = self.cycle_generation
+            value["cycle_pid"] = self.cycle_pid
         if include_digest:
             value["receipt_sha256"] = self.receipt_sha256
         return value
@@ -169,12 +191,15 @@ class WslSupervisor:
         expected_commit: str,
         operation_id: str,
         request_payload: Mapping[str, Any],
+        *,
+        gateway_credentials: Mapping[str, Any] | None = None,
     ) -> CycleLaunchReceipt:
         _text(campaign_id, "campaign_id", 512)
         _commit(expected_commit, "expected_commit")
         if _SAFE_OPERATION_ID.fullmatch(operation_id) is None:
             raise ValueError("operation_id is unsafe")
         payload = _validate_payload(request_payload)
+        credentials = _validate_credentials(gateway_credentials)
         request = {
             "version": 1,
             "operation": "launch_cycle",
@@ -182,8 +207,12 @@ class WslSupervisor:
             "campaign_id": campaign_id,
             "expected_commit": expected_commit,
             "request_payload": payload,
+            "gateway_credentials": credentials,
         }
-        encoded = canonical_json(request).encode("utf-8")
+        # Receipt binding hashes the credential-free request, matching the agent.
+        encoded = canonical_json(
+            {key: value for key, value in request.items() if key != "gateway_credentials"}
+        ).encode("utf-8")
         if len(encoded) > _MAX_REQUEST_BYTES:
             raise ValueError("cycle launch request exceeds its size limit")
         response = self._transport(request, self._timeout)
@@ -205,6 +234,46 @@ class WslSupervisor:
         ):
             raise WslSupervisorError("cycle launch receipt is bound to another request")
         return receipt
+
+    def cycle_status(self, campaign_id: str, generation: int, operation_id: str) -> Mapping[str, Any]:
+        """Bounded read of one detached cycle's status, result, and metering."""
+        _text(campaign_id, "campaign_id", 512)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError("generation must be a positive integer")
+        if _SAFE_OPERATION_ID.fullmatch(operation_id) is None:
+            raise ValueError("operation_id is unsafe")
+        request = {
+            "version": 1,
+            "operation": "cycle_status",
+            "operation_id": operation_id,
+            "campaign_id": campaign_id,
+            "generation": generation,
+        }
+        response = self._transport(request, self._timeout)
+        if not isinstance(response, Mapping) or response.get("ok") is not True:
+            message = str(response.get("message", "cycle status failed")) if isinstance(response, Mapping) else "cycle status failed"
+            raise WslSupervisorError(f"cycle status failed: {message[:512]}")
+        return response
+
+    def cancel_cycle(self, campaign_id: str, generation: int, operation_id: str) -> Mapping[str, Any]:
+        """Kill a detached cycle executor and mark it cancelled."""
+        _text(campaign_id, "campaign_id", 512)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError("generation must be a positive integer")
+        if _SAFE_OPERATION_ID.fullmatch(operation_id) is None:
+            raise ValueError("operation_id is unsafe")
+        request = {
+            "version": 1,
+            "operation": "cancel_cycle",
+            "operation_id": operation_id,
+            "campaign_id": campaign_id,
+            "generation": generation,
+        }
+        response = self._transport(request, self._timeout)
+        if not isinstance(response, Mapping) or response.get("ok") is not True:
+            message = str(response.get("message", "cycle cancel failed")) if isinstance(response, Mapping) else "cycle cancel failed"
+            raise WslSupervisorError(f"cycle cancel failed: {message[:512]}")
+        return response
 
     def _wsl_transport(self, request: Mapping[str, Any], timeout: float) -> Mapping[str, Any]:
         wire = canonical_json(request) + "\n"
@@ -307,9 +376,51 @@ def _boolean(value: object, name: str) -> bool:
 
 
 def _status(value: object) -> str:
-    if value not in {"completed", "boot_failed", "failed"}:
+    if value not in {"completed", "boot_failed", "failed", "launched"}:
         raise WslSupervisorError("invalid cycle launch status")
     assert isinstance(value, str)
+    return value
+
+
+def _validate_credentials(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("gateway_credentials must be an object")
+    allowed = {"base_url", "api_key", "user_agent", "timeout_seconds"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"gateway_credentials has unknown fields: {sorted(unknown)}")
+    if not isinstance(value.get("base_url"), str) or not isinstance(value.get("api_key"), str):
+        raise ValueError("gateway_credentials require base_url and api_key strings")
+    normalized: dict[str, Any] = {}
+    for key in sorted(allowed):
+        item = value.get(key)
+        if item is None:
+            continue
+        if not isinstance(item, str) or "\x00" in item or len(item.encode()) > 2048:
+            raise ValueError(f"gateway credential {key} is invalid")
+        normalized[key] = item
+    if not str(normalized.get("base_url", "")).startswith("https://"):
+        raise ValueError("gateway credential base_url must be HTTPS")
+    return normalized
+
+
+def _optional_generation(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise WslSupervisorError("cycle_generation is invalid")
+    return value
+
+
+def _optional_pid(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 1:
+        raise WslSupervisorError("cycle_pid is invalid")
     return value
 
 

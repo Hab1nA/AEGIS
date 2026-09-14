@@ -109,6 +109,24 @@ class ExtractUsageTests(unittest.TestCase):
         self.assertFalse(usage.verified)
         self.assertIn("cached_tokens_exceed_input_tokens", usage.anomalies)
 
+    def test_zero_output_with_nonempty_text_is_flagged(self) -> None:
+        usage = extract_usage(
+            {"usage": {"input_tokens": 50, "output_tokens": 0}},
+            _request(),
+            "nonempty completion",
+        )
+        self.assertFalse(usage.verified)
+        self.assertIn("zero_output_tokens_with_nonempty_text", usage.anomalies)
+
+    def test_zero_output_with_empty_text_stays_verified(self) -> None:
+        usage = extract_usage(
+            {"usage": {"input_tokens": 50, "output_tokens": 0}},
+            _request(),
+            "",
+        )
+        self.assertTrue(usage.verified)
+        self.assertEqual(usage.anomalies, ())
+
     def test_anomaly_summary_is_exposable(self) -> None:
         from aegis.cycle_ports import _usage_summary
 

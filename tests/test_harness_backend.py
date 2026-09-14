@@ -81,6 +81,7 @@ def test_backend_uses_typed_bounded_requests() -> None:
             "campaign_id": CAMPAIGN,
             "candidate_id": "candidate-1",
             "base_commit": COMMIT_A,
+            "meta_evolution_enabled": False,
             "changes": [
                 {
                     "path": "src/aegis/evolution/example.py",

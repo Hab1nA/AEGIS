@@ -1,25 +1,20 @@
-"""Fixed candidate-side entrypoint used by the trusted WSL supervisor.
+"""Candidate-side entrypoint used by the trusted WSL supervisor.
 
 Harness candidates may evolve :func:`run_cycle`, but cannot choose which
-module or command the supervisor executes.  The default implementation is a
-minimal deterministic heartbeat-compatible cycle hook.
+module or command the supervisor executes.  The default implementation runs
+the standard full v2 cycle through :mod:`aegis.wsl_cycle_runtime`; evolved
+candidates may replace the cycle flow itself — the frozen-path byte
+comparison against the pinned source ref, the supervisor protocol, and the
+credential sidecar remain outside that authority.
 """
 
 from __future__ import annotations
 
-import hashlib
-from collections.abc import Mapping
-from typing import Any
-
-from aegis.models import canonical_json
+from typing import Any, Mapping
 
 
 def run_cycle(request_payload: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Run the active harness cycle hook and return bounded JSON evidence."""
+    """Run the active harness cycle and return bounded JSON evidence."""
+    from aegis.wsl_cycle_runtime import execute_standard_cycle
 
-    return {
-        "accepted": True,
-        "request_sha256": hashlib.sha256(
-            canonical_json(request_payload).encode("utf-8")
-        ).hexdigest(),
-    }
+    return execute_standard_cycle(request_payload)

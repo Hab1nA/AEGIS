@@ -121,10 +121,21 @@ class HarnessBackend(Protocol):
         base_commit: str,
         changes: Sequence[Mapping[str, Any]],
         operation_id: str,
+        meta_evolution_enabled: bool = False,
     ) -> HarnessReceipt: ...
 
     def validate(
         self, campaign_id: str, candidate_id: str, candidate_commit: str, operation_id: str
+    ) -> HarnessReceipt: ...
+
+    def canary(
+        self,
+        campaign_id: str,
+        candidate_id: str,
+        operation_id: str,
+        *,
+        canary_command: Sequence[str] | None = None,
+        timeout_seconds: float = 300.0,
     ) -> HarnessReceipt: ...
 
     def activate(
@@ -226,6 +237,7 @@ class WslHarnessBackend:
         base_commit: str,
         changes: Sequence[Mapping[str, Any]],
         operation_id: str,
+        meta_evolution_enabled: bool = False,
     ) -> HarnessReceipt:
         _commit(base_commit, "base_commit")
         if not candidate_id or len(candidate_id.encode("utf-8")) > 256:
@@ -244,10 +256,16 @@ class WslHarnessBackend:
             candidate_id=candidate_id,
             base_commit=base_commit,
             changes=normalized,
+            meta_evolution_enabled=bool(meta_evolution_enabled),
         )
 
     def validate(
-        self, campaign_id: str, candidate_id: str, candidate_commit: str, operation_id: str
+        self,
+        campaign_id: str,
+        candidate_id: str,
+        candidate_commit: str,
+        operation_id: str,
+        meta_evolution_enabled: bool = False,
     ) -> HarnessReceipt:
         _commit(candidate_commit, "candidate_commit")
         return self._request(
@@ -256,6 +274,30 @@ class WslHarnessBackend:
             operation_id,
             candidate_id=candidate_id,
             candidate_commit=candidate_commit,
+            meta_evolution_enabled=bool(meta_evolution_enabled),
+        )
+
+    def canary(
+        self,
+        campaign_id: str,
+        candidate_id: str,
+        operation_id: str,
+        *,
+        canary_command: Sequence[str] | None = None,
+        timeout_seconds: float = 300.0,
+    ) -> HarnessReceipt:
+        _bounded_text(campaign_id, "campaign_id", 512)
+        if not candidate_id or len(candidate_id.encode("utf-8")) > 256:
+            raise ValueError("candidate_id must be bounded non-empty text")
+        if not 0 < float(timeout_seconds) <= 3600:
+            raise ValueError("canary timeout_seconds is outside the safe range")
+        payload: dict[str, Any] = {
+            "timeout_seconds": float(timeout_seconds),
+        }
+        if canary_command is not None:
+            payload["canary_command"] = [str(item) for item in canary_command]
+        return self._request(
+            "canary", campaign_id, operation_id, candidate_id=candidate_id, **payload
         )
 
     def activate(
@@ -265,6 +307,7 @@ class WslHarnessBackend:
         candidate_commit: str,
         expected_champion: str,
         operation_id: str,
+        meta_evolution_enabled: bool = False,
     ) -> HarnessReceipt:
         _commit(candidate_commit, "candidate_commit")
         _commit(expected_champion, "expected_champion")
@@ -275,6 +318,7 @@ class WslHarnessBackend:
             candidate_id=candidate_id,
             candidate_commit=candidate_commit,
             expected_champion=expected_champion,
+            meta_evolution_enabled=bool(meta_evolution_enabled),
         )
 
     def rollback(
@@ -435,3 +479,15 @@ def _digest(value: object, name: str) -> str:
 
 def _receipt_digest(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+class LocalHarnessBackend(WslHarnessBackend):
+    """In-distro harness transport for the WSL-first cycle executor.
+
+    The cycle runs inside the distribution, so harness operations reach the
+    fixed harness agent directly instead of through ``wsl.exe``.  Request
+    validation, receipts, and the fixed agent path are identical.
+    """
+
+    def transport_argv(self) -> tuple[str, ...]:
+        return (self.agent_path,)

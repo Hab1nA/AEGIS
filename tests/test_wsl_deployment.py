@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aegis.cli import _prepare_wsl_harness_runtime, main
+from aegis.cli import _run_v2_cycle_wsl_first, main
 from aegis.config import CampaignConfig
 from aegis.dynamic_tasks import DynamicTaskRegistry
 from aegis.evolution.wsl_deployment import (
@@ -78,6 +79,7 @@ def test_bootstrap_contains_fixed_agents_and_bounded_ext4_harness_volume() -> No
 
     assert "/usr/local/bin/aegis-harness-agent" in rendered
     assert "/usr/local/bin/aegis-supervisor-agent" in rendered
+    assert "/usr/local/bin/aegis-gateway-sidecar" in rendered
     assert "/usr/local/bin/aegis-evolution-doctor" in rendered
     helper = rendered["/usr/local/libexec/aegis-evolution-volume-setup"]
     assert f"SIZE={HARNESS_VOLUME_BYTES}" in helper
@@ -104,36 +106,73 @@ class _Backend:
         return SimpleNamespace()
 
 
+def _thin_client_env() -> dict[str, str]:
+    return {
+        "AEGIS_OPENAI_BASE_URL": "https://relay.example.invalid/v1",
+        "AEGIS_OPENAI_API_KEY": "sk-test",
+    }
+
+
 def test_production_cycle_prepares_and_launches_pinned_champion() -> None:
     config = _production_config()
     backend = _Backend()
     launch = SimpleNamespace(
-        status="completed",
+        status="launched",
         failure_kind=None,
         executed_commit=SOURCE_REF,
         last_known_good=SOURCE_REF,
+        import_ok=True,
+        heartbeat_ok=True,
+        cycle_generation=1,
+        cycle_pid=4242,
+        to_mapping=lambda: {"status": "launched"},
     )
-    supervisor = SimpleNamespace(launch_cycle=lambda *args: launch)
+    status_payloads = iter(
+        [
+            {"status": "running", "metering": {"requests": 3}},
+            {
+                "status": "completed",
+                "metering": {"requests": 3},
+                "cycle_result": {
+                    "campaign_id": "production",
+                    "state": "completed",
+                    "artifacts": {"submission": "artifact-sha256:" + "a" * 64},
+                },
+            },
+        ]
+    )
+    supervisor = SimpleNamespace(
+        launch_cycle=lambda *args, **kwargs: launch,
+        cycle_status=lambda *args, **kwargs: next(status_payloads),
+    )
     healthy = SimpleNamespace(
         doctor=lambda: DoctorReport((DoctorCheck("healthy", True, "ok"),))
     )
-    with tempfile.TemporaryDirectory() as directory:
-        registry = DynamicTaskRegistry(Path(directory) / "tasks.sqlite3")
-        try:
-            with (
-                patch("aegis.cli.WslHarnessBackend", return_value=backend),
-                patch("aegis.cli.WslSupervisor", return_value=supervisor),
-                patch(
-                    "aegis.evolution.wsl_deployment.WslEvolutionDeployment",
-                    return_value=healthy,
-                ),
-            ):
-                selected, receipt = _prepare_wsl_harness_runtime(config, registry)
-        finally:
-            registry.close()
+    launch_calls: list[tuple] = []
 
-    assert selected is backend
-    assert receipt is launch
+    def record_launch(*args: Any, **kwargs: Any) -> Any:
+        launch_calls.append((args, kwargs))
+        return launch
+
+    supervisor.launch_cycle = record_launch
+    with patch.dict(
+        os.environ,
+        {key: value for key, value in _thin_client_env().items()},
+    ):
+        with (
+            patch("aegis.cli.WslHarnessBackend", return_value=backend),
+            patch("aegis.cli.WslSupervisor", return_value=supervisor),
+            patch(
+                "aegis.evolution.wsl_deployment.WslEvolutionDeployment",
+                return_value=healthy,
+            ),
+            patch("time.sleep", lambda *_: None),
+        ):
+            response = _run_v2_cycle_wsl_first(config)
+
+    assert response["state"] == "completed"
+    assert response["cycle_generation"] == 1
+    assert response["gateway_metering"] == {"requests": 3}
     assert backend.calls[0] == (
         "ensure",
         "production",
@@ -141,6 +180,9 @@ def test_production_cycle_prepares_and_launches_pinned_champion() -> None:
         SOURCE_REF,
         "ensure-" + SOURCE_REF[:24],
     )
+    args, kwargs = launch_calls[0]
+    assert kwargs["gateway_credentials"]["api_key"] == "sk-test"
+    assert kwargs["gateway_credentials"]["base_url"].startswith("https://")
     assert all(call[0] != "rollback" for call in backend.calls)
 
 
@@ -153,28 +195,28 @@ def test_boot_failure_automatically_rolls_back_lkg() -> None:
         failure_kind="import_failed",
         executed_commit=failed,
         last_known_good=SOURCE_REF,
+        import_ok=False,
+        heartbeat_ok=False,
+        cycle_generation=None,
+        cycle_pid=None,
     )
     healthy = SimpleNamespace(
         doctor=lambda: DoctorReport((DoctorCheck("healthy", True, "ok"),))
     )
-    with tempfile.TemporaryDirectory() as directory:
-        registry = DynamicTaskRegistry(Path(directory) / "tasks.sqlite3")
-        try:
-            with (
-                patch("aegis.cli.WslHarnessBackend", return_value=backend),
-                patch(
-                    "aegis.cli.WslSupervisor",
-                    return_value=SimpleNamespace(launch_cycle=lambda *args: launch),
-                ),
-                patch(
-                    "aegis.evolution.wsl_deployment.WslEvolutionDeployment",
-                    return_value=healthy,
-                ),
-                pytest.raises(RuntimeError, match="failed to boot"),
-            ):
-                _prepare_wsl_harness_runtime(config, registry)
-        finally:
-            registry.close()
+    with patch.dict(os.environ, _thin_client_env()):
+        with (
+            patch("aegis.cli.WslHarnessBackend", return_value=backend),
+            patch(
+                "aegis.cli.WslSupervisor",
+                return_value=SimpleNamespace(launch_cycle=lambda *args, **kwargs: launch),
+            ),
+            patch(
+                "aegis.evolution.wsl_deployment.WslEvolutionDeployment",
+                return_value=healthy,
+            ),
+            pytest.raises(RuntimeError, match="failed to boot"),
+        ):
+            _run_v2_cycle_wsl_first(config)
 
     rollback = [call for call in backend.calls if call[0] == "rollback"]
     assert rollback

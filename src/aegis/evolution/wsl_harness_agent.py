@@ -28,6 +28,7 @@ from aegis.models import canonical_json
 
 from .harness import validate_harness_patch_paths
 from .source import SOURCE_MIRROR_PATH, is_local_source_mirror
+from .surfaces import validate_harness_path
 
 CAMPAIGNS_ROOT = Path("/var/lib/aegis/campaigns")
 _fcntl: Any | None
@@ -74,6 +75,7 @@ class HarnessAgent:
             "sync_mirror",
             "checkpoint",
             "validate",
+            "canary",
             "activate",
             "rollback",
             "cleanup_candidate",
@@ -249,14 +251,24 @@ class HarnessAgent:
         except (TypeError, RuntimeError) as exc:
             raise AgentError(str(exc)) from exc
         token = _candidate_key(candidate_id)
+        meta_evolution_enabled = request.get("meta_evolution_enabled") is True
+        source_ref = self._campaign_source_ref(campaign)
         candidate_ref = f"refs/aegis/candidates/{token}"
         worktree = campaign / "worktrees" / f"candidate-{token}"
         existing = _git(
             repo, "show-ref", "--verify", "--hash", candidate_ref, check=False
         ).stdout.strip()
         if isinstance(existing, str) and existing:
-            self._validate_tree(repo, existing)
+            self._validate_tree(
+                repo,
+                existing,
+                source_ref=source_ref,
+                meta_evolution_enabled=meta_evolution_enabled,
+            )
             return self._values("checkpointed", base, candidate=existing)
+        flag_path = campaign / "candidates" / f"{token}.json"
+        flag_path.parent.mkdir(mode=0o700, exist_ok=True)
+        _atomic_json(flag_path, {"meta_evolution_enabled": meta_evolution_enabled})
         if worktree.exists():
             _git(repo, "worktree", "remove", "--force", "--", str(worktree), check=False)
             shutil.rmtree(worktree, ignore_errors=True)
@@ -276,7 +288,12 @@ class HarnessAgent:
                 f"AEGIS candidate {token}",
             )
             commit = self._resolve(worktree, "HEAD")
-            self._validate_tree(repo, commit)
+            self._validate_tree(
+                repo,
+                commit,
+                source_ref=source_ref,
+                meta_evolution_enabled=meta_evolution_enabled,
+            )
             _git(repo, "update-ref", candidate_ref, commit, "0" * len(commit))
         except Exception:
             _git(repo, "worktree", "remove", "--force", "--", str(worktree), check=False)
@@ -294,12 +311,132 @@ class HarnessAgent:
         actual = self._resolve(repo, f"refs/aegis/candidates/{_candidate_key(candidate_id)}")
         if actual != expected:
             raise AgentError("candidate ref does not match candidate_commit")
-        self._validate_tree(repo, actual)
+        self._validate_tree(
+            repo,
+            actual,
+            source_ref=self._campaign_source_ref(campaign),
+            meta_evolution_enabled=self._candidate_meta_flag(campaign, candidate_id),
+        )
         if not self._is_ancestor(repo, self._resolve(repo, "refs/aegis/champion"), actual):
             raise AgentError("candidate is not based on current champion")
         return self._values(
             "validated", self._resolve(repo, "refs/aegis/champion"), candidate=actual
         )
+
+    def _canary(
+        self, campaign: Path, campaign_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Dual-arm worktree canary: baseline champion tree vs candidate tree.
+
+        The fixed agent selects the deterministic tests from the changed
+        paths (or runs the explicitly configured canary command verbatim) and
+        executes both arms inside their own worktrees with that tree's
+        ``src`` on ``PYTHONPATH``.  Champion code never selects or runs its
+        own exam.
+        """
+        del campaign_id
+        repo = self._repo(campaign)
+        candidate_id = _required(request, "candidate_id", 256)
+        token = _candidate_key(candidate_id)
+        timeout = request.get("timeout_seconds", 300.0)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not 0 < float(timeout) <= 3600
+        ):
+            raise AgentError("canary timeout_seconds is outside the safe range")
+        timeout = float(timeout)
+        candidate_commit = self._resolve(repo, f"refs/aegis/candidates/{token}")
+        champion_commit = self._resolve(repo, "refs/aegis/champion")
+        candidate_worktree = campaign / "worktrees" / f"candidate-{token}"
+        if not candidate_worktree.is_dir():
+            raise AgentError("candidate worktree is missing; checkpoint first")
+        champion_worktree = self._add_worktree(campaign, "champion", champion_commit)
+        changed = [
+            line.strip()
+            for line in _git(
+                repo, "diff", "--name-only", champion_commit, candidate_commit
+            ).stdout.splitlines()
+            if line.strip()
+        ]
+        argv = self._canary_argv(request.get("canary_command"), changed)
+        baseline = self._run_canary_arm(champion_worktree, argv, timeout)
+        candidate = self._run_canary_arm(candidate_worktree, argv, timeout)
+        detail = canonical_json(
+            {
+                "baseline": baseline,
+                "candidate_arm": candidate,
+                "tests": list(argv),
+            }
+        )
+        return self._values(
+            "canary_completed",
+            champion_commit,
+            candidate=candidate_commit,
+            detail=detail[:4096],
+        )
+
+    @staticmethod
+    def _canary_argv(explicit: Any, changed: Sequence[str]) -> tuple[str, ...]:
+        if isinstance(explicit, list):
+            if not explicit or len(explicit) > 8 or any(
+                not isinstance(item, str) or not item or len(item) > 256 for item in explicit
+            ):
+                raise AgentError("canary_command must be a bounded list of short strings")
+            return tuple(explicit)
+        from .harness import CANARY_ROOT_TESTS, DEFAULT_CANARY_TEST, MAX_CANARY_TESTS
+
+        selected: list[str] = [DEFAULT_CANARY_TEST]
+        for path in changed:
+            for root, tests in CANARY_ROOT_TESTS.items():
+                if path == root or path.startswith(root):
+                    for test in tests:
+                        if test not in selected:
+                            selected.append(test)
+        selected = selected[:MAX_CANARY_TESTS]
+        return (sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *selected)
+
+    @staticmethod
+    def _run_canary_arm(worktree: Path, argv: Sequence[str], timeout: float) -> dict[str, Any]:
+        env = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "PYTHONPATH": str(worktree / "src"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+        }
+        try:
+            compile_run = subprocess.run(
+                (sys.executable, "-m", "compileall", "-q", "-f", "src/aegis"),
+                cwd=worktree,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=min(timeout, 120.0),
+                check=False,
+            )
+            if compile_run.returncode != 0:
+                return {
+                    "ok": False,
+                    "exit_code": compile_run.returncode,
+                    "reason": f"compileall failed: {compile_run.stderr[-240:]}",
+                }
+            run = subprocess.run(
+                tuple(argv),
+                cwd=worktree,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "exit_code": None, "reason": "canary arm timed out"}
+        reason = "passed" if run.returncode == 0 else run.stdout[-300:] or run.stderr[-300:]
+        return {"ok": run.returncode == 0, "exit_code": run.returncode, "reason": reason[:300]}
 
     def _activate(
         self, campaign: Path, campaign_id: str, request: Mapping[str, Any]
@@ -311,7 +448,12 @@ class HarnessAgent:
         expected = _commit(request.get("expected_champion"), "expected_champion")
         if self._resolve(repo, f"refs/aegis/candidates/{_candidate_key(candidate_id)}") != candidate:
             raise AgentError("candidate ref does not match candidate_commit")
-        self._validate_tree(repo, candidate)
+        self._validate_tree(
+            repo,
+            candidate,
+            source_ref=self._campaign_source_ref(campaign),
+            meta_evolution_enabled=self._candidate_meta_flag(campaign, candidate_id),
+        )
         current = self._resolve(repo, "refs/aegis/champion")
         if current != candidate:
             if current != expected:
@@ -335,7 +477,12 @@ class HarnessAgent:
         state = _read_object(campaign / "state.json")
         if state.get("last_known_good") != target:
             raise AgentError("rollback target is not the recorded last-known-good commit")
-        self._validate_tree(repo, target)
+        self._validate_tree(
+            repo,
+            target,
+            source_ref=self._campaign_source_ref(campaign),
+            meta_evolution_enabled=True,
+        )
         current = self._resolve(repo, "refs/aegis/champion")
         if current != target:
             if current != failed:
@@ -408,7 +555,14 @@ class HarnessAgent:
             destination.write_bytes(content)
             destination.chmod(0o755 if raw["executable"] else 0o644)
 
-    def _validate_tree(self, repo: Path, commit: str) -> None:
+    def _validate_tree(
+        self,
+        repo: Path,
+        commit: str,
+        *,
+        source_ref: str | None = None,
+        meta_evolution_enabled: bool = False,
+    ) -> None:
         listing = _git(repo, "ls-tree", "-r", "-z", "--full-tree", commit).stdout
         total = 0
         for entry in listing.split("\0"):
@@ -431,6 +585,61 @@ class HarnessAgent:
                 assert isinstance(content, bytes)
                 if _SECRET_CONTENT.search(content):
                     raise AgentError(f"secret-like content is forbidden: {path}")
+        if source_ref is not None:
+            self._validate_frozen_paths(
+                repo, source_ref, commit, meta_evolution_enabled
+            )
+
+    def _validate_frozen_paths(
+        self,
+        repo: Path,
+        source_ref: str,
+        commit: str,
+        meta_evolution_enabled: bool,
+    ) -> None:
+        """Byte-equality trust anchor against the pinned source ref.
+
+        Every path that differs from the operator-pinned source tree must lie
+        inside the evolvable harness grant.  Frozen files (evaluation,
+        sandbox, publishing, connectors, accounting, the control plane) and
+        everything outside ``src/aegis`` are rejected, so a candidate commit
+        cannot weaken the exam, the jail, the score, or the ledger even when
+        the whole tree is what actually executes.
+        """
+        changed = _git(
+            repo, "diff", "--name-only", "-z", "--", source_ref, commit
+        ).stdout
+        for raw_path in changed.split("\0"):
+            if not raw_path:
+                continue
+            path = _safe_relative(raw_path).as_posix()
+            try:
+                validate_harness_path(
+                    path, meta_evolution_enabled=meta_evolution_enabled
+                )
+            except (TypeError, RuntimeError) as exc:
+                raise AgentError(
+                    f"candidate modifies a frozen path outside the harness "
+                    f"grant: {path} ({exc})"
+                ) from exc
+
+    @staticmethod
+    def _candidate_meta_flag(campaign: Path, candidate_id: str) -> bool:
+        flag_path = campaign / "candidates" / f"{_candidate_key(candidate_id)}.json"
+        if not flag_path.is_file():
+            return False
+        record = _read_object(flag_path)
+        return record.get("meta_evolution_enabled") is True
+
+    @staticmethod
+    def _campaign_source_ref(campaign: Path) -> str | None:
+        state = _read_object(campaign / "state.json")
+        source_ref = state.get("source_ref")
+        if source_ref is None:
+            return None
+        if not isinstance(source_ref, str) or _COMMIT.fullmatch(source_ref) is None:
+            raise AgentError("campaign state carries an invalid source_ref")
+        return source_ref
 
     @staticmethod
     def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:

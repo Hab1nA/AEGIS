@@ -69,7 +69,7 @@ def extract_usage(
             out_details = usage.get("output_tokens_details")
             if isinstance(out_details, Mapping) and isinstance(out_details.get("reasoning_tokens"), int):
                 reasoning = int(out_details["reasoning_tokens"])
-            return _finalize(request, TokenUsage(input_tokens, output_tokens, cached, reasoning, True))
+            return _finalize(request, TokenUsage(input_tokens, output_tokens, cached, reasoning, True), text)
         # Some compatibility relays answer the Responses endpoint with
         # chat-completions-shaped usage (prompt/completion tokens).
         prompt_tokens = usage.get("prompt_tokens")
@@ -82,13 +82,13 @@ def extract_usage(
             reasoning = usage.get("reasoning_tokens")
             if not isinstance(reasoning, int):
                 reasoning = 0
-            return _finalize(request, TokenUsage(prompt_tokens, completion_tokens, cached, reasoning, True))
+            return _finalize(request, TokenUsage(prompt_tokens, completion_tokens, cached, reasoning, True), text)
     # Conservative, explicitly unverified approximation for relays omitting usage.
     input_chars = sum(len(m.content) for m in request.messages)
     return TokenUsage(math.ceil(input_chars / 3), math.ceil(len(text) / 3), verified=False)
 
 
-def _finalize(request: "GatewayRequest", usage: TokenUsage) -> TokenUsage:
+def _finalize(request: "GatewayRequest", usage: TokenUsage, text: str) -> TokenUsage:
     anomalies: list[str] = []
     verified = True
     if usage.output_tokens > request.max_output_tokens:
@@ -99,6 +99,13 @@ def _finalize(request: "GatewayRequest", usage: TokenUsage) -> TokenUsage:
         verified = False
     if usage.cached_tokens > usage.input_tokens:
         anomalies.append("cached_tokens_exceed_input_tokens")
+        verified = False
+    if usage.output_tokens == 0 and usage.input_tokens > 0 and text.strip():
+        # A non-empty completion with zero billed output tokens is a free-output
+        # claim: plausible only if the relay genuinely produced nothing, which
+        # the non-empty text excludes.  Zero is a *possible* number, so it
+        # slips past the impossibility checks above — flag it explicitly.
+        anomalies.append("zero_output_tokens_with_nonempty_text")
         verified = False
     if not anomalies:
         return usage

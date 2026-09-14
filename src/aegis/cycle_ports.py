@@ -1081,6 +1081,9 @@ class ModelCyclePorts:
             )
         self._harness_canary: HarnessCanaryRunner | None = None
         self._harness_rollback: HarnessRollbackExecutor | None = None
+        self._harness_canary_command: tuple[str, ...] | None = (
+            tuple(harness_canary_command) if harness_canary_command is not None else None
+        )
         if harness_repo is not None:
             self._harness_canary = HarnessCanaryRunner(
                 harness_repo,
@@ -3952,6 +3955,248 @@ class ModelCyclePorts:
             ),
         }
 
+    def _evaluate_harness_candidate(
+        self,
+        result: dict[str, Any],
+        candidate: Any,
+        snapshot: CurriculumSnapshot,
+    ) -> dict[str, Any]:
+        """Checkpoint, validate, and dual-arm canary one harness-code candidate.
+
+        The causal evidence for a harness change is the frozen agent's
+        worktree canary: the deterministic suite runs against the real
+        champion tree and the real candidate tree, and only zero regression
+        on a passing baseline qualifies.  The shadow sealed-arm machinery is
+        bypassed — with an unchanged runtime binding it would measure noise,
+        not the candidate.  Qualification commits durably in
+        ``qualify_role_candidates``; activation flips the champion ref
+        through the reconciler, and the next launch's boot probe plus the
+        Prosecutor's rollback orders police the live effect.
+        """
+        if self._harness_backend is None and (
+            self._harness_canary is None or self._harness_repo is None
+        ):
+            self._evolution.reject(
+                candidate.candidate_id,
+                reason=(
+                    "harness_code surface enabled but no harness repository "
+                    "is configured"
+                ),
+            )
+            result["rejected"].append(
+                {
+                    "surface": candidate.surface.value,
+                    "target_role": candidate.target_role.value,
+                    "artifact_id": candidate.artifact_id,
+                    "error": "WSL harness backend is not configured",
+                }
+            )
+            result["role_generations"] = self._record_role_generations(snapshot)
+            return result
+        try:
+            content = _load_json_artifact(
+                self._artifacts, "harness-code", candidate.artifact_id
+            )
+            candidate_commit: str | None = None
+            expected_champion: str | None = None
+            if self._harness_backend is not None:
+                if self._harness_campaign_id is None:
+                    raise RuntimeError("harness campaign identity is missing")
+                checkpoint = self._harness_backend.checkpoint(
+                    self._harness_campaign_id,
+                    candidate.candidate_id,
+                    str(content["base_commit"]),
+                    cast(Sequence[Mapping[str, Any]], content["changes"]),
+                    f"checkpoint:{candidate.candidate_id.rsplit(':', 1)[1][:32]}",
+                    meta_evolution_enabled=self._meta_evolution_enabled,
+                )
+                if checkpoint.candidate_commit is None:
+                    raise RuntimeError("WSL harness checkpoint omitted candidate commit")
+                validation = self._harness_backend.validate(
+                    self._harness_campaign_id,
+                    candidate.candidate_id,
+                    checkpoint.candidate_commit,
+                    f"validate:{candidate.candidate_id.rsplit(':', 1)[1][:32]}",
+                    meta_evolution_enabled=self._meta_evolution_enabled,
+                )
+                canary_receipt = self._harness_backend.canary(
+                    self._harness_campaign_id,
+                    candidate.candidate_id,
+                    f"canary:{candidate.candidate_id.rsplit(':', 1)[1][:32]}",
+                    canary_command=self._harness_canary_command,
+                    timeout_seconds=300.0,
+                )
+                try:
+                    canary_detail = json.loads(canary_receipt.detail)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "harness canary receipt carried unreadable detail"
+                    ) from exc
+                baseline_arm = canary_detail.get("baseline")
+                candidate_arm = canary_detail.get("candidate_arm")
+                if not isinstance(baseline_arm, Mapping) or not isinstance(
+                    candidate_arm, Mapping
+                ):
+                    raise RuntimeError("harness canary receipt omitted an arm")
+                if not baseline_arm.get("ok"):
+                    raise HarnessEvolutionError(
+                        "harness canary baseline arm failed; refusing to "
+                        "qualify on unknown ground"
+                    )
+                if not candidate_arm.get("ok"):
+                    raise HarnessEvolutionError(
+                        "harness canary candidate arm regressed the "
+                        "deterministic suite"
+                    )
+                evidence_ref = self._artifacts.put_json(
+                    "harness-validation",
+                    {
+                        "checkpoint": checkpoint.to_mapping(),
+                        "validation": validation.to_mapping(),
+                        "canary": canary_receipt.to_mapping(),
+                        "canary_detail": canary_detail,
+                    },
+                )
+                candidate_commit = checkpoint.candidate_commit
+                expected_champion = checkpoint.champion_commit
+                result["harness_worktree"] = {
+                    "candidate_commit": candidate_commit,
+                    "champion_commit": expected_champion,
+                    "evidence_id": evidence_ref.artifact_id,
+                }
+            else:
+                assert self._harness_canary is not None
+                changes = changes_to_git_file_changes(content["changes"])
+                verdict = self._harness_canary.run(content, changes)
+                evidence_ref = self._artifacts.put_json(
+                    "harness-canary", verdict.to_mapping()
+                )
+                result["harness_canary"] = {
+                    "passed": verdict.passed,
+                    "reason": verdict.reason,
+                    "evidence_id": evidence_ref.artifact_id,
+                }
+                if not verdict.passed:
+                    raise HarnessEvolutionError(
+                        f"harness canary failed: {verdict.reason}"
+                    )
+        except (
+            HarnessEvolutionError,
+            HarnessBackendError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            KeyError,
+        ) as exc:
+            self._evolution.reject(
+                candidate.candidate_id,
+                reason=f"harness validation failed: {type(exc).__name__}: {exc}",
+            )
+            result["rejected"].append(
+                {
+                    "surface": candidate.surface.value,
+                    "target_role": candidate.target_role.value,
+                    "artifact_id": candidate.artifact_id,
+                    "error": f"harness validation failed: {type(exc).__name__}: {exc}",
+                }
+            )
+            result["role_generations"] = self._record_role_generations(snapshot)
+            return result
+        result["harness_qualification_pending"] = {
+            "candidate_id": candidate.candidate_id,
+            "surface": candidate.surface.value,
+            "evidence_id": evidence_ref.artifact_id,
+            "harness_candidate_commit": candidate_commit,
+            "harness_expected_champion": expected_champion,
+        }
+        result["activation"] = {
+            "activated": False,
+            "qualified": candidate.candidate_id,
+            "reason": "harness canary qualification pending durable commit",
+        }
+        result["role_generations"] = self._record_role_generations(snapshot)
+        return result
+
+    def _qualify_harness_candidate(
+        self,
+        snapshot: CurriculumSnapshot,
+        candidate_evaluation: ArtifactRef,
+        pending: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Durable harness-code qualification: canary evidence already bound.
+
+        The runtime binding is unchanged by a harness candidate, so the new
+        role version points at the champion's manifest artifact while its
+        version bump records the activation event.
+        """
+        candidate_id = pending.get("candidate_id")
+        evidence_id = pending.get("evidence_id")
+        if not isinstance(candidate_id, str) or not isinstance(evidence_id, str):
+            raise RuntimeError("harness qualification pending is incomplete")
+        record = self._evolution.projection.candidates.get(candidate_id)
+        if record is None:
+            return {
+                "qualified": {},
+                "current_active_set": self._roles.projection.current_active_set_id,
+                "note": "harness candidate has no registry record",
+            }
+        if record.state is CandidateState.VALIDATED:
+            record = self._evolution.qualify(
+                candidate_id, qualification_evidence_id=evidence_id
+            )
+            self._register_population(
+                record, evidence_id=evidence_id, gate_report=None
+            )
+        elif record.state is not CandidateState.QUALIFIED:
+            return {
+                "qualified": {},
+                "current_active_set": self._roles.projection.current_active_set_id,
+                "note": "harness candidate is not in a qualifiable state",
+            }
+        active = self._roles.projection.current_active_set
+        if active is None:
+            raise RuntimeError("role genesis must precede candidate qualification")
+        current = active.for_role(Role.WARRIOR)
+        identity = RoleVersionIdentity(
+            Role.WARRIOR,
+            current.version + 1,
+            current.artifact_id,
+            current.artifact_sha256,
+            current.constitution_id,
+            parent_role_version_id=current.role_version_id,
+        )
+        self._roles.collect_candidate(
+            identity,
+            objective_id=snapshot.objective.objective_id,
+            collection_evidence_id=candidate_evaluation.artifact_id,
+        )
+        self._roles.validate_candidate(
+            identity.role_version_id,
+            validation_evidence_id=candidate_evaluation.artifact_id,
+        )
+        self._roles.qualify_candidate(
+            identity.role_version_id,
+            qualification_evidence_id=evidence_id,
+        )
+        harness_candidate_commit = pending.get("harness_candidate_commit")
+        harness_expected_champion = pending.get("harness_expected_champion")
+        return {
+            "qualified": {Role.WARRIOR.value: identity.role_version_id},
+            "candidate_id": candidate_id,
+            "harness_candidate_commit": (
+                harness_candidate_commit
+                if isinstance(harness_candidate_commit, str)
+                else None
+            ),
+            "harness_expected_champion": (
+                harness_expected_champion
+                if isinstance(harness_expected_champion, str)
+                else None
+            ),
+            "current_active_set": self._roles.projection.current_active_set_id,
+            "note": "harness candidate qualified by dual-arm worktree canary",
+        }
+
     def _candidate_gate_cohort(
         self, cohort: DynamicTaskCohort
     ) -> DynamicTaskCohort | None:
@@ -4271,6 +4516,12 @@ class ModelCyclePorts:
                     "probation_replay": True,
                     "council_evidence_id": council.artifact_id,
                 }
+        if candidate.surface is EvolutionSurface.HARNESS_CODE:
+            # Harness candidates are causal by construction: the evidence is
+            # the frozen agent's dual-worktree canary over the real champion
+            # and candidate trees, not a shadow solve with an unchanged
+            # binding.  Fresh-holdout availability does not gate them.
+            return self._evaluate_harness_candidate(result, candidate, snapshot)
         evaluation_cohort = self._candidate_gate_cohort(cohort)
         if evaluation_cohort is None:
             result["activation"] = {
@@ -4280,99 +4531,6 @@ class ModelCyclePorts:
             }
             result["role_generations"] = self._record_role_generations(snapshot)
             return result
-        if candidate.surface is EvolutionSurface.HARNESS_CODE:
-            if self._harness_backend is None and (
-                self._harness_canary is None or self._harness_repo is None
-            ):
-                self._evolution.reject(
-                    candidate.candidate_id,
-                    reason=(
-                        "harness_code surface enabled but no harness repository "
-                        "is configured"
-                    ),
-                )
-                result["rejected"].append(
-                    {
-                        "surface": candidate.surface.value,
-                        "target_role": candidate.target_role.value,
-                        "artifact_id": candidate.artifact_id,
-                        "error": "WSL harness backend is not configured",
-                    }
-                )
-                result["role_generations"] = self._record_role_generations(snapshot)
-                return result
-            try:
-                content = _load_json_artifact(
-                    self._artifacts, "harness-code", candidate.artifact_id
-                )
-                if self._harness_backend is not None:
-                    if self._harness_campaign_id is None:
-                        raise RuntimeError("harness campaign identity is missing")
-                    checkpoint = self._harness_backend.checkpoint(
-                        self._harness_campaign_id,
-                        candidate.candidate_id,
-                        str(content["base_commit"]),
-                        cast(Sequence[Mapping[str, Any]], content["changes"]),
-                        f"checkpoint:{candidate.candidate_id.rsplit(':', 1)[1][:32]}",
-                    )
-                    if checkpoint.candidate_commit is None:
-                        raise RuntimeError("WSL harness checkpoint omitted candidate commit")
-                    validation = self._harness_backend.validate(
-                        self._harness_campaign_id,
-                        candidate.candidate_id,
-                        checkpoint.candidate_commit,
-                        f"validate:{candidate.candidate_id.rsplit(':', 1)[1][:32]}",
-                    )
-                    evidence_ref = self._artifacts.put_json(
-                        "harness-validation",
-                        {
-                            "checkpoint": checkpoint.to_mapping(),
-                            "validation": validation.to_mapping(),
-                        },
-                    )
-                    result["harness_worktree"] = {
-                        "candidate_commit": checkpoint.candidate_commit,
-                        "champion_commit": checkpoint.champion_commit,
-                        "evidence_id": evidence_ref.artifact_id,
-                    }
-                else:
-                    assert self._harness_canary is not None
-                    changes = changes_to_git_file_changes(content["changes"])
-                    verdict = self._harness_canary.run(content, changes)
-                    evidence_ref = self._artifacts.put_json(
-                        "harness-canary", verdict.to_mapping()
-                    )
-                    result["harness_canary"] = {
-                        "passed": verdict.passed,
-                        "reason": verdict.reason,
-                        "evidence_id": evidence_ref.artifact_id,
-                    }
-                    if not verdict.passed:
-                        raise HarnessEvolutionError(
-                            f"harness canary failed: {verdict.reason}"
-                        )
-            except (
-                HarnessEvolutionError,
-                HarnessBackendError,
-                RuntimeError,
-                ValueError,
-                TypeError,
-                KeyError,
-            ) as exc:
-                self._evolution.reject(
-                    candidate.candidate_id,
-                    reason=f"harness validation failed: {type(exc).__name__}: {exc}",
-                )
-                result["rejected"].append(
-                    {
-                        "surface": candidate.surface.value,
-                        "target_role": candidate.target_role.value,
-                        "artifact_id": candidate.artifact_id,
-                        "error": f"harness validation failed: {type(exc).__name__}: {exc}",
-                    }
-                )
-                result["role_generations"] = self._record_role_generations(snapshot)
-                return result
         if candidate.surface is EvolutionSurface.ENVIRONMENT:
             if self._environment_builder is None:
                 self._evolution.reject(
@@ -4447,15 +4605,11 @@ class ModelCyclePorts:
             default_workflow_ref=self._default_workflow_ref,
             default_subject_ref=self._default_subject_ref,
         )
-        candidate_runtime = (
-            champion_binding
-            if candidate.surface is EvolutionSurface.HARNESS_CODE
-            else candidate_binding(
-                champion=champion_binding,
-                candidate=candidate,
-                artifacts=self._artifacts,
-                role=Role.WARRIOR,
-            )
+        candidate_runtime = candidate_binding(
+            champion=champion_binding,
+            candidate=candidate,
+            artifacts=self._artifacts,
+            role=Role.WARRIOR,
         )
         if mcp_candidate is not None:
             assert self._mcp_bridge is not None
@@ -5577,6 +5731,11 @@ class ModelCyclePorts:
                 "current_active_set": self._roles.projection.current_active_set_id,
                 "note": reason,
             }
+        harness_pending = candidate_evidence.get("harness_qualification_pending")
+        if isinstance(harness_pending, Mapping):
+            return self._qualify_harness_candidate(
+                snapshot, candidate_evaluation, harness_pending
+            )
         pending = candidate_evidence.get("qualification_pending")
         if not isinstance(pending, Mapping):
             return {
@@ -6015,6 +6174,7 @@ class ModelCyclePorts:
                 intent.harness_candidate_commit,
                 intent.harness_expected_champion,
                 f"activate:{intent.intent_id.rsplit(':', 1)[1][:32]}",
+                meta_evolution_enabled=self._meta_evolution_enabled,
             )
             ref = self._artifacts.put_json("harness-activation", receipt.to_mapping())
             return ref.artifact_id

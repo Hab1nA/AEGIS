@@ -678,7 +678,7 @@ class RuntimeActionTests(unittest.TestCase):
 
 
 class HarnessEvolutionCycleTests(unittest.TestCase):
-    def test_harness_candidate_waits_for_fresh_full_cycle_evidence(self) -> None:
+    def test_harness_candidate_qualifies_by_canary_without_fresh_cohort(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             store = EventStore(root / "events.sqlite3")
@@ -757,18 +757,22 @@ class HarnessEvolutionCycleTests(unittest.TestCase):
                     )
                 )
                 self.assertIs(curriculum.projection.cycle_state, CycleState.COMPLETED)
-                self.assertIsNone(
-                    evolution.champion(EvolutionSurface.HARNESS_CODE, Role.WARRIOR)
-                )
-                pending = evolution.validated_candidates()
-                self.assertEqual(len(pending), 1)
-                self.assertIs(pending[0].surface, EvolutionSurface.HARNESS_CODE)
-                self.assertEqual(_git(harness_repo, "rev-parse", "HEAD").strip(), base)
+                # Harness candidates qualify through the dual-arm canary path:
+                # no Fresh holdout cohort is required and the canary runs.
                 candidate = json.loads(
                     artifacts.get(result.candidate_evaluation).decode("utf-8")
                 )
-                self.assertNotIn("harness_canary", candidate)
-                self.assertIn("Fresh holdout", candidate["activation"]["reason"])
+                self.assertIn("harness_canary", candidate)
+                self.assertTrue(candidate["harness_canary"]["passed"])
+                self.assertIn("harness_qualification_pending", candidate)
+                champion = evolution.champion(
+                    EvolutionSurface.HARNESS_CODE, Role.WARRIOR
+                )
+                self.assertIsNotNone(champion)
+                self.assertEqual(evolution.validated_candidates(), ())
+                # Host-canary activation flips the registry champion only;
+                # champion-ref commits live on the WSL-first path.
+                self.assertEqual(_git(harness_repo, "rev-parse", "HEAD").strip(), base)
             finally:
                 dynamic.close()
                 store.close()
@@ -925,7 +929,7 @@ class MetaEvolutionTests(unittest.TestCase):
 
 
 class HarnessPhase4EndToEndTests(unittest.TestCase):
-    def test_meta_harness_candidate_remains_pending_after_canary(self) -> None:
+    def test_meta_harness_candidate_activates_under_explicit_authorization(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             store = EventStore(root / "events.sqlite3")
@@ -1026,14 +1030,14 @@ class HarnessPhase4EndToEndTests(unittest.TestCase):
                     ),
                     meta=True,
                 )
-                self.assertIsNone(
-                    evolution.champion(EvolutionSurface.HARNESS_CODE, Role.WARRIOR)
+                # Explicit meta authorization plus a passing canary qualifies
+                # and activates the control-file candidate.
+                champion = evolution.champion(
+                    EvolutionSurface.HARNESS_CODE, Role.WARRIOR
                 )
-                pending = evolution.validated_candidates()
-                self.assertEqual(len(pending), 1)
-                self.assertIs(pending[0].surface, EvolutionSurface.HARNESS_CODE)
+                self.assertIsNotNone(champion)
                 self.assertEqual(_git(harness_repo, "rev-parse", "HEAD").strip(), base)
-                self.assertEqual(population.diversity_report()["cell_count"], 0)
+                self.assertEqual(population.diversity_report()["cell_count"], 1)
             finally:
                 dynamic.close()
                 store.close()

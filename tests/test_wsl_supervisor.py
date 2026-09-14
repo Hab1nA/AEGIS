@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,12 @@ from aegis.evolution.wsl_supervisor import (
 from aegis.models import canonical_json
 
 COMMIT_A = "a" * 40
+COMMIT_B = "b" * 40
+
+_TEST_CREDENTIALS = {
+    "base_url": "https://relay.example.invalid/v1",
+    "api_key": "sk-test",
+}
 
 
 def _receipt(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -27,7 +34,7 @@ def _receipt(request: Mapping[str, Any]) -> dict[str, Any]:
         "status": "completed",
         "failure_kind": None,
         "executed_commit": request["expected_commit"],
-        "tree_hash": "b" * 40,
+        "tree_hash": "c" * 40,
         "previous_champion": None,
         "last_known_good": request["expected_commit"],
         "import_ok": True,
@@ -35,7 +42,11 @@ def _receipt(request: Mapping[str, Any]) -> dict[str, Any]:
         "exit_code": 0,
         "output_sha256": hashlib.sha256(b"").hexdigest(),
         "output_summary": "",
-        "request_sha256": hashlib.sha256(canonical_json(request).encode()).hexdigest(),
+        "request_sha256": hashlib.sha256(
+            canonical_json(
+                {key: value for key, value in request.items() if key != "gateway_credentials"}
+            ).encode()
+        ).hexdigest(),
     }
     return {
         **payload,
@@ -63,6 +74,7 @@ def test_supervisor_uses_fixed_bounded_data_protocol() -> None:
             "campaign_id": "campaign/one",
             "expected_commit": COMMIT_A,
             "request_payload": {"cycle": 2},
+            "gateway_credentials": None,
         }
     ]
     assert supervisor.transport_argv() == (
@@ -72,6 +84,34 @@ def test_supervisor_uses_fixed_bounded_data_protocol() -> None:
         "--",
         "/usr/local/bin/aegis-supervisor-agent",
     )
+
+
+def test_supervisor_validates_gateway_credentials() -> None:
+    supervisor = WslSupervisor(transport=lambda request, timeout: {})
+    with pytest.raises(ValueError, match="HTTPS"):
+        supervisor.launch_cycle(
+            "campaign",
+            COMMIT_A,
+            "launch-1",
+            {},
+            gateway_credentials={"base_url": "http://relay/v1", "api_key": "sk"},
+        )
+    with pytest.raises(ValueError, match="unknown fields"):
+        supervisor.launch_cycle(
+            "campaign",
+            COMMIT_A,
+            "launch-2",
+            {},
+            gateway_credentials={"base_url": "https://r/v1", "api_key": "k", "shell": "/bin/sh"},
+        )
+    with pytest.raises(ValueError, match="unknown fields"):
+        supervisor.launch_cycle(
+            "campaign",
+            COMMIT_A,
+            "launch-3",
+            {},
+            gateway_credentials={"upstream": "https://r/v1"},
+        )
 
 
 @pytest.mark.parametrize("key", ["command", "argv", "cwd", "path", "module", "executable"])
@@ -85,7 +125,7 @@ def test_supervisor_rejects_cross_request_receipt() -> None:
     def transport(request: Mapping[str, Any], timeout: float) -> Mapping[str, Any]:
         del timeout
         receipt = _receipt(request)
-        receipt["executed_commit"] = "c" * 40
+        receipt["executed_commit"] = "d" * 40
         return {"ok": True, "receipt": receipt}
 
     with pytest.raises(WslSupervisorError, match="digest mismatch"):
@@ -94,31 +134,117 @@ def test_supervisor_rejects_cross_request_receipt() -> None:
         )
 
 
+def test_launched_receipt_requires_probe_handshake_and_pid() -> None:
+    def transport(request: Mapping[str, Any], timeout: float) -> Mapping[str, Any]:
+        del timeout
+        receipt = _receipt(request)
+        receipt["status"] = "launched"
+        receipt["cycle_generation"] = 3
+        receipt["cycle_pid"] = 4242
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json(
+                {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+            ).encode()
+        ).hexdigest()
+        return {"ok": True, "receipt": receipt}
+
+    supervisor = WslSupervisor(transport=transport, timeout_seconds=60)
+    receipt = supervisor.launch_cycle("campaign/one", COMMIT_A, "launch-2", {"generation": 3})
+    assert receipt.status == "launched"
+    assert receipt.cycle_pid == 4242
+    assert receipt.cycle_generation == 3
+
+    def broken_transport(request: Mapping[str, Any], timeout: float) -> Mapping[str, Any]:
+        del timeout
+        receipt = _receipt(request)
+        receipt["status"] = "launched"
+        receipt["cycle_generation"] = 3
+        receipt["cycle_pid"] = None  # A launched receipt without a pid is invalid.
+        receipt["receipt_sha256"] = hashlib.sha256(
+            canonical_json(
+                {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+            ).encode()
+        ).hexdigest()
+        return {"ok": True, "receipt": receipt}
+
+    broken = WslSupervisor(transport=broken_transport, timeout_seconds=60)
+    with pytest.raises(WslSupervisorError, match="probe handshake"):
+        broken.launch_cycle("campaign/one", COMMIT_A, "launch-3", {"generation": 3})
+
+
+def test_legacy_sixteen_field_receipts_still_replay() -> None:
+    legacy = _receipt(
+        {
+            "operation_id": "op",
+            "campaign_id": "campaign",
+            "expected_commit": COMMIT_A,
+        }
+    )
+    from aegis.evolution.wsl_supervisor import CycleLaunchReceipt
+
+    receipt = CycleLaunchReceipt.from_mapping(legacy)
+    assert receipt.cycle_generation is None
+    assert receipt.cycle_pid is None
+    assert receipt.to_mapping() == legacy
+
+
+def test_cycle_status_and_cancel_ops_flow_through_transport() -> None:
+    seen: list[Mapping[str, Any]] = []
+
+    def transport(request: Mapping[str, Any], timeout: float) -> Mapping[str, Any]:
+        seen.append(request)
+        return {
+            "ok": True,
+            "status": "running",
+            "metering": {"requests": 2, "request_bytes": 10, "response_bytes": 20, "errors": 0},
+        }
+
+    supervisor = WslSupervisor(transport=transport, timeout_seconds=60)
+    status = supervisor.cycle_status("campaign/one", 3, "status-1")
+    assert status["status"] == "running"
+    assert status["metering"]["requests"] == 2
+    supervisor.cancel_cycle("campaign/one", 3, "cancel-1")
+    assert seen[0]["operation"] == "cycle_status"
+    assert seen[1]["operation"] == "cancel_cycle"
+    assert seen[0]["generation"] == 3
+    with pytest.raises(ValueError, match="positive integer"):
+        supervisor.cycle_status("campaign/one", 0, "status-2")
+
+
 @pytest.mark.skipif(os.name != "posix", reason="real supervisor agent requires Linux")
 def test_linux_agent_launches_newly_activated_commit_and_is_idempotent(tmp_path: Path) -> None:
     from aegis.evolution.wsl_supervisor_agent import SupervisorAgent
 
     root, campaign, repo, commit_a, commit_b = _campaign(tmp_path, broken_b=False)
-    agent = SupervisorAgent(root, use_mount_namespace=False, timeout_seconds=30)
+    agent = SupervisorAgent(
+        root,
+        use_mount_namespace=False,
+        timeout_seconds=30,
+        sidecar_launcher=_fake_sidecar,
+    )
 
-    first_request = _request("integration", commit_a, "launch-a", {"cycle": 1})
+    first_request = _request("integration", commit_a, "launch-a", {"generation": 1})
     first = agent.handle(first_request)["receipt"]
-    assert first["status"] == "completed"
+    assert first["status"] == "launched"
     assert first["executed_commit"] == commit_a
     assert first["import_ok"] is True
+    assert first["cycle_generation"] == 1
+    assert first["cycle_pid"] > 1
     assert agent.handle(first_request)["receipt"] == first
+    _await_terminal(agent, "integration", 1)
 
     _activate(campaign, repo, commit_a, commit_b)
-    second = agent.handle(_request("integration", commit_b, "launch-b", {"cycle": 2}))[
+    second = agent.handle(_request("integration", commit_b, "launch-b", {"generation": 2}))[
         "receipt"
     ]
-    assert second["status"] == "completed"
+    assert second["status"] == "launched"
     assert second["executed_commit"] == commit_b
     assert second["previous_champion"] == commit_a
     assert second["output_sha256"] != first["output_sha256"]
+    _await_terminal(agent, "integration", 2)
 
     with pytest.raises(Exception, match="does not match"):
-        agent.handle(_request("integration", commit_a, "stale-launch", {}))
+        agent.handle(_request("integration", commit_a, "stale-launch", {"generation": 3}))
 
 
 @pytest.mark.skipif(os.name != "posix", reason="real supervisor agent requires Linux")
@@ -128,7 +254,7 @@ def test_linux_agent_returns_typed_boot_failure_with_lkg(tmp_path: Path) -> None
     root, campaign, repo, commit_a, commit_b = _campaign(tmp_path, broken_b=True)
     _activate(campaign, repo, commit_a, commit_b)
     receipt = SupervisorAgent(root, use_mount_namespace=False, timeout_seconds=30).handle(
-        _request("integration", commit_b, "launch-b-broken", {})
+        _request("integration", commit_b, "launch-b-broken", {"generation": 1})
     )["receipt"]
 
     assert receipt["status"] == "boot_failed"
@@ -138,27 +264,84 @@ def test_linux_agent_returns_typed_boot_failure_with_lkg(tmp_path: Path) -> None
     assert receipt["previous_champion"] == commit_a
     assert receipt["import_ok"] is False
     assert receipt["heartbeat_ok"] is False
+    # A broken champion never reaches the cycle executor.
+    assert "cycle_pid" not in receipt
 
 
 @pytest.mark.skipif(os.name != "posix", reason="mount namespace requires Linux")
-def test_linux_agent_launches_inside_private_mount_namespace(tmp_path: Path) -> None:
+def test_linux_agent_probe_survives_private_mount_namespace(tmp_path: Path) -> None:
     from aegis.evolution.wsl_supervisor_agent import SupervisorAgent
 
-    root, _campaign_path, _repo, commit_a, _commit_b = _campaign(
-        tmp_path, broken_b=False
-    )
-    receipt = SupervisorAgent(root, use_mount_namespace=True, timeout_seconds=30).handle(
-        _request("integration", commit_a, "launch-isolated", {})
-    )["receipt"]
+    root, _campaign_path, _repo, commit_a, _commit_b = _campaign(tmp_path, broken_b=False)
+    receipt = SupervisorAgent(
+        root,
+        use_mount_namespace=True,
+        timeout_seconds=30,
+        sidecar_launcher=_fake_sidecar,
+    ).handle(_request("integration", commit_a, "launch-isolated", {"generation": 1}))["receipt"]
 
-    assert receipt["status"] == "completed"
+    assert receipt["status"] == "launched"
     summary = json.loads(receipt["output_summary"])
-    complete = [
+    events = [
         json.loads(line)
         for line in summary["stdout"].splitlines()
-        if '"event": "complete"' in line
-    ][0]
-    assert complete["result"]["mnt_entries"] == []
+        if line.startswith("{")
+    ]
+    assert any(event.get("event") == "import" for event in events)
+    assert any(event.get("event") == "heartbeat" for event in events)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="real supervisor agent requires Linux")
+def test_linux_agent_cycle_status_reports_completion_and_metering(tmp_path: Path) -> None:
+    from aegis.evolution.wsl_supervisor_agent import SupervisorAgent
+
+    root, _campaign, _repo, commit_a, _commit_b = _campaign(tmp_path, broken_b=False)
+    agent = SupervisorAgent(
+        root,
+        use_mount_namespace=False,
+        timeout_seconds=30,
+        sidecar_launcher=_fake_sidecar,
+    )
+    receipt = agent.handle(
+        _request("integration", commit_a, "launch-a", {"generation": 99})
+    )["receipt"]
+    generation = receipt["cycle_generation"]
+    assert generation == 1  # agent-side launch ordinal, not the payload hint
+    status = _await_terminal(agent, "integration", generation)
+    assert status["status"] == "completed"
+    assert status["metering"]["requests"] == 2
+    result = status["cycle_result"]
+    assert result["version"] == "A"
+
+    unknown = agent.handle(_request_status("integration", 99))["status"]
+    assert unknown == "unknown"
+
+
+def _await_terminal(agent: Any, campaign_id: str, generation: int, attempts: int = 200) -> Mapping:
+    for _ in range(attempts):
+        status = agent.handle(_request_status(campaign_id, generation))
+        if status["status"] in {"completed", "failed", "cancelled"}:
+            return status
+        time.sleep(0.05)
+    raise AssertionError("cycle did not reach a terminal status")
+
+
+def _fake_sidecar(credentials: Mapping[str, Any], metering_path: Path) -> dict[str, Any]:
+    class _FakeStdin:
+        def close(self) -> None:
+            return None
+
+    class _FakeProcess:
+        stdin = _FakeStdin()
+
+    assert str(credentials.get("base_url", "")).startswith("https://")
+    metering_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metering_path.write_text(
+        '{"outcome": "forwarded", "request_bytes": 10, "response_bytes": 20}\n'
+        '{"outcome": "forwarded", "request_bytes": 30, "response_bytes": 40}\n',
+        encoding="utf-8",
+    )
+    return {"process": _FakeProcess(), "port": 45678}
 
 
 def _request(
@@ -171,6 +354,17 @@ def _request(
         "campaign_id": campaign_id,
         "expected_commit": commit,
         "request_payload": dict(payload),
+        "gateway_credentials": dict(_TEST_CREDENTIALS),
+    }
+
+
+def _request_status(campaign_id: str, generation: int) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "operation": "cycle_status",
+        "operation_id": f"status-{generation}",
+        "campaign_id": campaign_id,
+        "generation": generation,
     }
 
 
@@ -246,10 +440,8 @@ def _write_candidate(root: Path, version: str, *, broken: bool) -> None:
     (root / "src" / "aegis" / "__init__.py").write_text("", encoding="utf-8")
     (package / "__init__.py").write_text("", encoding="utf-8")
     content = (
-        "from pathlib import Path\n"
         "def run_cycle(payload):\n"
-        f"    return {{'version': '{version}', 'payload': payload, "
-        "'mnt_entries': sorted(p.name for p in Path('/mnt').iterdir())}\n"
+        f"    return {{'version': '{version}', 'generation': payload.get('generation')}}\n"
     )
     if broken:
         content = "def run_cycle(:\n"

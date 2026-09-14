@@ -259,6 +259,15 @@ def _run_v2_cycle_cli(
     no_candidate_eval: bool = False,
 ) -> Mapping[str, Any]:
     """Execute one full model-driven v2 cycle through the real runtime wiring."""
+    autonomy = config.autonomy_v2
+    if (
+        not config.test_mode
+        and autonomy is not None
+        and autonomy.harness_evolution_enabled
+    ):
+        # WSL-first: production cycles run inside the champion worktree under
+        # the trusted supervisor; the host is a thin client.
+        return _run_v2_cycle_wsl_first(config)
     store = _store()
     knowledge = _knowledge()
     skills = None
@@ -317,16 +326,10 @@ def _run_v2_cycle_cli(
                 Path(autonomy.harness_repo_root),
                 meta_evolution_enabled=autonomy.meta_evolution_enabled,
             )
+        # Production harness evolution is served by the WSL-first path above;
+        # the in-process host path never attaches a WSL harness backend.
         harness_backend: HarnessBackend | None = None
         harness_boot_receipt: CycleLaunchReceipt | None = None
-        if (
-            not config.test_mode
-            and autonomy is not None
-            and autonomy.harness_evolution_enabled
-        ):
-            harness_backend, harness_boot_receipt = _prepare_wsl_harness_runtime(
-                config, dynamic
-            )
         from aegis.mcp import McpBridge
 
         mcp_bridge = McpBridge()
@@ -468,17 +471,41 @@ def _run_v2_cycle_cli(
         store.close()
 
 
-def _prepare_wsl_harness_runtime(
-    config: CampaignConfig,
-    dynamic: DynamicTaskRegistry,
-) -> tuple[HarnessBackend, CycleLaunchReceipt]:
-    """Initialize and boot the active WSL champion before a production cycle."""
+def _gateway_credentials_from_env() -> dict[str, str]:
+    """Collect relay credentials from the host environment for the sidecar."""
+    base_url = os.environ.get("AEGIS_OPENAI_BASE_URL")
+    api_key = os.environ.get("AEGIS_OPENAI_API_KEY")
+    if not base_url or not api_key:
+        raise RuntimeError(
+            "WSL-first cycles require AEGIS_OPENAI_BASE_URL and AEGIS_OPENAI_API_KEY"
+        )
+    credentials = {"base_url": base_url, "api_key": api_key}
+    user_agent = os.environ.get("AEGIS_OPENAI_USER_AGENT")
+    timeout = os.environ.get("AEGIS_OPENAI_TIMEOUT_SECONDS")
+    if user_agent:
+        credentials["user_agent"] = user_agent
+    if timeout:
+        credentials["timeout_seconds"] = timeout
+    return credentials
+
+
+def _run_v2_cycle_wsl_first(config: CampaignConfig) -> Mapping[str, Any]:
+    """Thin-client production cycle.
+
+    The champion worktree inside the dedicated distribution runs the whole
+    loop; the host prepares the campaign, relays credentials to the fixed
+    sidecar (never to champion code), waits for the detached cycle, and
+    relays the bounded result.  A champion that fails its boot probe is
+    rolled back to the last known good commit before raising.
+    """
+    import time as time_module
 
     autonomy = config.autonomy_v2
     if autonomy is None or not autonomy.harness_evolution_enabled:
         raise RuntimeError("production WSL harness runtime is not enabled")
     if autonomy.public_repo_url is None or autonomy.harness_source_ref is None:
         raise RuntimeError("production harness requires a public URL and pinned source ref")
+    credentials = _gateway_credentials_from_env()
     from aegis.evolution.wsl_deployment import WslEvolutionDeployment
 
     deployment = WslEvolutionDeployment()
@@ -492,7 +519,6 @@ def _prepare_wsl_harness_runtime(
                 if not check.passed
             )
         )
-    generation = _next_v2_generation(dynamic)
     backend = WslHarnessBackend()
     backend.ensure_campaign(
         config.campaign_id,
@@ -502,7 +528,7 @@ def _prepare_wsl_harness_runtime(
     )
     status = backend.status(
         config.campaign_id,
-        f"status-{generation}-{os.urandom(8).hex()}",
+        f"status-{os.urandom(8).hex()}",
     )
     champion = status.champion_commit
     if champion is None:
@@ -511,27 +537,72 @@ def _prepare_wsl_harness_runtime(
     receipt = supervisor.launch_cycle(
         config.campaign_id,
         champion,
-        f"cycle-{generation}-launch-{champion[:16]}",
+        f"cycle-launch-{os.urandom(8).hex()}",
         {
             "action": "evolution_cycle",
             "campaign_id": config.campaign_id,
-            "generation": generation,
         },
+        gateway_credentials=credentials,
     )
-    if receipt.status != "completed":
+    if receipt.status == "boot_failed":
         target = receipt.last_known_good
         if target is not None and target != receipt.executed_commit:
             backend.rollback(
                 config.campaign_id,
                 receipt.executed_commit,
                 target,
-                f"cycle-{generation}-boot-rollback-{receipt.executed_commit[:12]}",
+                f"cycle-boot-rollback-{receipt.executed_commit[:12]}",
             )
         raise RuntimeError(
             "active WSL champion failed to boot: "
             f"status={receipt.status}, failure_kind={receipt.failure_kind}"
         )
-    return backend, receipt
+    generation = receipt.cycle_generation
+    if generation is None:
+        raise RuntimeError("launch receipt omitted the cycle generation")
+    wall_budget = float(config.wall_time_seconds or 28_800)
+    deadline = time_module.monotonic() + max(wall_budget, 600.0)
+    while True:
+        time_module.sleep(15.0)
+        status_response = supervisor.cycle_status(
+            config.campaign_id,
+            generation,
+            f"cycle-status-{os.urandom(8).hex()}",
+        )
+        state = str(status_response.get("status", "unknown"))
+        if state == "completed":
+            result = status_response.get("cycle_result")
+            if not isinstance(result, Mapping):
+                raise RuntimeError("completed cycle omitted its bounded result")
+            response = dict(result)
+            response["harness_boot_receipt"] = receipt.to_mapping()
+            response["cycle_generation"] = generation
+            response["gateway_metering"] = status_response.get("metering")
+            metering = status_response.get("metering")
+            if (
+                isinstance(metering, Mapping)
+                and int(metering.get("requests", 0)) == 0
+                and response.get("artifacts")
+            ):
+                raise RuntimeError(
+                    "gateway sidecar metered zero requests for a cycle that "
+                    "claims artifacts; possible accounting bypass"
+                )
+            return response
+        if state in {"failed", "cancelled"}:
+            raise RuntimeError(
+                f"WSL-first cycle ended with status={state}: "
+                f"{str(status_response.get('error', ''))[:512]}"
+            )
+        if time_module.monotonic() > deadline:
+            supervisor.cancel_cycle(
+                config.campaign_id,
+                generation,
+                f"cycle-cancel-{os.urandom(8).hex()}",
+            )
+            raise RuntimeError(
+                "WSL-first cycle exceeded the configured wall time and was cancelled"
+            )
 
 
 def _campaign_events(campaign_id: str) -> list[Any]:

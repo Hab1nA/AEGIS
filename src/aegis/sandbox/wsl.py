@@ -566,3 +566,33 @@ def _is_agent_error(process: subprocess.CompletedProcess[str]) -> bool:
     except ValueError:
         return False
     return isinstance(decoded, dict) and decoded.get("ok") is False
+
+
+class LocalAgentSandboxBackend(WslSandboxBackend):
+    """In-distro transport: invoke the fixed sandbox agent directly.
+
+    The WSL-first cycle executor runs inside the dedicated distribution, where
+    ``wsl.exe`` does not exist.  The JSON agent protocol, the fixed agent path,
+    and every payload validation are unchanged; only the transport argv differs.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_path: str = "/usr/local/bin/aegis-sandbox-agent",
+        runner: Runner | None = None,
+        environment_allowlist: frozenset[str] = DEFAULT_ENV_ALLOWLIST,
+        interop_warn_only: bool = True,
+    ) -> None:
+        super().__init__(
+            "local",
+            agent_path=agent_path,
+            runner=runner,
+            environment_allowlist=environment_allowlist,
+            interop_warn_only=interop_warn_only,
+        )
+
+    def transport_argv(self) -> list[str]:
+        if self.interop_warn_only:
+            return ["/usr/bin/env", "AEGIS_SANDBOX_INTEROP_WARN=1", self.agent_path]
+        return [self.agent_path]

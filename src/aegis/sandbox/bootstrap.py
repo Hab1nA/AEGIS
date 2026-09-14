@@ -177,6 +177,9 @@ def render_files(spec: BootstrapSpec) -> dict[str, str]:
         "/usr/local/bin/aegis-supervisor-agent": (
             "#!/usr/bin/python3\nfrom aegis.evolution.wsl_supervisor_agent import main\nraise SystemExit(main())\n"
         ),
+        "/usr/local/bin/aegis-gateway-sidecar": (
+            "#!/usr/bin/python3\nfrom aegis.gateway_sidecar import main\nraise SystemExit(main())\n"
+        ),
         "/usr/local/bin/aegis-evolution-doctor": (
             "#!/usr/bin/python3\nfrom aegis.evolution.wsl_deployment_agent import main\nraise SystemExit(main())\n"
         ),
