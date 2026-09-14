@@ -542,6 +542,30 @@ class CyclePortsTests(unittest.TestCase):
         self.assertFalse(_should_expand_seeds(clear_reject, seed_count=2, expansion_used=False))
         del _fmean
 
+    def test_population_fitness_reflects_qualification_margin(self) -> None:
+        from types import SimpleNamespace as _NS
+
+        from aegis.cycle_ports import _population_fitness
+
+        def gate_report(fresh: tuple[float, ...], regression: tuple[float, ...], cost=None):
+            return _NS(
+                seed_results=[
+                    _NS(fresh_delta=f, regression_delta=r)
+                    for f, r in zip(fresh, regression)
+                ],
+                total_cost_change=cost,
+            )
+
+        # Fresh path: fitness = mean fresh delta.
+        self.assertEqual(_population_fitness(gate_report((0.03, 0.05), (0.0, 0.0))), 0.04)
+        # Cost path: savings dominate same-magnitude quality margins.
+        self.assertEqual(_population_fitness(gate_report((0.0, 0.0), (0.0, 0.0), cost=-0.2)), 1.2)
+        # Fresh-saturated path: mean regression delta on top of the base.
+        self.assertEqual(_population_fitness(gate_report((1.0, 1.0), (0.03, 0.05))), 1.04)
+        # Unrankable shapes stay neutral instead of saturating at 1.0.
+        self.assertEqual(_population_fitness(None), 0.5)
+        self.assertEqual(_population_fitness(gate_report((), ())), 0.5)
+
     def test_rollback_order_dispatches_by_surface(self) -> None:
         from types import SimpleNamespace
 
@@ -594,6 +618,100 @@ class CyclePortsTests(unittest.TestCase):
             append=lambda *args, **kwargs: None,
         )
         self.assertEqual(ports._observe_candidate_probation(snapshot, None, []), [])
+
+    def test_probation_breach_is_noninferiority_and_keeps_observing(self) -> None:
+        """delta=0 must observe (not breach); a breach must not stop the
+        observation of later surfaces in the same cycle."""
+        from types import SimpleNamespace
+
+        import aegis.cycle_ports as cycle_ports_module
+        from aegis.evolution.surfaces import EvolutionSurface as ES
+
+        appended: list[tuple[str, dict]] = []
+
+        class FakeStore:
+            def read(self, stream):
+                return []
+
+            def append(self, stream, event_type, payload):
+                appended.append((event_type, dict(payload)))
+
+        class FakeEvolution:
+            def __init__(self):
+                self.projection = SimpleNamespace(
+                    champion_history={
+                        (surface, Role.WARRIOR): (f"cand-parent-{surface.value}", f"cand-{surface.value}")
+                        for surface in (ES.WORKFLOW, ES.SUBJECT)
+                    },
+                    candidates={
+                        f"cand-parent-{surface.value}": SimpleNamespace(
+                            candidate_id=f"cand-parent-{surface.value}"
+                        )
+                        for surface in (ES.WORKFLOW, ES.SUBJECT)
+                    },
+                )
+
+            def champion(self, surface, role):
+                return SimpleNamespace(candidate_id=f"cand-{surface.value}")
+
+        ports = ModelCyclePorts.__new__(ModelCyclePorts)
+        ports._campaign_event_store = FakeStore()
+        ports._evolution = FakeEvolution()
+        ports._curriculum = SimpleNamespace(
+            projection=SimpleNamespace(campaign_id="probation-audit")
+        )
+        ports._candidate_probation_cycles = 2
+        ports._artifacts = None
+        ports._arm_workspaces = {"champion": "ws-champion", "arm-x": "ws-arm"}
+        ports._main_solve_evidence = {"workspace_digest": "digest"}
+        ports._main_solve_task_ids = frozenset()
+        ports._dynamic = object()
+        ports._sandbox = object()
+        ports._baseline_reusable = lambda *args, **kwargs: True
+        ports._bindings = {
+            Role.WARRIOR: SimpleNamespace(
+                control_core=SimpleNamespace(
+                    promotion_gate=SimpleNamespace(
+                        regression_noninferiority_margin=0.01
+                    )
+                )
+            )
+        }
+
+        def fake_solve_arm(snapshot, cohort, tasks, binding, *, arm_label, evaluation_seed):
+            return {"arm": "arm-x", "workspace_digest": "digest-parent"}
+
+        ports._solve_arm = fake_solve_arm
+        snapshot = SimpleNamespace(cycle_number=7)
+        evaluations = iter(
+            [
+                SimpleNamespace(quality=0.5),  # champion
+                SimpleNamespace(quality=0.52),  # workflow parent: delta -0.02 -> breach
+                SimpleNamespace(quality=0.5),  # subject parent: delta 0.0 -> observe
+            ]
+        )
+        with patch.object(
+            cycle_ports_module,
+            "evaluate_frozen_workspace",
+            side_effect=lambda *args, **kwargs: next(evaluations),
+        ), patch.object(
+            cycle_ports_module, "candidate_binding", return_value=object()
+        ):
+            rows = ports._observe_candidate_probation(snapshot, None, [])
+
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[0]["breached"])
+        self.assertFalse(rows[1]["breached"])
+        self.assertEqual(
+            [event_type for event_type, _ in appended],
+            [
+                "evolution_probation_breached_v1",
+                "evolution_probation_observed_v1",
+            ],
+        )
+        # Direction: a champion holding exactly steady (delta 0.0) is observed,
+        # not breached — the pre-fix comparison (delta < +margin) failed here.
+        self.assertEqual(rows[1]["delta"], 0.0)
 
     def test_evaluation_seeds_are_sorted_distinct_and_prefix_stable(self) -> None:
         from aegis.evolution.sealed_evaluation import (

@@ -330,6 +330,30 @@ def _should_expand_seeds(
     return 0.0 < mean_fresh < gate_report.policy.fresh_improvement
 
 
+def _population_fitness(gate_report: Any) -> float:
+    """Archive fitness from the qualification path a candidate actually took.
+
+    The fresh path scores the mean fresh delta, the fresh-saturated path the
+    mean regression delta, and the cost path the realized cost-saving ratio.
+    A constant fitness would freeze every MAP-Elites cell at its first
+    occupant ("strictly better never replaces"), so unrankable shapes fall
+    back to a neutral 0.5 instead of a saturating 1.0.
+    """
+    if gate_report is None or not getattr(gate_report, "seed_results", None):
+        return 0.5
+    seeds = gate_report.seed_results
+    mean_fresh = fmean(item.fresh_delta for item in seeds)
+    mean_regression = fmean(item.regression_delta for item in seeds)
+    cost_change = getattr(gate_report, "total_cost_change", None)
+    if cost_change is not None and cost_change < 0.0:
+        # Cost path: savings ratio in (0, 1]; dominate pure-quality margins of
+        # the same magnitude so genuine savings can displace prior occupants.
+        return round(1.0 + abs(cost_change), 12)
+    if mean_fresh >= 1.0 - 1e-12:
+        return round(1.0 + mean_regression, 12)
+    return round(mean_fresh, 12)
+
+
 def _difficulty_signal_rows(quality_lock_data: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Per-task discriminating-power rows from one quality-lock artifact.
 
@@ -4880,6 +4904,7 @@ class ModelCyclePorts:
         candidate: Any,
         *,
         evidence_id: str,
+        gate_report: Any = None,
     ) -> Mapping[str, Any] | None:
         """Register one qualified candidate in the MAP-Elites archive."""
         if self._population is None:
@@ -4905,7 +4930,7 @@ class ModelCyclePorts:
         entry = self._population.register(
             candidate_id=candidate.candidate_id,
             cell=cell,
-            fitness=1.0,
+            fitness=_population_fitness(gate_report),
             evidence_id=evidence_id,
             descriptor=cell,
         )
@@ -5092,10 +5117,12 @@ class ModelCyclePorts:
 
         For each surface champion still inside its probation window, solve the
         cohort once with the parent champion binding under the anchor seed and
-        compare sealed quality against the champion's own main solve.  A
-        regression beyond the noninferiority margin writes a breach event; a
-        full window without breach writes a graduation event.  State rebuilds
-        from the event stream, so interruptions resume cleanly.
+        compare sealed quality of the champion-bound solve against the
+        parent-bound solve.  A regression beyond the noninferiority margin
+        writes a breach event; a full window without breach writes a graduation
+        event.  A breach on one surface does not stop observation of the other
+        surfaces.  State rebuilds from the event stream, so interruptions
+        resume cleanly.
         """
         if (
             self._campaign_event_store is None
@@ -5194,7 +5221,12 @@ class ModelCyclePorts:
                 policy=binding.control_core,
             )
             delta = round(champion_eval.quality - parent_eval.quality, 12)
-            breached_now = delta < margin
+            # Noninferiority: only a champion that regresses beyond the margin
+            # breaches.  Holding steady or improving by less than the margin is
+            # not a breach — the gate already required a fresh-improvement
+            # qualification, so demanding a repeat win every observation cycle
+            # would systematically roll back sound activations on cohort noise.
+            breached_now = delta < -margin
             payload = {
                 "schema_version": 1,
                 "candidate_id": champion.candidate_id,
@@ -5219,9 +5251,9 @@ class ModelCyclePorts:
                     "observations": observations_so_far + 1,
                 }
             )
-            if breached_now:
-                break
-            if observations_so_far + 1 >= self._candidate_probation_cycles:
+            # A breach on one surface must not blind the observer to the other
+            # surfaces still inside their probation windows.
+            if observations_so_far + 1 >= self._candidate_probation_cycles and not breached_now:
                 self._campaign_event_store.append(
                     stream,
                     "evolution_probation_graduated_v1",
@@ -5701,7 +5733,9 @@ class ModelCyclePorts:
                 qualification_evidence_id=candidate_evaluation.artifact_id,
             )
             self._register_population(
-                candidate, evidence_id=candidate_evaluation.artifact_id
+                candidate,
+                evidence_id=candidate_evaluation.artifact_id,
+                gate_report=gate_report,
             )
         mcp_candidate_id: str | None = None
         if candidate.surface is EvolutionSurface.MCP:
