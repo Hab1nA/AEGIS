@@ -47,3 +47,13 @@
 - 负面路径单测（越权路径/秘密内容/树不一致/金丝雀回归/冒烟失败全部拒绝或回滚）。
 - 真实三代/五代 e2e（激活→激活→回滚；meta 开关前后对照）。
 - Mimosa 深度扫描：exec 类 code-injection findings 属沙盒设计内行为（隔离即边界），非漏洞。
+
+### Mimosa findings 裁决台账（2026-09-16，scan-…594e0f317c01，9 项全无需修）
+
+| finding | 裁决 | 依据 |
+|---|---|---|
+| 代码注入 ×5（sandbox/backend.py:49、fake.py:119、owned.py:81、wsl.py:253、subagent_worker.py:42） | 设计内行为，接受 | 均为 `SandboxBackend.exec` **方法名**触发的静态模式（协议声明/委托/测试 fake/向固定 JSON agent 发请求），不是内建 `exec()`；命令执行发生在容器（cap-drop/all、read-only、network none）或发行版用户层（残余风险已记录），凭据单向流保证 worker 只见 sidecar |
+| 不安全的随机数（evaluation/promotion.py:104） | 有意确定性，接受 | `random.Random(seed=0xAE615)` 用于 bootstrap 置信区间的可复现重采样——统计用途而非安全随机，固定种子恰是报告可复现所需 |
+| 路径穿越（agent_runtime.py:669，_PLUGIN_STAGE_SCRIPT） | 已加固，误报 | stage 脚本只在容器内跑；`path` 来自 manifest.sources，调用侧 `_execute_source_plugin`（:856-871）已做 normpath 包含性检查 + 绝对路径/`..` 段拒绝；Linux 下反斜杠非分隔符无绕过 |
+| XML 实体扩展（research/paper_collector.py:338） | 已加固，误报 | 唯一 ET 解析点；`_XML_DECLARATION`（`<!\s*(?:DOCTYPE\|ENTITY)\b`，IGNORECASE）在 `ET.fromstring` 前拒绝 DOCTYPE/ENTITY——实体扩展必需的 DTD 声明无法到达解析器 |
+| 疑似跨文件污点（research/pdf_extractor.py:38，medium advisory） | 误报 | 提取脚本是可信控制面代码、argv 全固定（`input/document.pdf` + 限额数字），PDF 字节不进源码/路径/stdin；analyst 指向的 tests/test_gateway_client.py:533 是测试内部路径用法 |

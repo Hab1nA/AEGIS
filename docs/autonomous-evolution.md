@@ -704,6 +704,29 @@ reflection 非 Warrior 收集即拒等用例；全量回归 803 passed + 10 skip
 `test_reflect_strategy_proposals_reach_collection` 更新为收集期拒绝的新契约，
 "提案不静默丢失"的回归意图保留）。
 
+## 5b.9 Mimosa findings 逐项裁决：9 项全无需修（2026-09-16）
+
+normal 深度扫描（scan-…594e0f317c01，聚焦本轮改动文件）报告 9 findings。逐项
+人工核查后**无一需要代码修复**，全部为设计内行为、有意确定性或既有加固的误报：
+
+- **exec 类代码注入 ×5**：全部是 `SandboxBackend.exec` 方法名命中的静态模式
+  （backend.py:49 协议声明、owned.py:81 纯委托、fake.py:119 测试记录、
+  wsl.py:253 向固定 JSON agent 发请求、subagent_worker.py:42 subprocess），
+  非内建 `exec()`；执行域为容器（cap-drop/all/read-only/network none）或
+  发行版用户层（残余风险已记录），subagent worker 凭据面只见 sidecar。
+- **不安全随机数（promotion.py:104）**：`random.Random(seed=0xAE615)` 是
+  bootstrap 置信区间的可复现重采样——统计确定性恰是设计目标，非安全随机。
+- **路径穿越（agent_runtime.py:669）**：flag 的是 stage 脚本常量文本；实际
+  `path` 在 `_execute_source_plugin`（:856-871）经 normpath 包含性 + 绝对
+  路径/`..` 段双重拒绝，且脚本仅在容器 /tmp（noexec tmpfs）内运行。
+- **XML 实体扩展（paper_collector.py:338）**：全库唯一 ET 解析点，已有
+  `_XML_DECLARATION` 在解析前拒绝 DOCTYPE/ENTITY（实体扩展必需 DTD）。
+- **跨文件污点 advisory（pdf_extractor.py:38，medium）**：提取脚本 argv 全
+  固定、PDF 字节不进源码/路径，analyst 链到 tests 内部路径属分析器噪声。
+
+裁决台账已固化进 `wiki/20-threat-model.md`（新增 findings 裁决表），后续
+扫描复现同类 finding 时直接引用，不再重复人工核查。
+
 ## 6. 边界与后续项
 
 - 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面
