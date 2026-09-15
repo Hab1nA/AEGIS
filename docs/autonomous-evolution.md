@@ -92,11 +92,11 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
   `test_cycle_ports.py::test_environment_candidate_build_activates_and_binds_runtime_image`
   与真实沙箱驱动覆盖。
 
-真实 relay 模型（agnes-2.5-flash）按以下约定可稳定产出合法 JSON action：
+真实 relay 模型（agnes-3.0-flash）按以下约定可稳定产出合法 JSON action：
 
-**网关凭据与协议要求（agnes-2.5-flash）**
+**网关凭据与协议要求（agnes-3.0-flash）**
 
-- `AEGIS_OPENAI_BASE_URL=https://apihub.agnes-ai.com/v1`（agnes-2.5-flash
+- `AEGIS_OPENAI_BASE_URL=https://apihub.agnes-ai.com/v1`（agnes-3.0-flash
   官方 hub；网关固定 `POST {base_url}/responses`，即 `/v1/responses`；旧的
   `https://opencode.ai/zen/go/v1` 是上一代 deepseek relay，已随切换弃用）
 - `AEGIS_OPENAI_API_KEY=<sk-...>`（必需）。配置采用**项目级**方式：在
@@ -114,14 +114,17 @@ v2 分支）、cycle 沙箱未走 doctor/prepare 生命周期（补齐并加随�
   默认指向 agnes 官方 hub `https://apihub.agnes-ai.com/v1`。
 - `AEGIS_OPENAI_TIMEOUT_SECONDS`（可选，默认 900；thinking max + 65K
   输出下建议 3600，见下"预算默认值"）
-- campaign 配置三角色 `model: "agnes-2.5-flash"` 且
-  `reasoning_effort: "max"`（max 即 thinking 开启、预算打满 65,536；
-  配置与网关请求均接受 `max`）
+- campaign 配置三角色 `model: "agnes-3.0-flash"`。推理强度由网关**定死**：
+  每个请求固定携带标准 Responses `reasoning: {"effort": "high"}`（中继枚举
+  minimal/low/medium/high 的上限；`high` 实际按 medium 服务，thinking 默认
+  开启且无法关闭），`role_reasoning_effort` 配置值不再影响实际请求。
+  3.0 回原生 usage 形状，verified 直接成立。
 
 环境变量由运行进程环境提供，网关与子代理 worker 均继承。真实连通性已用项目
-自身 `ModelGateway` 验证（responses + json_object + max，usage verified）。
+自身 `ModelGateway` 验证（responses + json_object + reasoning 定死上限，
+usage verified）。
 若 relay 偶发输出非 JSON 文本，运行时按既有 JSON 契约拒绝并让模型在界内步数
-重试。另注意：agnes-2.5-flash 的 `/responses` 响应以 `reasoning` 项开头、
+重试。另注意：agnes-3.0-flash 的 `/responses` 响应以 `reasoning` 项开头、
 真实 JSON 在最后的 `message` 项（`output_text` 字段可能缺失）；网关提取器
 按"跳过推理项、取最后一个 message 项文本"处理，并在交给 JSON 解析前剥离
 ```json 围栏与前后空白（该模型默认会把结构化输出包进 markdown 围栏）。
@@ -192,16 +195,19 @@ usage verified。（注：该段描述基于 agnes hub 实测行为，若 hub �
   或 json_schema。响应未完成（`status: "incomplete"` / `incomplete_details`）
   或无文本时直接报错，绝不把截断结果交给运行时。system prompt 必须包含
   "json" 字样，`RoleAgentRuntime` 的固定提示词已满足。
-- **最高推理强度**：角色配置 `reasoning_effort: "max"`。agnes-2.5-flash
-  是隐藏推理模型（thinking 模式），`max` 把思考预算打满（65,536 token）
-  并保留可见 JSON 输出余量，实测稳定返回合法 action。
+- **最高推理强度**：网关把每个请求的推理强度**定死**为 Responses
+  `reasoning: {"effort": "high"}`（agnes-3.0-flash 中继的枚举上限，实际按
+  medium 服务）。agnes-3.0-flash 是隐藏推理模型（thinking 默认开启），
+  角色配置 `reasoning_effort` 与运行时策略 `role_reasoning_effort` 均不再
+  影响实际请求；3.0 不支持 2.5 的顶层 `reasoning_effort` 字段与
+  `budget_tokens` 打满语义。实测稳定返回合法 action。
 - **声明式任务锻造**：Judge 只声明任务内容（task_id、prompt、public/hidden
   cases、public_test、reference/defect/mutant 源码），控制面 TaskPackBuilder
   负责固定布局、manifest 与 content_hash、task_id 预留/冲突预检、文件白名单
   与 dry-run；模型不再写入草稿文件，缓存文件污染 sealed 套件的问题从结构上
   消除。task-validation 结果带 `status/registered_count/learning_outcome`，
   零注册周期标记 `learning-degraded`，不再以普通 task-outcome 静默完成。
-- **输出 token 上限**：agnes-2.5-flash 支持 512K（512,000 token）上下文
+- **输出 token 上限**：agnes-3.0-flash 支持 512K（512,000 token）上下文
   与最高 65.5K（65,536 token）输出；角色 `max_output_tokens` 默认直接对齐
   该能力上限（65,536），保证 max 思考（budget_tokens 打满）与最终 JSON
   内容都有充足余量，显著降低 `finish_reason: length` / 截断重试。注意

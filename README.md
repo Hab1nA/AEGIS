@@ -134,7 +134,7 @@ flowchart TD
 - Windows 宿主机 + **专用** WSL2 发行版（勿复用开发发行版）
 - 无根（rootless）Podman，含映像构建能力；可选 Trivy（环境面扫描）
 - Python 3.12+
-- 兼容 **OpenAI Responses 协议** 的中继服务（默认 agnes-2.5-flash，经 `https://apihub.agnes-ai.com/v1`）
+- 兼容 **OpenAI Responses 协议** 的中继服务（默认 agnes-3.0-flash，经 `https://apihub.agnes-ai.com/v1`）
 - （可选）本地 SearxNG 研究服务（`deploy/wsl/` 提供安装件，回环 `127.0.0.1:8888`）
 
 ## 安装
@@ -148,7 +148,7 @@ python -m pip install -e ".[dev]"
 项目级配置放在仓库根目录一个**被 git 忽略**的 `.aegis.env` 文件中，仅由 AEGIS CLI 从工作目录加载——不写入 Windows 用户/机器环境变量，因此不会影响 Codex 等其它工具。宿主机进程中显式设置的 `$env:AEGIS_OPENAI_*` 会覆盖文件中的同名键。
 
 ```text
-# 模型来源：agnes-2.5-flash（Responses 协议，thinking 由 reasoning_effort=max 开启）
+# 模型来源：agnes-3.0-flash（Responses 协议；网关把推理强度定死为枚举上限 reasoning={"effort":"high"}，与角色配置无关，中继按 medium 服务）
 AEGIS_OPENAI_BASE_URL=https://apihub.agnes-ai.com/v1
 AEGIS_OPENAI_API_KEY=sk-...
 # hidden-reasoning 中继可能较慢；thinking max + 65.5K 输出下建议 3600 秒

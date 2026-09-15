@@ -37,19 +37,19 @@
   "max_agent_steps": 96,
   "roles": {
     "warrior": {
-      "model": "agnes-2.5-flash",
+      "model": "agnes-3.0-flash",
       "budget_share": 0.55,
       "max_output_tokens": 65536,
       "reasoning_effort": "max"
     },
     "judge": {
-      "model": "agnes-2.5-flash",
+      "model": "agnes-3.0-flash",
       "budget_share": 0.225,
       "max_output_tokens": 65536,
       "reasoning_effort": "max"
     },
     "prosecutor": {
-      "model": "agnes-2.5-flash",
+      "model": "agnes-3.0-flash",
       "budget_share": 0.225,
       "max_output_tokens": 65536,
       "reasoning_effort": "max"

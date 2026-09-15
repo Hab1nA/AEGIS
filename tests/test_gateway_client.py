@@ -109,15 +109,16 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(transport.calls[0][1]["Authorization"], "Bearer super-secret")
         self.assertEqual(transport.calls[0][2]["text"], {"format": {"type": "json_object"}})
 
-    def test_reasoning_effort_is_forwarded(self) -> None:
-        request = GatewayRequest(
-            "model-a", (Message("user", "hello"),), 100, reasoning_effort="low"
-        )
-        self.assertEqual(ModelGateway._payload(request)["reasoning_effort"], "low")
-        request_max = GatewayRequest(
-            "model-a", (Message("user", "hello"),), 100, reasoning_effort="max"
-        )
-        self.assertEqual(ModelGateway._payload(request_max)["reasoning_effort"], "max")
+    def test_reasoning_effort_is_pinned_to_relay_ceiling(self) -> None:
+        # agnes-3.0: every call runs at the enum ceiling regardless of the
+        # per-role config value (relay serves `high` at medium).
+        for effort in (None, "none", "low", "medium", "high", "max"):
+            request = GatewayRequest(
+                "model-a", (Message("user", "hello"),), 100, reasoning_effort=effort
+            )
+            self.assertEqual(
+                ModelGateway._payload(request)["reasoning"], {"effort": "high"}
+            )
         with self.assertRaisesRegex(ValueError, "reasoning_effort"):
             GatewayRequest(
                 "model-a", (Message("user", "hello"),), 100, reasoning_effort="unbounded"

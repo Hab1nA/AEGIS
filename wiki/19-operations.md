@@ -13,7 +13,7 @@
   AEGIS_OPENAI_API_KEY=sk-...
   AEGIS_OPENAI_TIMEOUT_SECONDS=3600   # thinking max + 65K 输出建议值
   ```
-- 模型要求：`agnes-2.5-flash` + `reasoning_effort: "max"`（65,536 thinking 预算）；Responses 协议 + json_object 固定。
+- 模型要求：`agnes-3.0-flash`；Responses 协议 + json_object 固定。网关把推理强度**定死**为 `reasoning: {"effort": "high"}`（中继枚举上限 minimal/low/medium/high，`high` 实际按 medium 服务，thinking 无法关闭），与 `role_reasoning_effort` 配置值无关。
 - `AEGIS_OPENAI_USER_AGENT`：Cloudflare 前置中继可能按浏览器 UA 拦截（网关默认 Chrome 串，:118-126）。
 
 ## 配置文件（`configs/`）
@@ -54,7 +54,7 @@
 ## E2E 惯例（源自 docs/autonomous-evolution.md 台账）
 
 - 真实两代 smoke：真实 WSL/Podman + 真实模型连跑两代 `--run --repair`，十类证据 artifact 齐全、preflight 全过为通过线。
-- 已知模型瓶颈：agnes-2.5-flash 长程组合弱（Warrior 求解阶段步数超限/工具参数构造失败率高，2026-09-14/15 两轮复现）——`max_agent_steps=96` 起步；失败 trace 看 `StepLimitExceeded` 的 `step:action:ok|rejected(...)`。
+- 已知模型瓶颈：agnes-3.0-flash 长程组合弱（Warrior 求解阶段步数超限/工具参数构造失败率高，2026-09-14/15 两轮复现）——`max_agent_steps=96` 起步；失败 trace 看 `StepLimitExceeded` 的 `step:action:ok|rejected(...)`。
 - 401 → 刷新 `.aegis.env` 的 key；偶发 relay JSON 围栏/截断由网关兜底（[14](14-gateway-accounting.md)）。
 
 ## 诊断入口

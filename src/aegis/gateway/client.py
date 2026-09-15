@@ -1,8 +1,12 @@
 """OpenAI-compatible Responses API gateway forcing json_object output.
 
-Default relay: `agnes-2.5-flash` at `https://apihub.agnes-ai.com/v1`
-(endpoint `POST /responses`), Bearer auth. Thinking is enabled via the
-top-level `reasoning_effort: "max"` field — see docs/autonomous-evolution.md.
+Default relay: `agnes-3.0-flash` at `https://apihub.agnes-ai.com/v1`
+(endpoint `POST /responses`), Bearer auth. Two payload properties are
+pinned at the gateway regardless of request/config: ``text.format`` is
+always ``json_object``, and reasoning effort is always the relay enum
+ceiling ``reasoning: {"effort": "high"}`` (the agnes-3.0 relay serves
+``high`` at medium, rejects ``none``, and ignores the legacy top-level
+``reasoning_effort`` field). See docs/autonomous-evolution.md.
 """
 
 from __future__ import annotations
@@ -365,8 +369,9 @@ class ModelGateway:
         payload["text"] = {"format": {"type": "json_object"}}
         if request.seed is not None:
             payload["seed"] = request.seed
-        if request.reasoning_effort is not None:
-            payload["reasoning_effort"] = request.reasoning_effort
+        # Reasoning effort is pinned to the relay enum ceiling regardless of
+        # per-role config (agnes-3.0 serves `high` at medium; see module doc).
+        payload["reasoning"] = {"effort": "high"}
         return payload
 
     @staticmethod

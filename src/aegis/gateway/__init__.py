@@ -1,10 +1,12 @@
 """OpenAI-compatible native Responses model gateway and role protocols.
 
-The relay currently targets `agnes-2.5-flash` at
-`https://apihub.agnes-ai.com/v1/responses` (Responses protocol, Bearer auth,
-`reasoning_effort: "max"` enables thinking with a full 65,536-token budget).
-The same gateway contract works against any OpenAI/DeepSeek-compatible
-Responses endpoint; only base_url and credentials are project-configured.
+The relay currently targets `agnes-3.0-flash` at
+`https://apihub.agnes-ai.com/v1/responses` (Responses protocol, Bearer auth).
+The gateway pins reasoning effort to the relay enum ceiling — every request
+carries `reasoning: {"effort": "high"}` (the relay serves `high` at medium
+and cannot disable thinking) — and forces `text.format=json_object`. The
+same gateway contract works against any OpenAI/DeepSeek-compatible Responses
+endpoint; only base_url and credentials are project-configured.
 """
 
 from .client import GatewayConfig, ModelGateway, RetryPolicy
