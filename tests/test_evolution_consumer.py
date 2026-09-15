@@ -69,6 +69,46 @@ class EvolutionConsumerTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertIs(records[0].state, CandidateState.VALIDATED)
 
+    def test_reflection_proposals_targeting_non_warrior_are_rejected_at_collection(self) -> None:
+        consumed = consume_cycle_proposals(
+            registry=self.registry,
+            artifacts=self.artifacts,
+            submission={},
+            prosecutor_audit={},
+            objective_id=self.objective,
+            collection_evidence_id="cycle:1:eval",
+            reflections=[
+                {
+                    "proposals": [
+                        {
+                            "proposal_id": "w1",
+                            "target_role": "warrior",
+                            "content": workflow(),
+                            "rationale": "warrior workflow",
+                        },
+                        {
+                            "proposal_id": "j1",
+                            "target_role": "judge",
+                            "content": workflow(),
+                            "rationale": "judge workflow",
+                        },
+                    ]
+                }
+            ],
+        )
+        self.assertEqual(len(consumed), 2)
+        by_id = {item.proposal_id: item for item in consumed}
+        self.assertTrue(by_id["w1"].collected and by_id["w1"].validated)
+        # The judge-target reflection proposal is rejected at collection:
+        # non-Warrior targets have no shadow attribution, so registering it
+        # would only guarantee a later rejection.
+        self.assertFalse(by_id["j1"].collected)
+        self.assertFalse(by_id["j1"].validated)
+        self.assertIn("may only target the Warrior", by_id["j1"].error)
+        records = self.registry.candidates()
+        self.assertEqual(len(records), 1)
+        self.assertIs(records[0].state, CandidateState.VALIDATED)
+
     def test_consumes_evolution_request_proposal_and_subject_role_candidates(self) -> None:
         submission = {
             "role": "warrior",

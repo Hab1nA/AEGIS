@@ -72,6 +72,12 @@ _V2_ROLE_INTEGER_FIELDS = frozenset(
         "role_max_search_results",
     }
 )
+# Enforcement note for prosecutors reading the schema: only role_max_steps,
+# role_max_output_tokens and role_command_timeout_seconds are live budget
+# parameters.  The remaining role_* fields are validated and stored but the
+# runtime pins them to the fixed safety constants (agent_runtime
+# _refresh_policy); amendments to them would be inert, and they are excluded
+# from the amendable patch whitelist for exactly that reason.
 _V2_ROLE_NUMBER_FIELDS = frozenset({"role_command_timeout_seconds"})
 _V2_INTEGER_LIMITS = frozenset(
     {
@@ -116,11 +122,14 @@ _POLICY_FIELDS_V2 = frozenset(
 # The external cost envelope plus a bounded set of cycle-flow parameters: the
 # runtime-policy fields the Prosecutor may adjust (with council ratification).
 # Flow bounds keep the adjustments inside sane operating ranges; everything
-# else remains a fixed safety constant or inert legacy value.
+# else remains a fixed safety constant or inert legacy value.  The campaign
+# config may preset the same fields at genesis within the identical bounds
+# (autonomy_v2.runtime_flow_parameters); afterwards only the Prosecutor moves
+# them.
 _ENVELOPE_FIELDS = frozenset(
     {"max_total_tokens", "max_requests", "max_model_invocations", "max_active_runtime_seconds"}
 )
-_FLOW_FIELD_BOUNDS: Mapping[str, tuple[int, int]] = {
+FLOW_FIELD_BOUNDS: Mapping[str, tuple[int, int]] = {
     "cohort_limit": (1, 12),
     "task_authoring_attempts": (1, 4),
     "task_proposals_per_cycle": (1, 8),
@@ -128,6 +137,7 @@ _FLOW_FIELD_BOUNDS: Mapping[str, tuple[int, int]] = {
     "council_max_messages": (2, 64),
     "objective_history_window": (1, 5),
     "candidate_evaluations_per_cycle": (0, 4),
+    "max_evolution_requests_per_run": (1, 4),
     "sandbox_cpus": (1, 8),
     "sandbox_memory_gib": (1, 8),
     "sandbox_pids": (64, 1024),
@@ -1154,14 +1164,14 @@ class RuntimePolicyRegistry:
             raise RuntimePolicyError("only the prosecutor may amend runtime policy")
         if not isinstance(patch, Mapping) or not patch:
             raise RuntimePolicyError("runtime policy patch must be a non-empty mapping")
-        unknown = set(patch) - _ENVELOPE_FIELDS - set(_FLOW_FIELD_BOUNDS)
+        unknown = set(patch) - _ENVELOPE_FIELDS - set(FLOW_FIELD_BOUNDS)
         if unknown:
             raise RuntimePolicyError(
                 f"runtime policy patch cannot modify fields: {', '.join(sorted(map(str, unknown)))}"
             )
         for name, raw in patch.items():
-            if name in _FLOW_FIELD_BOUNDS:
-                bounds = _FLOW_FIELD_BOUNDS[name]
+            if name in FLOW_FIELD_BOUNDS:
+                bounds = FLOW_FIELD_BOUNDS[name]
                 if isinstance(raw, bool) or not isinstance(raw, int) or not bounds[0] <= raw <= bounds[1]:
                     raise RuntimePolicyError(
                         f"{name} must be an integer in [{bounds[0]},{bounds[1]}]"

@@ -123,7 +123,7 @@ def test_v2_has_no_legacy_economic_fields_and_accepts_values_above_old_caps() ->
 
     # The evaluation budget is now a bounded [0,4] flow parameter: accepted
     # at genesis (operator-controlled) and bound-checked on prosecutor
-    # amendments through _FLOW_FIELD_BOUNDS.
+    # amendments through FLOW_FIELD_BOUNDS.
     accepted = RuntimePolicyVersion.create(
         parent_policy_id=None,
         effective_cycle=0,
@@ -131,9 +131,44 @@ def test_v2_has_no_legacy_economic_fields_and_accepts_values_above_old_caps() ->
         provider_output_limits=provider_limits(),
     )
     assert accepted.values["candidate_evaluations_per_cycle"] == 2
-    from aegis.runtime_policy import _FLOW_FIELD_BOUNDS
+    from aegis.runtime_policy import FLOW_FIELD_BOUNDS
 
-    assert _FLOW_FIELD_BOUNDS["candidate_evaluations_per_cycle"] == (0, 4)
+    assert FLOW_FIELD_BOUNDS["candidate_evaluations_per_cycle"] == (0, 4)
+    assert FLOW_FIELD_BOUNDS["max_evolution_requests_per_run"] == (1, 4)
+
+
+def test_max_evolution_requests_per_run_is_an_amendable_bounded_flow_parameter(tmp_path: Path) -> None:
+    store, policies = registry(tmp_path)
+    genesis = policies.genesis(values_v2(), provider_limits())
+    boundary = RuntimeStageBoundary(0, 1, "audit")
+    amended = policies.request_patch_immediately(
+        requested_by=Role.PROSECUTOR,
+        requested_at=boundary,
+        request_id="raise-proposal-capacity",
+        base_policy_id=genesis.policy_id,
+        patch={"max_evolution_requests_per_run": 3},
+        consumed={},
+        reason="multi-candidate evaluation budget needs proposal capacity",
+    )
+    assert amended.revision == 1
+    assert (
+        policies.effective_for_stage(boundary).values["max_evolution_requests_per_run"]
+        == 3
+    )
+    with pytest.raises(
+        RuntimePolicyError,
+        match=r"max_evolution_requests_per_run must be an integer in \[1,4\]",
+    ):
+        policies.request_patch_immediately(
+            requested_by=Role.PROSECUTOR,
+            requested_at=boundary,
+            request_id="beyond-flow-range",
+            base_policy_id=amended.resulting_policy_id,
+            patch={"max_evolution_requests_per_run": 5},
+            consumed={},
+            reason="outside the bounded legal range",
+        )
+    store.close()
 
 
 def test_v1_genesis_migrates_once_to_content_addressed_v2_child(tmp_path: Path) -> None:

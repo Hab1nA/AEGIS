@@ -6,7 +6,7 @@
 
 | 常量 | 值 | 位置 |
 |---|---|---|
-| MAX_EVOLUTION_REQUESTS | 1 | :86 |
+| MAX_EVOLUTION_REQUESTS | 1（=genesis 默认；policy 可调 [1,4]） | :86 / runtime_policy.py FLOW_FIELD_BOUNDS |
 | MAX_EVOLUTION_SOURCE_REFS | 5 | :87 |
 | FIXED_ROLE_MAX_STEPS | 128 | :92 |
 | FIXED_ROLE_MAX_READ_BYTES / MAX_WRITE_BYTES | 4 MiB | :93-94 |
@@ -66,12 +66,13 @@
 
 | 常量 | 值 | 位置 |
 |---|---|---|
-| candidate_evaluations_per_cycle | [0,4] 默认 1 | runtime_policy.py:129 / cycle_ports genesis |
+| candidate_evaluations_per_cycle | [0,4] 默认 1 | runtime_policy.py FLOW_FIELD_BOUNDS / cycle_ports genesis |
 | evaluation_seed_count | 默认 2 夹 [2,4]；扩种至多 1 次 | config.py:278-280 / cycle_ports:315 |
 | candidate_max_extra_steps | 默认 24（流程界限 [4,128]） | configs / runtime_policy.py:125 |
 | candidate_probation_cycles | 默认 2 ∈ [0,16]；非劣 -0.01 | config.py:110 |
 | task_holdout_delay_cycles | 默认 1（registry 强制 ≥1） | config.py:80 / registry.py:271 |
-| cohort_limit / task_authoring_attempts / task_proposals_per_cycle | [1,12] / [1,4] / [1,8]，默认 3/2/3 | runtime_policy.py:122-124 |
+| cohort_limit / task_authoring_attempts / task_proposals_per_cycle | [1,12] / [1,4] / [1,8]，默认 3/2/3 | runtime_policy.py FLOW_FIELD_BOUNDS |
+| genesis 流程预设（runtime_flow_parameters） | 8 个无专属 config 字段的流程参数可在同界限内由 campaign config 预设 | config.py `_FLOW_PRESET_FIELDS` / runtime_policy.py `FLOW_FIELD_BOUNDS` |
 | population_max_cells | 默认 128（代码默认 256） | cycle_ports genesis :6775 / population.py:32 |
 | 试用期 breach | delta < -margin（-0.01） | cycle_ports.py:5197 区域 |
 

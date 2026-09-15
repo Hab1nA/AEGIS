@@ -342,6 +342,30 @@ def _consume_reflection_proposals(
                     )
                 )
                 continue
+            if target_role is not Role.WARRIOR:
+                # Non-Warrior targets have no shadow attribution in this
+                # release: registering them would only guarantee a later
+                # rejection, so filter them here while keeping the inbox
+                # visible.
+                consumed.append(
+                    ConsumedCandidate(
+                        EvolutionSurface.WORKFLOW,
+                        target_role,
+                        "",
+                        "",
+                        "reflection",
+                        proposal_id,
+                        rationale,
+                        collected=False,
+                        validated=False,
+                        error=(
+                            "workflow reflection proposals may only target the "
+                            "Warrior; non-Warrior targets have no shadow "
+                            "attribution in this release"
+                        ),
+                    )
+                )
+                continue
             dedupe_key = (proposal_id, target_role.value)
             if dedupe_key in seen:
                 continue

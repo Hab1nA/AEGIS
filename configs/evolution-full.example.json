@@ -31,13 +31,18 @@
     "harness_evolution_enabled": true,
     "harness_repo_root": null,
     "harness_source_ref": "REPLACE_WITH_FULL_40_HEX_COMMIT_PINNED_IN_WSL_SOURCE_MIRROR",
-    "harness_canary_command": [
-      "python3",
-      "-c",
-      "import aegis.evolution.cycle_entrypoint"
-    ],
     "harness_activation_automatic": true,
     "meta_evolution_enabled": true,
+    "runtime_flow_parameters": {
+      "cohort_limit": 6,
+      "task_authoring_attempts": 3,
+      "task_proposals_per_cycle": 5,
+      "candidate_evaluations_per_cycle": 4,
+      "max_evolution_requests_per_run": 2,
+      "sandbox_cpus": 2,
+      "sandbox_memory_gib": 2,
+      "sandbox_pids": 512
+    },
     "subagent_max_steps": 8,
     "subagent_timeout_seconds": 180.0,
     "subagent_max_concurrency": 2,

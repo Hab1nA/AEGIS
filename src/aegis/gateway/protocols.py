@@ -83,6 +83,9 @@ def build_role_request(
     if not objective.strip():
         raise ValueError("objective must not be empty")
     envelope = {"protocol_version": 1, "role": policy.role.value, "objective": objective, "context": context}
+    # seed is intentionally left unset: the hidden-reasoning relay does not
+    # honour it, and paired-evaluation determinism is owned by evaluation_seed
+    # at the cohort/arm layer instead of by API sampling.
     return GatewayRequest(
         model=model,
         messages=(

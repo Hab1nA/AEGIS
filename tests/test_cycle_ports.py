@@ -2132,5 +2132,47 @@ class CyclePortsTests(unittest.TestCase):
         self.assertEqual(empty["cache_hit_ratio"], -1)
 
 
+def test_runtime_policy_genesis_reads_flow_parameter_presets() -> None:
+    from types import SimpleNamespace
+
+    from aegis.config import AutonomyV2Config
+    from aegis.cycle_ports import _runtime_policy_genesis_values
+    from aegis.runtime_policy import FLOW_FIELD_BOUNDS
+
+    autonomy = AutonomyV2Config.from_mapping(
+        {
+            "runtime_flow_parameters": {
+                "candidate_evaluations_per_cycle": 4,
+                "cohort_limit": 8,
+                "max_evolution_requests_per_run": 2,
+                "sandbox_cpus": 4,
+            }
+        }
+    )
+    campaign = SimpleNamespace(
+        total_tokens=1_000_000,
+        max_requests=100,
+        max_rounds=10,
+        wall_time_seconds=3600.0,
+        autonomy_v2=autonomy,
+    )
+    limits = SimpleNamespace(max_steps=96)
+    roles = {
+        name: SimpleNamespace(budget_share=share, max_output_tokens=65_536, reasoning_effort="max")
+        for name, share in (("warrior", 0.55), ("judge", 0.225), ("prosecutor", 0.225))
+    }
+    values = _runtime_policy_genesis_values(campaign, limits, roles)
+    assert values["candidate_evaluations_per_cycle"] == 4
+    assert values["cohort_limit"] == 8
+    assert values["max_evolution_requests_per_run"] == 2
+    assert values["sandbox_cpus"] == 4
+    # Absent preset names keep the built-in genesis defaults.
+    assert values["sandbox_pids"] == 256
+    assert values["task_authoring_attempts"] == 2
+    assert values["task_proposals_per_cycle"] == 3
+    # The Prosecutor amendment whitelist shares the same bounds.
+    assert FLOW_FIELD_BOUNDS["max_evolution_requests_per_run"] == (1, 4)
+
+
 if __name__ == "__main__":
     unittest.main()

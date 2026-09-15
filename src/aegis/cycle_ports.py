@@ -4417,33 +4417,36 @@ class ModelCyclePorts:
         # Stale pre-rejection: a candidate whose parent is no longer the
         # current champion can never pass the registry's activation staleness
         # check, so rejecting it here saves a full paired evaluation slot.
-        if candidate is not None:
+        # Drain the whole stale prefix — every rejected candidate is replaced
+        # by the next validated candidate until one has a live parent.
+        while candidate is not None:
             champion = self._evolution.champion(candidate.surface, candidate.target_role)
             parent_id = candidate.parent_candidate_id
-            if champion is not None and parent_id != champion.candidate_id:
-                self._evolution.reject(
-                    candidate.candidate_id,
-                    reason=(
-                        "candidate is superseded: its parent is no longer the "
-                        "current champion"
-                    ),
-                )
-                result["rejected"].append(
-                    {
-                        "surface": candidate.surface.value,
-                        "target_role": candidate.target_role.value,
-                        "artifact_id": candidate.artifact_id,
-                        "error": "candidate superseded by a newer champion",
-                    }
-                )
-                candidate = next(
-                    (
-                        item
-                        for item in self._evolution.validated_candidates()
-                        if item.target_role is Role.WARRIOR
-                    ),
-                    None,
-                )
+            if champion is None or parent_id == champion.candidate_id:
+                break
+            self._evolution.reject(
+                candidate.candidate_id,
+                reason=(
+                    "candidate is superseded: its parent is no longer the "
+                    "current champion"
+                ),
+            )
+            result["rejected"].append(
+                {
+                    "surface": candidate.surface.value,
+                    "target_role": candidate.target_role.value,
+                    "artifact_id": candidate.artifact_id,
+                    "error": "candidate superseded by a newer champion",
+                }
+            )
+            candidate = next(
+                (
+                    item
+                    for item in self._evolution.validated_candidates()
+                    if item.target_role is Role.WARRIOR
+                ),
+                None,
+            )
         # Non-Warrior candidates cannot run a Warrior-solve shadow arm; reject
         # them every cycle with an explicit reason instead of letting them
         # linger in VALIDATED (a Warrior candidate in the same cycle must not
@@ -6731,6 +6734,10 @@ def _runtime_policy_genesis_values(
         FIXED_ROLE_MAX_WRITE_BYTES,
         FIXED_ROLE_RESEARCH_ACTION_BUDGET,
     )
+    # Operator presets for the bounded cycle-flow parameters (validated
+    # against the same FLOW_FIELD_BOUNDS at config parse time); absent names
+    # keep the built-in genesis defaults below.
+    flow = dict(getattr(autonomy, "runtime_flow_parameters", ()) or ())
 
     return {
         # Single external cost envelope: operator-set, far above any normal
@@ -6778,17 +6785,21 @@ def _runtime_policy_genesis_values(
         "subagent_max_requests": max(
             1, int(campaign_config.max_requests) // 4, 5_000
         ),
-        "max_evolution_requests_per_run": 1,
+        "max_evolution_requests_per_run": int(
+            flow.get("max_evolution_requests_per_run", 1)
+        ),
         "max_evolution_source_refs": 5,
-        "task_authoring_attempts": 2,
-        "task_proposals_per_cycle": 3,
-        "cohort_limit": 3,
-        "candidate_evaluations_per_cycle": 1,
+        "task_authoring_attempts": int(flow.get("task_authoring_attempts", 2)),
+        "task_proposals_per_cycle": int(flow.get("task_proposals_per_cycle", 3)),
+        "cohort_limit": int(flow.get("cohort_limit", 3)),
+        "candidate_evaluations_per_cycle": int(
+            flow.get("candidate_evaluations_per_cycle", 1)
+        ),
         "candidate_max_steps": int(getattr(autonomy, "candidate_max_extra_steps", 24)),
         "population_max_cells": 128,
-        "sandbox_cpus": 1,
-        "sandbox_memory_gib": 1,
-        "sandbox_pids": 256,
+        "sandbox_cpus": int(flow.get("sandbox_cpus", 1)),
+        "sandbox_memory_gib": int(flow.get("sandbox_memory_gib", 1)),
+        "sandbox_pids": int(flow.get("sandbox_pids", 256)),
         "council_max_messages": int(getattr(autonomy, "council_max_messages", 200)),
         "council_max_tokens": int(getattr(autonomy, "council_max_tokens", 4_194_304)),
         "task_holdout_delay_cycles": int(getattr(autonomy, "task_holdout_delay_cycles", 1)),

@@ -209,6 +209,75 @@ class ConfigTests(unittest.TestCase):
                 )
             )
 
+    def test_runtime_flow_parameters_are_bounded_genesis_presets(self):
+        roles = {
+            "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},
+            "judge": {"model": "j", "budget_share": 0.225, "max_output_tokens": 4096},
+            "prosecutor": {"model": "p", "budget_share": 0.225, "max_output_tokens": 4096},
+        }
+        config = CampaignConfig.from_mapping(
+            valid_config(
+                acceptance_profile="autonomous_evolution_v2",
+                roles=roles,
+                task_pack_paths=[],
+                autonomy_v2={
+                    "public_repo_url": "https://github.com/example/aegis-roles.git",
+                    "runtime_flow_parameters": {
+                        "cohort_limit": 6,
+                        "candidate_evaluations_per_cycle": 4,
+                        "max_evolution_requests_per_run": 2,
+                        "sandbox_pids": 512,
+                    },
+                },
+            )
+        )
+        assert config.autonomy_v2 is not None
+        self.assertEqual(
+            config.autonomy_v2.runtime_flow_parameters,
+            (
+                ("candidate_evaluations_per_cycle", 4),
+                ("cohort_limit", 6),
+                ("max_evolution_requests_per_run", 2),
+                ("sandbox_pids", 512),
+            ),
+        )
+        self.assertEqual(CampaignConfig.from_mapping(config.to_dict()), config)
+        # Defaults stay empty: absent names keep the built-in genesis values.
+        default = CampaignConfig.from_mapping(
+            valid_config(
+                acceptance_profile="autonomous_evolution_v2",
+                roles=roles,
+                task_pack_paths=[],
+                autonomy_v2={"public_repo_url": "https://github.com/example/aegis-roles.git"},
+            )
+        )
+        assert default.autonomy_v2 is not None
+        self.assertEqual(default.autonomy_v2.runtime_flow_parameters, ())
+        # Out-of-bounds, unknown, and non-integer values all fail closed.
+        for payload in (
+            {"cohort_limit": 13},
+            {"cohort_limit": 0},
+            {"candidate_evaluations_per_cycle": 5},
+            {"max_evolution_requests_per_run": 0},
+            {"sandbox_cpus": 9},
+            {"bogus_field": 1},
+            {"cohort_limit": "3"},
+            {"cohort_limit": True},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ConfigError):
+                    CampaignConfig.from_mapping(
+                        valid_config(
+                            acceptance_profile="autonomous_evolution_v2",
+                            roles=roles,
+                            task_pack_paths=[],
+                            autonomy_v2={
+                                "public_repo_url": "https://github.com/example/aegis-roles.git",
+                                "runtime_flow_parameters": payload,
+                            },
+                        )
+                    )
+
     def test_evaluation_seed_count_is_bounded_to_2_through_4(self):
         roles = {
             "warrior": {"model": "w", "budget_share": 0.55, "max_output_tokens": 4096},

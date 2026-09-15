@@ -704,8 +704,12 @@ def test_reflect_strategy_proposals_reach_collection(tmp_path: Path) -> None:
             artifacts.get(result.candidate_evaluation).decode("utf-8")
         )
         rejected = candidate_evidence["rejected"]
+        # The prosecutor-target reflection proposal is still visibly rejected
+        # (never silently dropped) — since 2026-09-16 at collection time.
         assert any(
-            item.get("error", "").startswith("only Warrior-target")
+            item.get("error", "").startswith(
+                "workflow reflection proposals may only target the Warrior"
+            )
             and item.get("target_role") == "prosecutor"
             for item in rejected
         ), rejected

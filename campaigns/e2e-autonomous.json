@@ -54,11 +54,6 @@
     "harness_evolution_enabled": true,
     "harness_repo_root": null,
     "harness_source_ref": "fadf2578674ebf742c51f584ae1fd67be45d780d",
-    "harness_canary_command": [
-      "python3",
-      "-c",
-      "import aegis.evolution.cycle_entrypoint"
-    ],
     "harness_activation_automatic": true,
     "meta_evolution_enabled": true,
     "subagent_max_steps": 8,

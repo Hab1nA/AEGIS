@@ -15,8 +15,27 @@ from aegis.autonomy_budget import (
     AUTONOMY_ROLE_SHARES,
 )
 from aegis.evolution.source import is_local_source_mirror
+from aegis.runtime_policy import FLOW_FIELD_BOUNDS
 
 AUTONOMY_ACCEPTANCE_PROFILES = frozenset({"autonomous_evolution_v1", "autonomous_evolution_v2"})
+
+# Flow parameters the operator may preset at genesis through
+# ``autonomy_v2.runtime_flow_parameters``.  These are exactly the bounded
+# cycle-flow knobs that have no dedicated campaign-config field; the bounds
+# are the same FLOW_FIELD_BOUNDS the Prosecutor's amendments are checked
+# against afterwards.
+_FLOW_PRESET_FIELDS = frozenset(
+    {
+        "cohort_limit",
+        "task_authoring_attempts",
+        "task_proposals_per_cycle",
+        "candidate_evaluations_per_cycle",
+        "max_evolution_requests_per_run",
+        "sandbox_cpus",
+        "sandbox_memory_gib",
+        "sandbox_pids",
+    }
+)
 
 
 class ConfigError(ValueError):
@@ -109,6 +128,9 @@ class AutonomyV2Config:
     evaluation_seed_count: int = 2
     candidate_probation_cycles: int = 2
     require_warrior_strategy_proposal: bool = False
+    # Genesis presets for the bounded cycle-flow parameters, stored as sorted
+    # (name, value) pairs.  Absent names keep the built-in genesis defaults.
+    runtime_flow_parameters: tuple[tuple[str, int], ...] = ()
 
     _FIELDS = frozenset(
         {
@@ -141,6 +163,7 @@ class AutonomyV2Config:
             "evaluation_seed_count",
             "candidate_probation_cycles",
             "require_warrior_strategy_proposal",
+            "runtime_flow_parameters",
         }
     )
     _EVOLUTION_SURFACES = frozenset(
@@ -285,6 +308,26 @@ class AutonomyV2Config:
             raw.get("candidate_max_extra_steps", 24),
             "autonomy_v2.candidate_max_extra_steps",
         )
+        flow_raw = raw.get("runtime_flow_parameters", {})
+        if not isinstance(flow_raw, Mapping):
+            raise ConfigError("autonomy_v2.runtime_flow_parameters must be an object")
+        flow_pairs: list[tuple[str, int]] = []
+        for name, value in flow_raw.items():
+            if name not in _FLOW_PRESET_FIELDS:
+                raise ConfigError(
+                    f"autonomy_v2.runtime_flow_parameters has unknown field {name!r}"
+                )
+            bounds = FLOW_FIELD_BOUNDS[name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not bounds[0] <= value <= bounds[1]
+            ):
+                raise ConfigError(
+                    f"autonomy_v2.runtime_flow_parameters.{name} must be an integer "
+                    f"in [{bounds[0]}, {bounds[1]}]"
+                )
+            flow_pairs.append((name, value))
         return cls(
             enabled=enabled,
             dynamic_only=dynamic_only,
@@ -335,6 +378,7 @@ class AutonomyV2Config:
                 raw.get("require_warrior_strategy_proposal", False),
                 "autonomy_v2.require_warrior_strategy_proposal",
             ),
+            runtime_flow_parameters=tuple(sorted(flow_pairs)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -372,6 +416,7 @@ class AutonomyV2Config:
             "evaluation_seed_count": self.evaluation_seed_count,
             "candidate_probation_cycles": self.candidate_probation_cycles,
             "require_warrior_strategy_proposal": self.require_warrior_strategy_proposal,
+            "runtime_flow_parameters": dict(self.runtime_flow_parameters),
         }
 
 
@@ -380,6 +425,10 @@ class RoleConfig:
     model: str
     budget_share: float
     max_output_tokens: int
+    # Currently inert: the gateway pins every request's reasoning effort to
+    # the relay enum ceiling (agnes-3.0 serves `high` at medium and ignores
+    # the legacy top-level field).  Accepted and forwarded for forward
+    # compatibility with relays that honour per-role effort again.
     reasoning_effort: str | None = None
 
     @classmethod

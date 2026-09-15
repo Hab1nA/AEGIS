@@ -6,15 +6,15 @@ Warrior 的进化提议从收集到激活/回滚的完整门槛链。注册表�
 
 ## 1. 收集（`evolution/consumer.py`）
 
-- 每 cycle 消费三个通道：`strategy.propose`、`evolution.request`、Prosecutor 审计中的 `role_candidates`（:277-383, :511-567）。
-- 收集即拒：非 Warrior 目标候选、未启用表面、非 Warrior 提议者——给明确原因，不注册、不烧评测名额（:75-106）。
+- 每 cycle 消费三个通道：`strategy.propose`、`evolution.request`、Prosecutor 审计中的 `role_candidates`（:277-383, :511-567），外加议会 reflection 中的 workflow 提案（`_consume_reflection_proposals` :292-397）。
+- 收集即拒：非 Warrior 目标候选（**含 reflection 提案**，2026-09-16 起 judge/prosecutor 目标的 workflow 反思提案在收集层拒绝而非注册后搁置）、未启用表面、非 Warrior 提议者——给明确原因，不注册、不烧评测名额（:75-106）。
 - 内容物化进 CAS（`materialize_artifact`），表面校验在提议时已过（[04](04-evolution-surfaces.md)）。
 
 ## 2. 验证与选择（`cycle_ports.evaluate_candidates` :4024 起）
 
-- 入口预算：runtime policy `candidate_evaluations_per_cycle` ∈ [0,4]（默认 1；0=禁用；`runtime_policy.py:119-129`）。
+- 入口预算：runtime policy `candidate_evaluations_per_cycle` ∈ [0,4]（默认 1；0=禁用；`runtime_policy.py`）； genesis 可由 campaign config `autonomy_v2.runtime_flow_parameters` 在同界限内预设（2026-09-16，[17](17-runtime-policy.md)）。
 - FIFO 选择：优先 MCP 试用期候选，否则首个 Warrior-target VALIDATED（:4393-4410）。
-- **stale 预拒绝**（2026-09-15）：候选 parent ≠ 当前 champion → 直接 REJECTED（superseded）——这类候选注定过不了激活的血缘检查，不再消耗评测名额（:4411-4436）。
+- **stale 预拒绝**（2026-09-15）：候选 parent ≠ 当前 champion → 直接 REJECTED（superseded）——这类候选注定过不了激活的血缘检查，不再消耗评测名额；2026-09-16 起**循环排空**整个 stale 前缀（每个被拒候选以队列中下一个为替补，直至出现 parent 存活者，:4417-4452）。
 - 非 Warrior 滞留候选每 cycle 诚实拒绝（:4445-4460）。
 - harness-code 候选前置于 cohort 门 early-return（金丝雀路径，[05](05-harness-evolution.md)），且支持预算内批量评测 + sequential activation saga（:4452-4490 附近）。
 

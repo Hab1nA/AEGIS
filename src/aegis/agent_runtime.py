@@ -58,6 +58,7 @@ from aegis.research.paper_collector import (
 from aegis.research.pdf_extractor import PDFExtractor
 from aegis.research.runtime_imports import bind_research_import
 from aegis.research.types import ResearchArtifact, SearchHit
+from aegis.runtime_policy import FLOW_FIELD_BOUNDS
 from aegis.sandbox.backend import SandboxBackend
 from aegis.sandbox.types import CommandResult, CommandSpec
 from aegis.skill_registry import SkillCandidateState, SkillRegistry, SkillRegistryError
@@ -97,6 +98,9 @@ FIXED_ROLE_MAX_SEARCH_RESULTS = 200
 FIXED_ROLE_RESEARCH_ACTION_BUDGET = 1_000_000
 _PLUGIN_RECEIPT_OVERHEAD_BYTES = 4096
 _FEEDBACK_DECISIONS = frozenset({"adopt", "defer", "reject"})
+# Derived once so the prompt can never drift from the amendment validator:
+# every listed name is bound-checked against this same mapping.
+_ADJUSTABLE_FLOW_PARAM_NAMES = ", ".join(sorted(FLOW_FIELD_BOUNDS))
 
 _FAILED_ACTION_RECOVERY: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "github.collect": (
@@ -3389,11 +3393,9 @@ class RoleAgentRuntime:
             "lifecycle state, or promotion decisions. Only the Prosecutor may call "
             "aegis.adjust_runtime_policy to adjust the campaign cost envelope "
             "(max_total_tokens, max_requests, max_model_invocations, max_active_runtime_seconds) and a "
-            "bounded set of cycle-flow parameters (cohort_limit, task_authoring_attempts, "
-            "task_proposals_per_cycle, candidate_max_steps, council_max_messages, "
-            "objective_history_window, objective_probation_cycles) after this action; "
-            "all other parameters are fixed safety constants and it cannot alter the frozen current paired "
-            "evaluation or any host safety/resource envelope. The envelope advertises the live "
+            f"bounded set of cycle-flow parameters ({_ADJUSTABLE_FLOW_PARAM_NAMES}) after this action; "
+            "each parameter must stay within its bounded legal range, and neither the frozen current paired "
+            "evaluation nor the host safety boundary itself is reachable. The envelope advertises the live "
             "runtime_policy_id and runtime_policy_consumed: copy runtime_policy_id into "
             "base_policy_id exactly. Prosecutor: when your audit shows repeated rejected actions, "
             "exhausted step or proposal budgets, or a process bottleneck, call it once before submit."

@@ -19,8 +19,8 @@
 ## 配置文件（`configs/`）
 
 - `evolution-smoke.example.json`：4 软表面、`max_agent_steps=24`（**对 agnes 偏紧**，建议 96）、max_requests 500。
-- `evolution-full.example.json`：全部 7 表面 + harness 进化 + meta + 自动激活；`max_agent_steps=96`、max_requests 2000、wall_time 28800。正式跑采用此形态。
-- 关键字段：`public_repo_url` + `harness_source_ref`（40hex pin，必须与 WSL source mirror 一致）、`harness_canary_command`、`environment_output_repository`、角色 `budget_share` 必须恰为 0.55/0.225/0.225（`autonomy_budget.py` 强制）。
+- `evolution-full.example.json`：全部 7 表面 + harness 进化 + meta + 自动激活；`max_agent_steps=96`、max_requests 2000、wall_time 28800；`runtime_flow_parameters` 预设第 1 周期即高吞吐（cohort 6 / 评测 4 / 提议 2 / 沙盒 2CPU/2GiB/512pids）。正式跑采用此形态。
+- 关键字段：`public_repo_url` + `harness_source_ref`（40hex pin，必须与 WSL source mirror 一致）、`harness_canary_command`（**留 null 用默认金丝雀**——按变更根映射的双 worktree pytest 子集，比显式命令更强；仅特殊需求才整体覆盖）、`runtime_flow_parameters`（genesis 流程预设，界限同修正案，[17](17-runtime-policy.md)）、`environment_output_repository`、角色 `budget_share` 必须恰为 0.55/0.225/0.225（`autonomy_budget.py` 强制）。
 - 配置一经 `campaign-create` 绑定不可改（immutable creation snapshot 校验，`cli.py:92-117`）；改配置 = 新 campaign。
 
 ## WSL 发行版部署

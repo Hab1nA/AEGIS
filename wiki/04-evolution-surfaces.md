@@ -11,7 +11,7 @@
 授权规则（`validate_evolution_proposal` :674-711）：
 
 - **仅 Warrior 可提议**（:685-687）——Judge/Prosecutor 不可提议（对抗结构：出题者与检察官保持控制面约束）。
-- plugin/environment/subject/harness-code/mcp/control-core **只能 target Warrior**（:689-700）；workflow 只能 target 提议者自己（:701-704）。
+- plugin/environment/subject/harness-code/mcp/control-core **只能 target Warrior**（:689-700）；workflow 只能 target 提议者自己（:701-704）。议会 reflection 的 workflow 提案通道在收集层执行同一规则：非 Warrior 目标收集即拒、不注册（`consumer.py` `_consume_reflection_proposals`，2026-09-16 起——非 Warrior 面尚无 shadow 归因路径）。
 - 表面须在配置 `autonomy_v2.evolution_surfaces` 白名单内：默认仅 workflow/subject/plugin/environment（`config.py:90-95, 253`）；mcp 与 control-core 恒需显式启用。
 
 ## 各表面内容契约

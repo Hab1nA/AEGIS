@@ -9,11 +9,14 @@
 - v1（legacy）：`_LEGACY_POLICY_FIELDS_V1`（:51-60），含已废弃的 max_cost_usd/max_steps 等。
 - **v2（现行）**：`_POLICY_FIELDS_V2`（:109-114）= 成本信封 4 项（max_total_tokens / max_requests / max_model_invocations / max_active_runtime_seconds）+ 角色级（role_max_steps / role_max_output_tokens / role_research_action_budgets / role_max_read_bytes / role_max_write_bytes / role_max_tool_output_bytes / role_max_search_results / role_command_timeout_seconds / role_token_shares / role_reasoning_effort）+ 整数限额（gateway/subagent/candidate/cohort/council/holdout/依赖下载/population/sandbox 资源）+ 数值限额（各 timeout）。
 - 严格字段集：多键/缺键即错；未知键若含宿主安全词（`_HOST_SAFETY_TERMS` :135-150：windows/wsl/host/safety/interop/drvfs/mount/broker 等）报"不可变"，否则报"不支持"。
+- **角色字段的生效范围**：仅 `role_max_steps` / `role_max_output_tokens` /
+  `role_command_timeout_seconds` 是活预算参数；其余 role_* 字段（read/write/tool_output/
+  search/research_action_budgets）校验并存储但运行时钉回 FIXED 安全常量（`agent_runtime._refresh_policy` 注释），且被排除在修正案白名单外——对它们的修正案会无效。`role_token_shares` 与 `role_reasoning_effort` 为惰性 legacy 值（:474-476 注释；reasoning 由网关钉死，见 [14](14-gateway-accounting.md)）。
 - v1→v2 一次性迁移：语义保持校验（`_v2_matches_v1`）+ CAS 持久化（:851-905）。
 
-## 流程界限（`_FLOW_FIELD_BOUNDS` :122-129）
+## 流程界限（`FLOW_FIELD_BOUNDS` :122-136）
 
-Prosecutor 即时修正案可动的有界参数：
+Prosecutor 即时修正案可动的有界参数（公开名，config 与提示词共用派生）：
 
 | 字段 | 界限 |
 |---|---|
@@ -24,9 +27,16 @@ Prosecutor 即时修正案可动的有界参数：
 | council_max_messages | [2,64] |
 | objective_history_window | [1,5] |
 | candidate_evaluations_per_cycle | [0,4] |
+| max_evolution_requests_per_run | [1,4] |
 | sandbox_cpus / sandbox_memory_gib / sandbox_pids | [1,8] / [1,8] / [64,1024] |
 
-界限只在**修正案**层强制；genesis 由操作者全权。资源信封语义：默认 1 CPU/1GiB/256 pids；检察官可在界内上调——资源上限不是隔离完整性（成本信封本就可调），隔离由容器 flags 与冻结面保证（[16](16-sandbox.md)）。
+界限在**修正案**层强制；genesis 默认由操作者全权，且操作者可通过 campaign config
+`autonomy_v2.runtime_flow_parameters`（`config.py` `_FLOW_PRESET_FIELDS`）在**相同界限内**
+预设其中 8 个无专属 campaign 字段的流程参数（candidate_max_steps/council_max_messages/
+objective_history_window 已有专属字段，不在预设集内）；缺席名字保持内置 genesis 默认
+（`cycle_ports._runtime_policy_genesis_values` 读取）。资源信封语义：默认 1 CPU/1GiB/256
+pids；检察官可在界内上调——资源上限不是隔离完整性（成本信封本就可调），隔离由容器 flags
+与冻结面保证（[16](16-sandbox.md)）。
 
 ## 修正案三通道
 
@@ -51,7 +61,10 @@ cumulative 量 + role_tokens；有限非负。`maintenance_reasons` 由"consumed
 
 ## 与 agent 协议的接口
 
-`aegis.adjust_runtime_policy` 参数白名单（system prompt 明示）：max_total_tokens / max_requests / max_model_invocations / max_active_runtime_seconds + 六个流程参数（`agent_runtime.py` :454-463 schema；sandbox 资源三键 2026-09-15 加入 `_FLOW_FIELD_BOUNDS`）。信封携带 `runtime_policy_id` + consumed（Prosecutor 正确复制 base_policy_id 的前提，5b.3）。
+`aegis.adjust_runtime_policy` 参数白名单：cost envelope 4 项 + `FLOW_FIELD_BOUNDS` 全部
+11 个流程参数——system prompt 内的清单由 `_ADJUSTABLE_FLOW_PARAM_NAMES` 从
+`FLOW_FIELD_BOUNDS` **派生**（`agent_runtime.py`），不再硬编码，杜绝再次漂移。信封携带
+`runtime_policy_id` + consumed（Prosecutor 正确复制 base_policy_id 的前提，5b.3）。
 
 ## 边界
 

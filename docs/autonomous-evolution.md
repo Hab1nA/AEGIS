@@ -667,6 +667,43 @@ AEGIS v2 的迭代与审计覆盖：难度/覆盖双硬门禁、ABORTED 恢复�
 **测试与回归**：全量回归 728 passed + 5 skipped + 214 subtests（排除
 gateway 偶发模块；gateway 36 用例隔离全过）。
 
+## 5b.8 独立审计修复：去保守化收尾与死出口清理（2026-09-16）
+
+独立进化彻底性审计（对照四大自由度：自我修改代码/自配 harness/安装软件/定制
+WSL 沙盒）确认主进化链无阻断性缺陷后，修复审计提出的边缘保守点与死出口：
+
+- **提议/评测容量对称化**：`max_evolution_requests_per_run` 从"genesis=1 且永不可调"
+  纳入 `FLOW_FIELD_BOUNDS`（公开名，原 `_FLOW_FIELD_BOUNDS`）界限 [1,4]——检察官
+  修正案可调；同时新增 campaign config `autonomy_v2.runtime_flow_parameters`（界限
+  同修正案），操作者可从第 1 周期就预设 cohort/评测预算/提议上限/sandbox 资源信封
+  等 8 个流程参数（`config.py` `_FLOW_PRESET_FIELDS`；`cycle_ports._runtime_policy_genesis_values`
+  读取，缺席名保持内置默认）。`evolution-full.example.json` 示范完全进化预设。
+- **系统提示词漂移修复**：`aegis.adjust_runtime_policy` 的可调参数清单原来硬编码
+  7 项，缺 candidate_evaluations_per_cycle 与 sandbox 资源三键（检察官模型不知道能调）。
+  现改为从 `FLOW_FIELD_BOUNDS` 派生（`agent_runtime._ADJUSTABLE_FLOW_PARAM_NAMES`），
+  与修正案校验器共用单一事实源。
+- **非 Warrior 反思提案死出口清理**：judge/prosecutor 目标的 workflow reflection
+  提案原来"注册后必拒"（每 cycle 被 stranded 拒绝），改为收集层即拒、理由可见、不
+  注册（`consumer.py` `_consume_reflection_proposals`）——与 role_candidates 通道的
+  Warrior-only 语义对齐。
+- **stale 预拒绝排空**：superseded 候选的预拒绝从单次重试改为循环排空整个 stale
+  前缀，连续多个过期候选不再烧评测名额。
+- **死旋钮注记**：`RoleConfig.reasoning_effort`、runtime policy 角色 I/O 字段、
+  `role_token_shares`/`role_reasoning_effort` 的惰性/钉死语义在源码与 wiki 落注；
+  网关 seed 刻意不用于角色请求的意图落注（`gateway/protocols.py`）。
+- **示例配置金丝雀回归**：`evolution-full.example.json` 与 `e2e-autonomous.json`
+  删除 `harness_canary_command`（原为纯 import 冒烟，会整体覆盖更强的默认根映射
+  双 worktree pytest 金丝雀）。
+- **发行版重装（操作项）**：审计实测 AEGIS-Sandbox 发行版内安装包早于 WP1（无
+  `wsl_cycle_runtime`/`_validate_frozen_paths`/`sync_mirror`/`save_image`），已按
+  wiki 19 刷新纪律 `pip install --force-reinstall --no-deps` 重装并探针验证。
+
+**测试与回归**：新增 config 预设校验（界内/越界/未知键/非整数 8 例）、
+`max_evolution_requests_per_run` 修正案界内接受+越界拒绝、genesis 预设读取、
+reflection 非 Warrior 收集即拒等用例；全量回归 803 passed + 10 skipped（原
+`test_reflect_strategy_proposals_reach_collection` 更新为收集期拒绝的新契约，
+"提案不静默丢失"的回归意图保留）。
+
 ## 6. 边界与后续项
 
 - 任务锻造已收敛为声明式：Judge 只声明 `task_specs`（纯文本/JSON），控制面
