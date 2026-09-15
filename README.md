@@ -239,6 +239,7 @@ python -m pytest
 | [docs/threat-model.md](docs/threat-model.md) | 威胁模型：受保护资产、对手假设、强制控制与残余风险 |
 | [docs/wsl-runbook.md](docs/wsl-runbook.md) | 专用 WSL 发行版安装与本地研究服务运行手册 |
 | [docs/taskpack-authoring.md](docs/taskpack-authoring.md) | 任务包作者指南（密封隐藏测试契约） |
+| [wiki/INDEX.md](wiki/INDEX.md) | **项目 Wiki（设计现状全量）**：24 页人机双友好设计文档——总览/架构/各子系统设计细节/限额与事件目录/术语表；Agent 导航规则见 INDEX |
 
 ## 项目状态与边界
 
