@@ -28,6 +28,7 @@ env/
 .smoke-data*/
 .smoke-judge*/
 .e2e-thesis-data*/
+.e2e-*/
 .aegis.env
 .coverage
 htmlcov/
